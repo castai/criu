@@ -475,13 +475,6 @@ int restore_one_tcp(int fd, struct inet_sk_info *ii)
 
 	show_one_inet_img("Restoring TCP connection", ii->ie);
 
-	if (opts.tcp_close) {
-		if (shutdown(fd, SHUT_RDWR) && errno != ENOTCONN) {
-			pr_perror("Unable to shutdown the socket id %x ino %x", ii->ie->id, ii->ie->ino);
-		}
-		return 0;
-	}
-
 	sk = libsoccr_pause(fd);
 	if (!sk)
 		return -1;
