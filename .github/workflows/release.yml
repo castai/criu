@@ -26,7 +26,7 @@ jobs:
 
       - name: Create tar
         run: |
-          tar -czf criu-.tar.gz -C bins .
+          tar -czf criu-${{ github.ref_name}}-amd64.tar.gz -C bins .
 
       - name: Upload Release Asset
         uses: ncipollo/release-action@v1
