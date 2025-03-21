@@ -1,0 +1,50 @@
+name: Publish GitHub Release
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+
+permissions:
+  packages: write
+  contents: read
+
+jobs:
+  build-and-publish-kind-image:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      - name: Create multi architecture builder
+        run: |
+          docker buildx create --name multi-arch --platform "linux/arm64,linux/amd64" --driver "docker-container"
+          docker buildx ls --no-trunc
+
+      - name: Build amd64 with Docker
+        run: docker buildx build --builder multi-arch --platform linux/amd64 -f release/Dockerfile --output amd64-bins .
+
+      - name: Build arm64 with Docker
+        run: docker buildx build --builder multi-arch --platform linux/arm64 -f release/Dockerfile --output arm64-bins .
+
+      - name: List built binaries
+        run: ls -lah amd64-bins arm64-bins
+
+      - name: Create tar
+        run: |
+          tar -czf criu-${{ github.ref_name}}-linux-amd64.tar.gz -C amd64-bins criu
+          tar -czf criu-${{ github.ref_name}}-linux-arm64.tar.gz -C arm64-bins criu
+          sha256sum criu-${{ github.ref_name}}-linux-amd64.tar.gz >> SHA256SUMS
+          sha256sum criu-${{ github.ref_name}}-linux-arm64.tar.gz >> SHA256SUMS
+
+      - name: Upload Release Asset
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "criu-${{ github.ref_name}}-linux-amd64.tar.gz,criu-${{ github.ref_name}}-linux-arm64.tar.gz,SHA256SUMS"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
