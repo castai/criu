@@ -1,4 +1,4 @@
-name: Docker Build and Publish to GitHub Packages
+name: Publish GitHub Release
 
 on:
   push:
@@ -9,8 +9,12 @@ permissions:
   packages: write
   contents: read
 
+env:
+  KIND_VERSION: 1.32
+  KIND_MINOR: 2
+
 jobs:
-  build-and-publish:
+  build-and-publish-kind-image:
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -19,19 +23,19 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Build with Docker
-        run: docker build -f release/Dockerfile --output bins .
+        run: docker build --build-arg VERSION=$KIND_VERSION --build-arg MINOR=$KIND_MINOR -f release/Dockerfile --output bins .
 
       - name: List built binaries
         run: ls -lah bins
 
       - name: Create tar
         run: |
-          tar -czf criu-${{ github.ref_name}}-amd64.tar.gz -C bins .
+          tar -czf criu-${{ github.ref_name}}-kind-${KIND_VERSION}.${KIND_MINOR}-amd64.tar.gz -C bins .
 
       - name: Upload Release Asset
         uses: ncipollo/release-action@v1
         with:
-          artifacts: "criu-${{ github.ref_name}}-amd64.tar.gz"
+          artifacts: "criu-${{ github.ref_name}}-kind-${KIND_VERSION}.${KIND_MINOR}-amd64.tar.gz"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
