@@ -30,12 +30,12 @@ jobs:
 
       - name: Create tar
         run: |
-          tar -czf criu-${{ github.ref_name}}-kind-${KIND_VERSION}.${KIND_MINOR}-amd64.tar.gz -C bins .
+          tar -czf criu-${{ github.ref_name}}-kind-v${KIND_VERSION}.${KIND_MINOR}-amd64.tar.gz -C bins .
 
       - name: Upload Release Asset
         uses: ncipollo/release-action@v1
         with:
-          artifacts: "criu-${{ github.ref_name}}-kind-${{ env.KIND_VERSION }}.${{ env.KIND_MINOR }}-amd64.tar.gz"
+          artifacts: "criu-${{ github.ref_name}}-kind-v${{ env.KIND_VERSION }}.${{ env.KIND_MINOR }}-amd64.tar.gz"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
