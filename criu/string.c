@@ -17,7 +17,7 @@
  * of course, the buffer size is zero). It does not pad
  * out the result like strncpy() does.
  */
-size_t __strlcpy(char *dest, const char *src, size_t size)
+size_t __wrap___strlcpy(char *dest, const char *src, size_t size)
 {
 	size_t ret = strlen(src);
 
