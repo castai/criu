@@ -22,6 +22,9 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v3
 
+      - name: Create multi architecture builder
+        run: docker buildx create --name multi-arch --platform "linux/arm64,linux/amd64" --driver "docker-container"
+
       - name: Build amd64 with Docker
         run: docker build --platform linux/amd64 --build-arg VERSION=$KIND_VERSION --build-arg MINOR=$KIND_MINOR -f release/Dockerfile --output amd64-bins .
 
