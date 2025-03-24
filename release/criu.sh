@@ -17,7 +17,7 @@ cp ./install.sh "$CRIU_BUNDLE"
 cp "$CRIU_REPO/criu/criu" "$CRIU_BUNDLE"
 
 # Grepping here skips libs like ld-linux-x86-64 and linux-vdso
-/lib64/ld-linux-x86-64.so.2 --list "$CRIU_REPO/criu/criu" | grep "=>" >./libmap.txt
+ldd "$CRIU_REPO/criu/criu" | grep "=>" >./libmap.txt
 
 while IFS= read -r line; do
     filename="$(echo $line | awk '{print $1}')"
