@@ -41,11 +41,13 @@ jobs:
         run: |
           tar -czf criu-${{ github.ref_name}}-kind-v${KIND_VERSION}.${KIND_MINOR}-amd64.tar.gz -C amd64-bins criu
           tar -czf criu-${{ github.ref_name}}-kind-v${KIND_VERSION}.${KIND_MINOR}-arm64.tar.gz -C arm64-bins criu
+          sha256sum criu-${{ github.ref_name}}-kind-v${KIND_VERSION}.${KIND_MINOR}-amd64.tar.gz >> SHA256SUMS
+          sha256sum criu-${{ github.ref_name}}-kind-v${KIND_VERSION}.${KIND_MINOR}-arm64.tar.gz >> SHA256SUMS
 
       - name: Upload Release Asset
         uses: ncipollo/release-action@v1
         with:
-          artifacts: "criu-${{ github.ref_name}}-kind-v${{ env.KIND_VERSION }}.${{ env.KIND_MINOR }}-amd64.tar.gz,criu-${{ github.ref_name}}-kind-v${{ env.KIND_VERSION }}.${{ env.KIND_MINOR }}-arm64.tar.gz"
+          artifacts: "criu-${{ github.ref_name}}-kind-v${{ env.KIND_VERSION }}.${{ env.KIND_MINOR }}-amd64.tar.gz,criu-${{ github.ref_name}}-kind-v${{ env.KIND_VERSION }}.${{ env.KIND_MINOR }}-arm64.tar.gz,SHA256SUMS"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
