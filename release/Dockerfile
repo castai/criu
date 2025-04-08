@@ -26,9 +26,9 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
 	uuid-dev \
 	python3-yaml
 
-COPY . /criu
-WORKDIR /criu
+COPY . /work
+WORKDIR /work
 RUN make -j $(nproc) criu
 
 FROM scratch
-COPY --from=build /criu/criu/criu .
+COPY --from=build /work/criu/criu .
