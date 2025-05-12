@@ -31,4 +31,5 @@ WORKDIR /work
 RUN make -j $(nproc) criu
 
 FROM scratch
-COPY --from=build /work/criu/criu .
+ARG TARGETARCH
+COPY --from=build /work/criu/criu $TARGETARCH/.
