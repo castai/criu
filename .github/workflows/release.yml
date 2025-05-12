@@ -57,9 +57,10 @@ jobs:
 
       - name: Create tar
         run: |
-          for arch in amd64 arm64
+          tree bins/ || true
+          for arch in arm64 amd64
           do
-            tar czvf criu-${{ github.ref_name}}-linux-$arch.tar.gz -C bins/$arch criu
+            tar czvf criu-${{ github.ref_name}}-linux-$arch.tar.gz -C bins/linux_$arch criu
             sha256sum criu-${{ github.ref_name}}-linux-$arch.tar.gz >> SHA256SUMS
           done
 
