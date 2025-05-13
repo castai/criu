@@ -3,7 +3,7 @@ name: Publish GitHub Release
 on:
   push:
     tags:
-      - '*'
+      - "*"
   workflow_dispatch:
 
 permissions:
@@ -14,31 +14,55 @@ jobs:
   build-and-publish-kind-image:
     permissions:
       contents: write
+      packages: write
+
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
         uses: actions/checkout@v3
 
-      - name: Create multi architecture builder
-        run: |
-          docker buildx create --name multi-arch --platform "linux/arm64,linux/amd64" --driver "docker-container"
-          docker buildx ls --no-trunc
+      - name: Configure environment variables
+        run: echo "RELEASE_TAG=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
 
-      - name: Build amd64 with Docker
-        run: docker buildx build --builder multi-arch --platform linux/amd64 -f release/Dockerfile --output amd64-bins .
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build arm64 with Docker
-        run: docker buildx build --builder multi-arch --platform linux/arm64 -f release/Dockerfile --output arm64-bins .
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
-      - name: List built binaries
-        run: ls -lah amd64-bins arm64-bins
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: |
+            linux/arm64
+            linux/amd64
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          file: release/Dockerfile
+          tags: |
+            ghcr.io/castai/criu/criu:${{ env.RELEASE_TAG }}
+            ghcr.io/castai/criu/criu:latest
+          platforms: |
+            linux/arm64
+            linux/amd64
+          outputs: |
+            type=image,push=true
+            type=local,dest=bins/
 
       - name: Create tar
         run: |
-          tar -czf criu-${{ github.ref_name}}-linux-amd64.tar.gz -C amd64-bins criu
-          tar -czf criu-${{ github.ref_name}}-linux-arm64.tar.gz -C arm64-bins criu
-          sha256sum criu-${{ github.ref_name}}-linux-amd64.tar.gz >> SHA256SUMS
-          sha256sum criu-${{ github.ref_name}}-linux-arm64.tar.gz >> SHA256SUMS
+          tree bins/ || true
+          for arch in arm64 amd64
+          do
+            tar czvf criu-${{ github.ref_name}}-linux-$arch.tar.gz -C bins/linux_$arch criu
+            sha256sum criu-${{ github.ref_name}}-linux-$arch.tar.gz >> SHA256SUMS
+          done
 
       - name: Upload Release Asset
         uses: ncipollo/release-action@v1
@@ -46,5 +70,3 @@ jobs:
           artifacts: "criu-${{ github.ref_name}}-linux-amd64.tar.gz,criu-${{ github.ref_name}}-linux-arm64.tar.gz,SHA256SUMS"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-
