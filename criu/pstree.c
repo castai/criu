@@ -63,6 +63,7 @@ CoreEntry *core_entry_alloc(int th, int tsk)
 		sz += CR_CAP_SIZE * sizeof(ce->cap_prm[0]);
 		sz += CR_CAP_SIZE * sizeof(ce->cap_eff[0]);
 		sz += CR_CAP_SIZE * sizeof(ce->cap_bnd[0]);
+		sz += CR_CAP_SIZE * sizeof(ce->cap_amb[0]);
 		/*
 		 * @groups are dynamic and allocated
 		 * on demand.
@@ -122,10 +123,12 @@ CoreEntry *core_entry_alloc(int th, int tsk)
 			ce->n_cap_prm = CR_CAP_SIZE;
 			ce->n_cap_eff = CR_CAP_SIZE;
 			ce->n_cap_bnd = CR_CAP_SIZE;
+			ce->n_cap_amb = CR_CAP_SIZE;
 			ce->cap_inh = xptr_pull_s(&m, CR_CAP_SIZE * sizeof(ce->cap_inh[0]));
 			ce->cap_prm = xptr_pull_s(&m, CR_CAP_SIZE * sizeof(ce->cap_prm[0]));
 			ce->cap_eff = xptr_pull_s(&m, CR_CAP_SIZE * sizeof(ce->cap_eff[0]));
 			ce->cap_bnd = xptr_pull_s(&m, CR_CAP_SIZE * sizeof(ce->cap_bnd[0]));
+			ce->cap_amb = xptr_pull_s(&m, CR_CAP_SIZE * sizeof(ce->cap_amb[0]));
 
 			if (arch_alloc_thread_info(core)) {
 				xfree(core);
@@ -179,7 +182,7 @@ void free_pstree(struct pstree_item *root_item)
 	struct pstree_item *item = root_item, *parent;
 
 	while (item) {
-		if (!list_empty(&item->children)) {
+		if (has_children(item)) {
 			item = list_first_entry(&item->children, struct pstree_item, sibling);
 			continue;
 		}
@@ -241,10 +244,15 @@ int init_pstree_helper(struct pstree_item *ret)
 	return 0;
 }
 
+bool has_children(struct pstree_item *item)
+{
+	return !list_empty(&item->children);
+}
+
 /* Deep first search on children */
 struct pstree_item *pstree_item_next(struct pstree_item *item)
 {
-	if (!list_empty(&item->children))
+	if (has_children(item))
 		return list_first_entry(&item->children, struct pstree_item, sibling);
 
 	while (item->parent) {
@@ -959,7 +967,7 @@ static int prepare_pstree_kobj_ids(void)
 			 * this namespace is either inherited from the
 			 * criu or is created for the init task (only)
 			 */
-			pr_err("Can't restore sub-task in NS\n");
+			pr_err("Can't restore sub-task in NS (cflags %lx)\n", cflags);
 			return -1;
 		}
 	}

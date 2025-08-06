@@ -4,7 +4,7 @@ set -x -e
 CI_PKGS=(protobuf-c-compiler libprotobuf-c-dev libaio-dev libgnutls28-dev
 		libgnutls30 libprotobuf-dev protobuf-compiler libcap-dev
 		libnl-3-dev gdb bash libnet-dev util-linux asciidoctor
-		libnl-route-3-dev time libbsd-dev python3-yaml
+		libnl-route-3-dev time libbsd-dev python3-yaml uuid-dev
 		libperl-dev pkg-config python3-protobuf python3-pip
 		python3-importlib-metadata python3-junit.xml libdrm-dev)
 
@@ -38,6 +38,10 @@ ci_prep () {
 
 	# This can fail on aarch64 travis
 	service apport stop || :
+
+	# Ubuntu has set up AppArmor in 24.04 so that it blocks use of user
+	# namespaces by unprivileged users. We need this for some of our tests.
+	sysctl kernel.apparmor_restrict_unprivileged_userns=0 || :
 
 	if [ "$CLANG" = "1" ]; then
 		# clang support
@@ -121,8 +125,14 @@ if [ "${CD_TO_TOP}" = "1" ]; then
 fi
 
 export GCOV CC
+if [ -z "$COMPILE_FLAGS" ]; then
+	LOCAL_COMPILE_FLAGS=("V=1")
+else
+	IFS=" " read -r -a LOCAL_COMPILE_FLAGS <<< "$COMPILE_FLAGS"
+	LOCAL_COMPILE_FLAGS=("V=1" "${LOCAL_COMPILE_FLAGS[@]}")
+fi
 $CC --version
-time make CC="$CC" -j4 V=1
+time make CC="$CC" -j4 "${LOCAL_COMPILE_FLAGS[@]}"
 
 ./criu/criu -v4 cpuinfo dump || :
 ./criu/criu -v4 cpuinfo check || :
@@ -150,6 +160,7 @@ ulimit -c unlimited
 cgid=$$
 cleanup_cgroup() {
 	./test/zdtm_umount_cgroups $cgid
+	dmesg
 }
 trap cleanup_cgroup EXIT
 ./test/zdtm_mount_cgroups $cgid

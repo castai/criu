@@ -44,6 +44,11 @@
 #define PB_ALEN_INET  1
 #define PB_ALEN_INET6 4
 
+/* Definition for older kernels without MPTCP support (e.g. Ubuntu 20.04) */
+#ifndef IPPROTO_MPTCP
+#define IPPROTO_MPTCP 262
+#endif
+
 static LIST_HEAD(inet_ports);
 
 struct inet_port {
@@ -125,9 +130,13 @@ static int can_dump_ipproto(unsigned int ino, int proto, int type)
 	case IPPROTO_TCP:
 	case IPPROTO_UDP:
 	case IPPROTO_UDPLITE:
+	case IPPROTO_ICMP:
+	case IPPROTO_ICMPV6:
 		break;
 	default:
 		pr_err("Unsupported proto %d for socket %x\n", proto, ino);
+		if (proto == IPPROTO_MPTCP)
+			pr_err("For Go programs, consider using \"GODEBUG=multipathtcp=0\" to disable MPTCP\n");
 		return 0;
 	}
 
@@ -915,8 +924,9 @@ static int open_inet_sk(struct file_desc *d, int *new_fd)
 	}
 
 	if (ie->src_port) {
-		if (inet_bind(sk, ii))
-			goto err;
+		if (ie->proto != IPPROTO_ICMP && ie->proto != IPPROTO_ICMPV6)
+			if (inet_bind(sk, ii))
+				goto err;
 	}
 
 	/*

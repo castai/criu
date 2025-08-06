@@ -21,6 +21,8 @@
 #include "log.h"
 #include "common/err.h"
 
+#include "compel/infect-util.h"
+
 #define PREF_SHIFT_OP(pref, op, size) ((size)op(pref##BYTES_SHIFT))
 #define KBYTES_SHIFT		      10
 #define MBYTES_SHIFT		      20
@@ -406,14 +408,24 @@ static inline void cleanup_freep(void *p)
 	free(*pp);
 }
 
+#define cleanup_file __attribute__((cleanup(cleanup_filep)))
+static inline void cleanup_filep(FILE **f)
+{
+	FILE *file = *f;
+	if (file)
+		(void)fclose(file);
+}
+
 extern int run_command(char *buf, size_t buf_size, int (*child_fn)(void *), void *args);
 
 /*
  * criu_run_id is a unique value of the current run. It can be used to
  * generate resource ID-s to avoid conflicts with other CRIU processes.
  */
-extern uint64_t criu_run_id;
+extern char criu_run_id[RUN_ID_HASH_LENGTH];
 extern void util_init(void);
+#define NO_DUMP_CRIU_RUN_ID 0x7f
+extern char dump_criu_run_id[RUN_ID_HASH_LENGTH];
 
 extern char *resolve_mountpoint(char *path);
 

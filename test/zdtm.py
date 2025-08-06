@@ -22,11 +22,11 @@ import sys
 import tempfile
 import time
 import uuid
+import site
 from builtins import input, int, open, range, str, zip
 
 import yaml
 
-import pycriu as crpc
 from zdtm.criu_config import criu_config
 
 # File to store content of streamed images
@@ -443,6 +443,7 @@ class zdtm_test:
         self._bins = [name]
         self._env = {'TMPDIR': os.environ.get('TMPDIR', '/tmp')}
         self._deps = desc.get('deps', [])
+        self._bind = desc.get('bind')
         self.auto_reap = True
 
     def __make_action(self, act, env=None, root=None):
@@ -513,6 +514,8 @@ class zdtm_test:
         if self.__flavor.ns:
             env['ZDTM_NEWNS'] = "1"
             env['ZDTM_ROOT'] = self.__flavor.root
+            if self._bind:
+                env['ZDTM_BIND'] = self._bind
             env['ZDTM_DEV'] = self.__flavor.devpath
             env['PATH'] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -1139,6 +1142,24 @@ class criu:
         self.__img_streamer_process = None
         self.__tls = self.__tls_options() if opts['tls'] else []
         self.__criu_bin = opts['criu_bin']
+
+        global crpc
+        pycriu_search_path = opts.get('pycriu_search_path')
+        if pycriu_search_path:
+            sys.path.insert(0, pycriu_search_path)
+
+        try:
+            import pycriu as crpc
+            if pycriu_search_path:
+                print(f"pycriu loaded from: {crpc.__file__}")
+        except ImportError:
+            if not pycriu_search_path:
+                print("Consider building CRIU or using '--pycriu-search-path' option.")
+            raise
+        finally:
+            if pycriu_search_path:
+                sys.path.pop(0)
+
         self.__crit_bin = opts['crit_bin']
         self.__pre_dump_mode = opts['pre_dump_mode']
         self.__preload_libfault = bool(opts['preload_libfault'])
@@ -1590,6 +1611,7 @@ class criu:
     def available():
         if not os.access(opts['criu_bin'], os.X_OK):
             print("CRIU binary not found at %s" % opts['criu_bin'])
+            print("Consider building CRIU or using '--criu-bin' option.")
             sys.exit(1)
 
     def kill(self):
@@ -2166,7 +2188,8 @@ class Launcher:
               'dedup', 'sbs', 'freezecg', 'user', 'dry_run', 'noauto_dedup',
               'remote_lazy_pages', 'show_stats', 'lazy_migrate', 'stream',
               'tls', 'criu_bin', 'crit_bin', 'pre_dump_mode', 'mntns_compat_mode',
-              'rootless', 'preload_libfault', 'mocked_cuda_checkpoint')
+              'rootless', 'preload_libfault', 'mocked_cuda_checkpoint',
+              'pycriu_search_path')
         arg = repr((name, desc, flavor, {d: self.__opts[d] for d in nd}))
 
         if self.__use_log:
@@ -2857,6 +2880,9 @@ def get_cli_args():
     rp.add_argument("--criu-bin",
                     help="Path to criu binary",
                     default='../criu/criu')
+    rp.add_argument("--pycriu-search-path",
+                    help=f"Path to search for pycriu module first (e.g., {site.getsitepackages()[0]})",
+                    default=None)
     rp.add_argument("--crit-bin",
                     help="Path to crit binary",
                     default='../crit/crit')
@@ -2947,7 +2973,7 @@ if __name__ == '__main__':
     if opts['debug']:
         sys.settrace(traceit)
 
-    if opts['action'] == 'run':
+    if opts['action'] == run_tests:
         criu.available()
     for tst in test_classes.values():
         tst.available()

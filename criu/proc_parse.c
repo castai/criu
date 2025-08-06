@@ -144,6 +144,8 @@ static void __parse_vmflags(char *buf, u32 *flags, u64 *madv, int *io_pf,
 			*flags |= MAP_NORESERVE;
 		else if (_vmflag_match(tok, "ht"))
 			*flags |= MAP_HUGETLB;
+		else if (_vmflag_match(tok, "dp"))
+			*flags |= MAP_DROPPABLE;
 
 		/* madvise() block */
 		if (_vmflag_match(tok, "sr"))
@@ -160,6 +162,8 @@ static void __parse_vmflags(char *buf, u32 *flags, u64 *madv, int *io_pf,
 			*madv |= (1ul << MADV_HUGEPAGE);
 		else if (_vmflag_match(tok, "nh"))
 			*madv |= (1ul << MADV_NOHUGEPAGE);
+		else if (_vmflag_match(tok, "wf"))
+			*madv |= (1ul << MADV_WIPEONFORK);
 
 		/* vmsplice doesn't work for VM_IO and VM_PFNMAP mappings. */
 		if (_vmflag_match(tok, "io") || _vmflag_match(tok, "pf"))
@@ -204,6 +208,20 @@ static void parse_vma_vmflags(char *buf, struct vma_area *vma_area)
 
 	if (vma_area->e->madv)
 		vma_area->e->has_madv = true;
+
+	/*
+	 * We set MAP_PRIVATE flag on vma_area->e->flags right after parsing
+	 * a first line of VMA entry in /proc/<pid>/smaps file:
+	 * 7fa84fa70000-7fa84fa95000 rw-p 00000000 00:00 0
+	 * but it's too early and we can't distinguish between MAP_DROPPABLE
+	 * and MAP_PRIVATE mappings yet, as they both private mappings in nature
+	 * and at this point we haven't yet read "VmFlags:" line in smaps.
+	 *
+	 * Let's detect this situation and drop MAP_PRIVATE flag while keep
+	 * MAP_DROPPABLE, otherwise restorer's restore_mapping() helper will fail.
+	 */
+	if ((vma_area->e->flags & MAP_PRIVATE) && (vma_area->e->flags & MAP_DROPPABLE))
+		vma_area->e->flags &= ~MAP_PRIVATE;
 }
 
 static inline int is_anon_shmem_map(dev_t dev)
@@ -579,7 +597,8 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_pat
 	} else if (!strcmp(file_path, "[vdso]")) {
 		if (handle_vdso_vma(vma_area))
 			goto err;
-	} else if (!strcmp(file_path, "[vvar]")) {
+	} else if (!strcmp(file_path, "[vvar]") ||
+		   !strcmp(file_path, "[vvar_vclock]")) {
 		if (handle_vvar_vma(vma_area))
 			goto err;
 	} else if (!strcmp(file_path, "[heap]")) {
@@ -771,7 +790,7 @@ static int task_size_check(pid_t pid, VmaEntry *entry)
 
 int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t dump_filemap)
 {
-	struct vma_area *vma_area = NULL;
+	struct vma_area *vma_area = NULL, *prev_vma_area = NULL;
 	unsigned long start, end, pgoff, prev_end = 0;
 	char r, w, x, s;
 	int ret = -1, vm_file_fd = -1;
@@ -813,8 +832,22 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
 				continue;
 		}
 
-		if (vma_area && vma_list_add(vma_area, vma_area_list, &prev_end, &vfi, &prev_vfi))
-			goto err;
+		if (vma_area && vma_area_is(vma_area, VMA_AREA_VVAR) &&
+		    prev_vma_area && vma_area_is(prev_vma_area, VMA_AREA_VVAR)) {
+			if (prev_vma_area->e->end != vma_area->e->start) {
+				pr_err("two nonconsecutive vvar vma-s: "
+				       "%" PRIx64 "-%" PRIx64 " %" PRIx64 "-%" PRIx64 "\n",
+				       prev_vma_area->e->start, prev_vma_area->e->end,
+				       vma_area->e->start, vma_area->e->end);
+				goto err;
+			}
+			/* Merge all vvar vma-s into one. */
+			prev_vma_area->e->end = vma_area->e->end;
+		} else {
+			if (vma_area && vma_list_add(vma_area, vma_area_list, &prev_end, &vfi, &prev_vfi))
+				goto err;
+			prev_vma_area = vma_area;
+		}
 
 		if (eof)
 			break;
@@ -1056,7 +1089,7 @@ int parse_pid_status(pid_t pid, struct seize_task_status *ss, void *data)
 	if (bfdopenr(&f))
 		return -1;
 
-	while (done < 13) {
+	while (done < 14) {
 		str = breadline(&f);
 		if (str == NULL)
 			break;
@@ -1140,6 +1173,13 @@ int parse_pid_status(pid_t pid, struct seize_task_status *ss, void *data)
 			continue;
 		}
 
+		if (!strncmp(str, "CapAmb:", 7)) {
+			if (cap_parse(str + 8, cr->cap_amb))
+				goto err_parse;
+			done++;
+			continue;
+		}
+
 		if (!strncmp(str, "Seccomp:", 8)) {
 			if (sscanf(str + 9, "%d", &cr->s.seccomp_mode) != 1) {
 				goto err_parse;
@@ -1183,7 +1223,7 @@ int parse_pid_status(pid_t pid, struct seize_task_status *ss, void *data)
 	}
 
 	/* seccomp and nspids are optional */
-	expected_done = (parsed_seccomp ? 12 : 11);
+	expected_done = (parsed_seccomp ? 13 : 12);
 	if (kdat.has_nspid)
 		expected_done++;
 	if (done == expected_done)

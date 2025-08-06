@@ -17,6 +17,7 @@
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sched.h>
+#include <linux/elf.h>
 
 #include "types.h"
 #include <compel/ptrace.h>
@@ -1707,6 +1708,9 @@ static int restore_task_with_children(void *_arg)
 				     arg);
 }
 
+int __attribute((weak)) arch_ptrace_restore(int pid, struct pstree_item *item);
+int arch_ptrace_restore(int pid, struct pstree_item *item) { return 0; }
+
 static int attach_to_tasks(bool root_seized)
 {
 	struct pstree_item *item;
@@ -1747,6 +1751,8 @@ static int attach_to_tasks(bool root_seized)
 				pr_perror("Unable to set PTRACE_O_TRACESYSGOOD for %d", pid);
 				return -1;
 			}
+			if (arch_ptrace_restore(pid, item))
+				return -1;
 			/*
 			 * Suspend seccomp if necessary. We need to do this because
 			 * although seccomp is restored at the very end of the
@@ -1814,6 +1820,7 @@ static int restore_rseq_cs(void)
 static int catch_tasks(bool root_seized)
 {
 	struct pstree_item *item;
+	bool nobp = fault_injected(FI_NO_BREAKPOINTS) || !kdat.has_breakpoints;
 
 	for_each_pstree_item(item) {
 		int status, i, ret;
@@ -1841,7 +1848,7 @@ static int catch_tasks(bool root_seized)
 				return -1;
 			}
 
-			ret = compel_stop_pie(pid, rsti(item)->breakpoint, fault_injected(FI_NO_BREAKPOINTS));
+			ret = compel_stop_pie(pid, rsti(item)->breakpoint, nobp);
 			if (ret < 0)
 				return -1;
 		}
@@ -2113,7 +2120,7 @@ static int restore_root_task(struct pstree_item *init)
 		 * the '--empty-ns net' mode no iptables C/R is done and we
 		 * need to return these rules by hands.
 		 */
-		ret = network_lock_internal();
+		ret = network_lock_internal(/* restore = */ true);
 		if (ret)
 			goto out_kill;
 	}
@@ -2125,6 +2132,9 @@ static int restore_root_task(struct pstree_item *init)
 	__restore_switch_stage(CR_STATE_FORKING);
 
 skip_ns_bouncing:
+	ret = run_plugins(POST_FORKING);
+	if (ret < 0 && ret != -ENOTSUP)
+		goto out_kill;
 
 	ret = restore_wait_inprogress_tasks();
 	if (ret < 0)
@@ -2252,7 +2262,7 @@ skip_ns_bouncing:
 		 * might actually be a true error code but that would be also
 		 * captured in the plugin so no need to print the error here.
 		 */
-		if (ret < 0)
+		if (ret < 0 && ret != -ENOTSUP)
 			pr_debug("restore late stage hook for external plugin failed\n");
 	}
 
@@ -2329,6 +2339,7 @@ int prepare_task_entries(void)
 	task_entries->nr_helpers = 0;
 	futex_set(&task_entries->start, CR_STATE_FAIL);
 	mutex_init(&task_entries->userns_sync_lock);
+	mutex_init(&task_entries->cgroupd_sync_lock);
 	mutex_init(&task_entries->last_pid_mutex);
 
 	return 0;
@@ -2355,41 +2366,47 @@ int cr_restore_tasks(void)
 		return 1;
 
 	if (check_img_inventory(/* restore = */ true) < 0)
-		goto err;
-
-	if (cr_plugin_init(CR_PLUGIN_STAGE__RESTORE))
 		return -1;
 
 	if (init_stats(RESTORE_STATS))
-		goto err;
+		return -1;
 
 	if (lsm_check_opts())
-		goto err;
+		return -1;
 
 	timing_start(TIME_RESTORE);
 
 	if (cpu_init() < 0)
-		goto err;
+		return -1;
 
 	if (vdso_init_restore())
-		goto err;
+		return -1;
 
 	if (tty_init_restore())
-		goto err;
+		return -1;
 
 	if (opts.cpu_cap & CPU_CAP_IMAGE) {
 		if (cpu_validate_cpuinfo())
-			goto err;
+			return -1;
 	}
 
 	if (prepare_task_entries() < 0)
-		goto err;
+		return -1;
 
 	if (prepare_pstree() < 0)
-		goto err;
+		return -1;
 
 	if (fdstore_init())
-		goto err;
+		return -1;
+
+	/*
+	 * For the AMDGPU plugin, its parallel restore feature needs to use fdstore to store
+	 * its socket file descriptor. This allows the main process and the target process to
+	 * communicate with each other through this file descriptor. Therefore, cr_plugin_init
+	 * must be initialized after fdstore_init.
+	 */
+	if (cr_plugin_init(CR_PLUGIN_STAGE__RESTORE))
+		return -1;
 
 	if (inherit_fd_move_to_fdstore())
 		goto err;
@@ -2551,6 +2568,17 @@ static int remap_restorer_blob(void *addr)
 	 */
 	restorer_setup_c_header_desc(&pbd, true);
 	compel_relocs_apply(addr, addr, &pbd);
+
+	/*
+	 * Ensure the infected thread sees the updated code.
+	 *
+	 * On architectures like ARM64, the Data Cache (D-cache) and
+	 * Instruction Cache (I-cache) are not automatically coherent.
+	 * Modifications land in the D-cache, so we must flush (clean) the
+	 * D-cache to push changes to RAM to ensure the CPU fetches the updated
+	 * instructions.
+	 */
+	__builtin___clear_cache(addr, addr + pbd.hdr.bsize);
 
 	return 0;
 }
@@ -2992,6 +3020,7 @@ static struct thread_creds_args *rst_prep_creds_args(CredsEntry *ce, unsigned lo
 	args->creds.cap_eff = NULL;
 	args->creds.cap_prm = NULL;
 	args->creds.cap_bnd = NULL;
+	args->creds.cap_amb = NULL;
 	args->creds.groups = NULL;
 	args->creds.lsm_profile = NULL;
 
@@ -2999,6 +3028,7 @@ static struct thread_creds_args *rst_prep_creds_args(CredsEntry *ce, unsigned lo
 	copy_caps(args->cap_eff, ce->cap_eff, ce->n_cap_eff);
 	copy_caps(args->cap_prm, ce->cap_prm, ce->n_cap_prm);
 	copy_caps(args->cap_bnd, ce->cap_bnd, ce->n_cap_bnd);
+	copy_caps(args->cap_amb, ce->cap_amb, ce->n_cap_amb);
 
 	if (ce->n_groups && !groups_match(ce->groups, ce->n_groups)) {
 		unsigned int *groups;
@@ -3100,6 +3130,9 @@ static void *restorer_munmap_addr(CoreEntry *core, void *restorer_blob)
 #endif
 	return restorer_sym(restorer_blob, arch_export_unmap);
 }
+
+void arch_rsti_init(struct pstree_item *p) __attribute__((weak));
+void arch_rsti_init(struct pstree_item *p) {}
 
 static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, unsigned long alen, CoreEntry *core)
 {
@@ -3320,6 +3353,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	 */
 	creds_pos_next = creds_pos;
 	siginfo_n = task_args->siginfo_n;
+	arch_rsti_init(current);
 	for (i = 0; i < current->nr_threads; i++) {
 		CoreEntry *tcore;
 		struct rt_sigframe *sigframe;
