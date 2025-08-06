@@ -8,6 +8,7 @@ TST_NOFILE	:=				\
 		sleeping00			\
 		pid00				\
 		caps00				\
+		caps01				\
 		wait00				\
 		zombie00			\
 		zombie01			\
@@ -23,6 +24,7 @@ TST_NOFILE	:=				\
 		sse20				\
 		mprotect00			\
 		timers				\
+		timers01			\
 		timerfd				\
 		unbound_sock			\
 		sched_prio00			\
@@ -35,6 +37,8 @@ TST_NOFILE	:=				\
 		socket_udp-corked		\
 		socket6_udp			\
 		socket_udp_shutdown		\
+		socket_icmp			\
+		socket6_icmp			\
 		sk-freebind			\
 		sk-freebind-false		\
 		socket_udplite			\
@@ -64,6 +68,7 @@ TST_NOFILE	:=				\
 		pipe01				\
 		pipe02				\
 		pthread00			\
+		pthread00-pac			\
 		pthread01			\
 		pthread02			\
 		pthread_timers			\
@@ -147,6 +152,7 @@ TST_NOFILE	:=				\
 		maps05				\
 		maps09				\
 		maps10				\
+		maps11				\
 		mlock_setuid			\
 		xids00				\
 		groups				\
@@ -375,6 +381,7 @@ TST_FILE	=				\
 		sk-unix-listen02		\
 		sk-unix-listen03		\
 		sk-unix-listen04		\
+		mnt_ext_file_bind_auto		\
 
 TST_DIR		=				\
 		cwd00				\
@@ -420,6 +427,7 @@ TST_DIR		=				\
 		mntns_ghost			\
 		mntns_ghost01			\
 		mntns_ro_root			\
+		mnt_ro_root			\
 		mntns_link_ghost		\
 		mntns_shared_bind		\
 		mntns_shared_bind02		\
@@ -494,6 +502,12 @@ STATE	= $(TST_STATE:%=%.state)
 STATE_OUT	= $(TST_STATE:%=%.out)
 
 include ../Makefile.inc
+
+ifeq ($(ARCH),aarch64)
+	PAC_CFLAGS := -mbranch-protection=standard
+else
+	PAC_CFLAGS :=
+endif
 
 all:	$(TST) criu-rtc.so
 install: all
@@ -586,6 +600,8 @@ uptime_grow:		LDLIBS += -lrt -pthread
 unlink_largefile:	CFLAGS += -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE
 inotify_system_nodel:	CFLAGS += -DNO_DEL
 pthread00:		LDLIBS += -pthread
+pthread00-pac:		CFLAGS += ${PAC_CFLAGS}
+pthread00-pac:		LDLIBS += -pthread
 pthread01:		LDLIBS += -pthread
 pthread02:		LDLIBS += -pthread
 pthread_timers:		LDLIBS += -lrt -pthread
@@ -617,6 +633,7 @@ socket-tcp6-closed:	CFLAGS += -D ZDTM_IPV6
 socket-tcp6-closed:	CFLAGS += -D ZDTM_IPV4V6
 socket-tcp-closed-last-ack:	CFLAGS += -D ZDTM_TCP_LAST_ACK
 socket-tcp-skip-in-flight:	CFLAGS += -D ZDTM_IPV4V6
+socket6-icmp:		CFLAGS += -DZDTM_IPV6
 sock_ip_opts01:		CFLAGS += -DZDTM_VAL_ZERO
 sock_tcp_opts01:	CFLAGS += -DZDTM_VAL_ZERO
 tun_ns:			CFLAGS += -DTUN_NS
@@ -722,7 +739,7 @@ criu-rtc.pb-c.c: criu-rtc.proto
 	$(Q)echo $@ >> .gitignore
 	$(Q)echo $(@:%.c=%.h) >> .gitignore
 	$(E) " PBCC     " $@
-	$(Q)protoc-c --proto_path=. --c_out=. criu-rtc.proto
+	$(Q)protoc --proto_path=. --c_out=. criu-rtc.proto
 
 criu-rtc.so: criu-rtc.c criu-rtc.pb-c.c
 	$(E) " LD       " $@

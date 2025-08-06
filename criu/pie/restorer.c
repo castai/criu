@@ -347,6 +347,22 @@ skip_xids:
 		return -1;
 	}
 
+	for (b = 0; b < CR_CAP_SIZE; b++) {
+		for (i = 0; i < 32; i++) {
+			if (b * 32 + i > args->cap_last_cap)
+				break;
+			if ((args->cap_amb[b] & (1 << i)) == 0)
+				/* don't set */
+				continue;
+			ret = sys_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, i + b * 32, 0, 0);
+			if (!ret)
+				continue;
+			pr_err("Unable to raise ambient capability %d: %d\n", i + b * 32, ret);
+			return -1;
+		}
+	}
+
+
 	if (lsm_type != LSMTYPE__SELINUX) {
 		/*
 		 * SELinux does not support setting the process context for
@@ -688,9 +704,8 @@ static int send_cg_set(int sk, int cg_set)
 }
 
 /*
- * As this socket is shared among threads, recvmsg(MSG_PEEK)
- * from the socket until getting its own thread id as an
- * acknowledge of successful threaded cgroup fixup
+ * As the cgroupd socket is shared among threads and processes, this
+ * should be called with task_entries->cgroupd_sync_lock held.
  */
 static int recv_cg_set_restore_ack(int sk)
 {
@@ -703,33 +718,22 @@ static int recv_cg_set_restore_ack(int sk)
 	h.msg_control = cmsg;
 	h.msg_controllen = sizeof(cmsg);
 
-	while (1) {
-		ret = sys_recvmsg(sk, &h, MSG_PEEK);
-		if (ret < 0) {
-			pr_err("Unable to peek from cgroupd %d\n", ret);
-			return -1;
-		}
+	ret = sys_recvmsg(sk, &h, 0);
+	if (ret < 0) {
+		pr_err("Unable to receive from cgroupd %d\n", ret);
+		return -1;
+	}
 
-		if (h.msg_controllen != sizeof(cmsg)) {
-			pr_err("The message from cgroupd is truncated\n");
-			return -1;
-		}
+	if (h.msg_controllen != sizeof(cmsg)) {
+		pr_err("The message from cgroupd is truncated\n");
+		return -1;
+	}
 
-		ch = CMSG_FIRSTHDR(&h);
-		cred = (struct ucred *)CMSG_DATA(ch);
-		if (cred->pid != sys_gettid())
-			continue;
-
-		/*
-		 * Actual remove message from recv queue of socket
-		 */
-		ret = sys_recvmsg(sk, &h, 0);
-		if (ret < 0) {
-			pr_err("Unable to receive from cgroupd %d\n", ret);
-			return -1;
-		}
-
-		break;
+	ch = CMSG_FIRSTHDR(&h);
+	cred = (struct ucred *)CMSG_DATA(ch);
+	if (cred->pid != sys_gettid()) {
+		pr_err("cred pid %d != gettid\n", cred->pid);
+		return -1;
 	}
 	return 0;
 }
@@ -766,12 +770,21 @@ __visible long __export_restore_thread(struct thread_restore_args *args)
 	rt_sigframe = (void *)&args->mz->rt_sigframe;
 
 	if (args->cg_set != -1) {
+		int err = 0;
+
+		mutex_lock(&task_entries_local->cgroupd_sync_lock);
+
 		pr_info("Restore cg_set in thread cg_set: %d\n", args->cg_set);
-		if (send_cg_set(args->cgroupd_sk, args->cg_set))
-			goto core_restore_end;
-		if (recv_cg_set_restore_ack(args->cgroupd_sk))
-			goto core_restore_end;
+
+		err = send_cg_set(args->cgroupd_sk, args->cg_set);
+		if (!err)
+			err = recv_cg_set_restore_ack(args->cgroupd_sk);
+
+		mutex_unlock(&task_entries_local->cgroupd_sync_lock);
 		sys_close(args->cgroupd_sk);
+
+		if (err)
+			goto core_restore_end;
 	}
 
 	if (restore_thread_common(args))
@@ -1222,9 +1235,23 @@ static int timerfd_arm(struct task_restore_args *args)
 
 static int create_posix_timers(struct task_restore_args *args)
 {
-	int ret, i;
+	int ret, i, exit_code = -1;
 	kernel_timer_t next_id = 0, timer_id;
 	struct sigevent sev;
+	bool create_restore_ids = false;
+
+	if (!args->posix_timers_n)
+		return 0;
+
+	/* prctl returns EINVAL if PR_TIMER_CREATE_RESTORE_IDS isn't supported. */
+	ret = sys_prctl(PR_TIMER_CREATE_RESTORE_IDS,
+			PR_TIMER_CREATE_RESTORE_IDS_ON, 0, 0, 0);
+	if (ret == 0) {
+		create_restore_ids = true;
+	} else if (ret != -EINVAL) {
+		pr_err("Can't enabled PR_TIMER_CREATE_RESTORE_IDS: %d\n", ret);
+		return -1;
+	}
 
 	for (i = 0; i < args->posix_timers_n; i++) {
 		sev.sigev_notify = args->posix_timers[i].spt.it_sigev_notify;
@@ -1236,16 +1263,36 @@ static int create_posix_timers(struct task_restore_args *args)
 #endif
 		sev.sigev_value.sival_ptr = args->posix_timers[i].spt.sival_ptr;
 
+		if (create_restore_ids) {
+			/*
+			 * With enabled PR_TIMER_CREATE_RESTORE_IDS, the
+			 * timer_create syscall creates a new timer with the
+			 * specified ID.
+			 */
+			timer_id = args->posix_timers[i].spt.it_id;
+			ret = sys_timer_create(args->posix_timers[i].spt.clock_id, &sev, &timer_id);
+			if (ret < 0) {
+				pr_err("Can't create posix timer - %d: %d\n", i, ret);
+				goto out;
+			}
+			if (timer_id != args->posix_timers[i].spt.it_id) {
+				pr_err("Unexpected timer id %u (expected %lu)\n",
+				       timer_id, args->posix_timers[i].spt.it_id);
+				goto out;
+			}
+			continue;
+		}
+
 		while (1) {
 			ret = sys_timer_create(args->posix_timers[i].spt.clock_id, &sev, &timer_id);
 			if (ret < 0) {
 				pr_err("Can't create posix timer - %d\n", i);
-				return ret;
+				goto out;
 			}
 
 			if (timer_id != next_id) {
 				pr_err("Can't create timers, kernel don't give them consequently\n");
-				return -1;
+				goto out;
 			}
 			next_id++;
 
@@ -1255,12 +1302,22 @@ static int create_posix_timers(struct task_restore_args *args)
 			ret = sys_timer_delete(timer_id);
 			if (ret < 0) {
 				pr_err("Can't remove temporaty posix timer 0x%x\n", timer_id);
-				return ret;
+				goto out;
 			}
 		}
 	}
 
-	return 0;
+	exit_code = 0;
+out:
+	if (create_restore_ids) {
+		ret = sys_prctl(PR_TIMER_CREATE_RESTORE_IDS,
+				PR_TIMER_CREATE_RESTORE_IDS_OFF, 0, 0, 0);
+		if (ret != 0) {
+			pr_err("Can't disable PR_TIMER_CREATE_RESTORE_IDS: %d\n", ret);
+			exit_code = -1;
+		}
+	}
+	return exit_code;
 }
 
 static void restore_posix_timers(struct task_restore_args *args)
@@ -2210,7 +2267,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	 * code below doesn't fail due to bad timing values.
 	 */
 
-#define itimer_armed(args, i) (args->itimers[i].it_interval.tv_sec || args->itimers[i].it_interval.tv_usec)
+#define itimer_armed(args, i) (args->itimers[i].it_value.tv_sec || args->itimers[i].it_value.tv_usec)
 
 	if (itimer_armed(args, 0))
 		sys_setitimer(ITIMER_REAL, &args->itimers[0], NULL);

@@ -36,6 +36,15 @@
 #ifndef PR_SET_NO_NEW_PRIVS
 #define PR_SET_NO_NEW_PRIVS 38
 #endif
+#ifndef PR_CAP_AMBIENT
+#define PR_CAP_AMBIENT 47
+#endif
+#ifndef PR_CAP_AMBIENT_IS_SET
+#define PR_CAP_AMBIENT_IS_SET 1
+#endif
+#ifndef PR_CAP_AMBIENT_RAISE
+#define PR_CAP_AMBIENT_RAISE 2
+#endif
 
 #ifndef PR_SET_MM
 #define PR_SET_MM	      35
@@ -86,6 +95,13 @@ struct prctl_mm_map {
 
 #ifndef PR_GET_THP_DISABLE
 #define PR_GET_THP_DISABLE 42
+#endif
+
+#ifndef PR_TIMER_CREATE_RESTORE_IDS
+#define PR_TIMER_CREATE_RESTORE_IDS             77
+# define PR_TIMER_CREATE_RESTORE_IDS_OFF        0
+# define PR_TIMER_CREATE_RESTORE_IDS_ON         1
+# define PR_TIMER_CREATE_RESTORE_IDS_GET        2
 #endif
 
 #endif /* __CR_PRCTL_H__ */

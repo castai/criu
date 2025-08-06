@@ -888,7 +888,11 @@ static int resolve_external_mounts(struct mount_info *info)
 
 		cut_root = cut_root_for_bind(m->root, match->root);
 
-		p = xsprintf("%s/%s", match->ns_mountpoint + 1, cut_root);
+		if (cut_root[0] == '\0') {
+			p = xstrdup(match->ns_mountpoint + 1);
+		} else {
+			p = xsprintf("%s/%s", match->ns_mountpoint + 1, cut_root);
+		}
 		if (!p)
 			return -1;
 
@@ -2690,8 +2694,15 @@ shared:
 
 static int do_mount_root(struct mount_info *mi)
 {
+	unsigned long mflags = mi->flags & (~MS_PROPAGATE);
+
 	if (restore_shared_options(mi, !mi->shared_id && !mi->master_id, mi->shared_id, mi->master_id))
 		return -1;
+
+	if (mflags && mount(NULL, service_mountpoint(mi), NULL, MS_REMOUNT | MS_BIND | mflags, NULL)) {
+		pr_perror("Unable to apply root mount options");
+		return -1;
+	}
 
 	return fetch_rt_stat(mi, service_mountpoint(mi));
 }

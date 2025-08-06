@@ -140,6 +140,10 @@ ifneq ($(GCOV),)
         CFLAGS          += $(CFLAGS-GCOV)
 endif
 
+ifneq ($(NETWORK_LOCK_DEFAULT),)
+	CFLAGS		+= -DNETWORK_LOCK_DEFAULT=$(NETWORK_LOCK_DEFAULT)
+endif
+
 ifeq ($(ASAN),1)
 	CFLAGS-ASAN	:= -fsanitize=address
 	export		CFLAGS-ASAN
@@ -466,7 +470,7 @@ shellcheck:
 	shellcheck -x test/others/action-script/*.sh
 
 codespell:
-	codespell -S tags
+	codespell
 
 lint: ruff shellcheck codespell
 	# Do not append \n to pr_perror, pr_pwarn or fail

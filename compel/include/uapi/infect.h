@@ -13,6 +13,15 @@
 
 #define PARASITE_START_AREA_MIN (4096)
 
+#define PARASITE_STACK_SIZE (16 << 10)
+/*
+ * A stack redzone is a small, protected region of memory located immediately
+ * after a parasite stack. It is intended to remain unchanged. While it can be
+ * implemented as a guard page, we want to avoid the overhead of additional
+ * remote system calls.
+ */
+#define PARASITE_STACK_REDZONE 128
+
 extern int __must_check compel_interrupt_task(int pid);
 
 struct seize_task_status {
@@ -97,7 +106,7 @@ extern k_rtsigset_t *compel_thread_sigmask(struct parasite_thread_ctl *tctl);
 struct rt_sigframe;
 
 typedef int (*open_proc_fn)(int pid, int mode, const char *fmt, ...) __attribute__((__format__(__printf__, 3, 4)));
-typedef int (*save_regs_t)(void *, user_regs_struct_t *, user_fpregs_struct_t *);
+typedef int (*save_regs_t)(pid_t pid, void *, user_regs_struct_t *, user_fpregs_struct_t *);
 typedef int (*make_sigframe_t)(void *, struct rt_sigframe *, struct rt_sigframe *, k_rtsigset_t *);
 
 struct infect_ctx {

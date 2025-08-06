@@ -6,6 +6,10 @@
 #define MAP_HUGETLB 0x40000
 #endif
 
+#ifndef MAP_DROPPABLE
+#define MAP_DROPPABLE 0x08
+#endif
+
 #ifndef MADV_HUGEPAGE
 #define MADV_HUGEPAGE 14
 #endif
@@ -16,6 +20,10 @@
 
 #ifndef MADV_DONTDUMP
 #define MADV_DONTDUMP 16
+#endif
+
+#ifndef MADV_WIPEONFORK
+#define MADV_WIPEONFORK 18
 #endif
 
 static void parse_vmflags(char *buf, unsigned long *flags, unsigned long *madv)
@@ -41,6 +49,8 @@ static void parse_vmflags(char *buf, unsigned long *flags, unsigned long *madv)
 			*flags |= MAP_NORESERVE;
 		else if (_vmflag_match(tok, "ht"))
 			*flags |= MAP_HUGETLB;
+		else if (_vmflag_match(tok, "dp"))
+			*flags |= MAP_DROPPABLE;
 
 		/* madvise() block */
 		if (_vmflag_match(tok, "sr"))
@@ -57,6 +67,8 @@ static void parse_vmflags(char *buf, unsigned long *flags, unsigned long *madv)
 			*madv |= (1ul << MADV_HUGEPAGE);
 		else if (_vmflag_match(tok, "nh"))
 			*madv |= (1ul << MADV_NOHUGEPAGE);
+		else if (_vmflag_match(tok, "wf"))
+			*madv |= (1ul << MADV_WIPEONFORK);
 
 		/*
 		 * Anything else is just ignored.

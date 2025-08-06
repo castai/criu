@@ -75,6 +75,7 @@ struct thread_creds_args {
 	u32 cap_prm[CR_CAP_SIZE];
 	u32 cap_eff[CR_CAP_SIZE];
 	u32 cap_bnd[CR_CAP_SIZE];
+	u32 cap_amb[CR_CAP_SIZE];
 
 	char *lsm_profile;
 	unsigned int *groups;
@@ -169,6 +170,7 @@ struct task_restore_args {
 
 	struct restore_posix_timer *posix_timers;
 	unsigned int posix_timers_n;
+	bool posix_timer_cr_ids;
 
 	struct restore_timerfd *timerfd;
 	unsigned int timerfd_n;

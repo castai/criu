@@ -2,11 +2,19 @@
 #include "zdtmtst.h"
 #include "get_smaps_bits.h"
 
+#ifndef MAP_DROPPABLE
+#define MAP_DROPPABLE 0x08
+#endif
+
 #ifndef MADV_DONTDUMP
 #define MADV_DONTDUMP 16
 #endif
 
-const char *test_doc = "Test shared memory with advises";
+#ifndef MADV_WIPEONFORK
+#define MADV_WIPEONFORK 18
+#endif
+
+const char *test_doc = "Test private memory with advises";
 const char *test_author = "Cyrill Gorcunov <gorcunov@openvz.org>";
 
 struct mmap_data {
@@ -23,8 +31,14 @@ static int alloc_anon_mmap(struct mmap_data *m, int flags, int adv)
 {
 	m->start = mmap(NULL, MEM_SIZE, PROT_READ | PROT_WRITE, flags, -1, 0);
 	if (m->start == MAP_FAILED) {
-		pr_perror("mmap failed");
-		return -1;
+		if (errno == EINVAL) {
+			test_msg("mmap failed, no kernel support\n");
+			*m = (struct mmap_data){};
+			return 0;
+		} else {
+			pr_perror("mmap failed");
+			return -1;
+		}
 	}
 
 	if (madvise(m->start, MEM_SIZE, adv)) {
@@ -43,12 +57,12 @@ static int alloc_anon_mmap(struct mmap_data *m, int flags, int adv)
 
 int main(int argc, char **argv)
 {
-	struct mmap_data m[5] = {};
+	struct mmap_data m[7] = {};
 	size_t i;
 
 	test_init(argc, argv);
 
-	test_msg("Alloc growsdown\n");
+	test_msg("Alloc dontfork\n");
 	if (alloc_anon_mmap(&m[0], MAP_PRIVATE | MAP_ANONYMOUS, MADV_DONTFORK))
 		return -1;
 
@@ -64,8 +78,16 @@ int main(int argc, char **argv)
 	if (alloc_anon_mmap(&m[3], MAP_PRIVATE | MAP_ANONYMOUS, MADV_HUGEPAGE))
 		return -1;
 
-	test_msg("Alloc dontfork/random|mergeable\n");
+	test_msg("Alloc mergeable\n");
 	if (alloc_anon_mmap(&m[4], MAP_PRIVATE | MAP_ANONYMOUS, MADV_MERGEABLE))
+		return -1;
+
+	test_msg("Alloc wipeonfork\n");
+	if (alloc_anon_mmap(&m[5], MAP_PRIVATE | MAP_ANONYMOUS, MADV_WIPEONFORK))
+		return -1;
+
+	test_msg("Alloc droppable\n");
+	if (alloc_anon_mmap(&m[6], MAP_DROPPABLE | MAP_ANONYMOUS, MADV_NORMAL))
 		return -1;
 
 	test_msg("Fetch existing flags/adv\n");

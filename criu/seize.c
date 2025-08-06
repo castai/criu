@@ -87,7 +87,10 @@ static const char frozen[] = "FROZEN";
 static const char freezing[] = "FREEZING";
 static const char thawed[] = "THAWED";
 
-enum freezer_state { FREEZER_ERROR = -1, THAWED, FROZEN, FREEZING };
+enum freezer_state { FREEZER_ERROR = -1,
+		     THAWED,
+		     FROZEN,
+		     FREEZING };
 
 /* Track if we are running on cgroup v2 system. */
 static bool cgroup_v2 = false;
@@ -536,13 +539,42 @@ err:
 	return exit_code;
 }
 
+static void cgroupv1_freezer_kludges(int fd, int iter, const struct timespec *req) {
+	/* As per older kernel docs (freezer-subsystem.txt before
+	 * the kernel commit ef9fe980c6fcc1821), if FREEZING is seen,
+	 * userspace should either retry or thaw. While current
+	 * kernel cgroup v1 docs no longer mention a need to retry,
+	 * even recent kernels can't reliably freeze a cgroup v1.
+	 *
+	 * Let's keep asking the kernel to freeze from time to time.
+	 * In addition, do occasional thaw/sleep/freeze.
+	 *
+	 * This is still a game of chances (the real fix belongs to the kernel)
+	 * but these kludges might improve the probability of success.
+	 *
+	 * Cgroup v2 does not have this problem.
+	 */
+	switch (iter % 32) {
+		case 9:
+		case 20:
+			freezer_write_state(fd, FROZEN);
+			break;
+		case 31:
+			freezer_write_state(fd, THAWED);
+			nanosleep(req, NULL);
+			freezer_write_state(fd, FROZEN);
+			break;
+	}
+}
+
 static int freeze_processes(void)
 {
 	int fd, exit_code = -1;
 	enum freezer_state state = THAWED;
 
 	static const unsigned long step_ms = 100;
-	unsigned long nr_attempts = (opts.timeout * 1000000) / step_ms;
+	/* Since opts.timeout is in seconds, multiply it by 1000 to convert to milliseconds. */
+	unsigned long nr_attempts = (opts.timeout * 1000) / step_ms;
 	unsigned long i = 0;
 
 	const struct timespec req = {
@@ -551,14 +583,12 @@ static int freeze_processes(void)
 	};
 
 	if (unlikely(!nr_attempts)) {
-		/*
-		 * If timeout is turned off, lets
-		 * wait for at least 10 seconds.
-		 */
-		nr_attempts = (10 * 1000000) / step_ms;
+		/* If the timeout is 0, wait for at least 10 seconds. */
+		nr_attempts = (10 * 1000) / step_ms;
 	}
 
-	pr_debug("freezing processes: %lu attempts with %lu ms steps\n", nr_attempts, step_ms);
+	pr_debug("freezing cgroup %s: %lu x %lums attempts, timeout: %us\n",
+		 opts.freeze_cgroup, nr_attempts, step_ms, opts.timeout);
 
 	fd = freezer_open();
 	if (fd < 0)
@@ -585,22 +615,25 @@ static int freeze_processes(void)
 		 * not read @tasks pids while freezer in
 		 * transition stage.
 		 */
-		for (; i <= nr_attempts; i++) {
+		while (1) {
 			state = get_freezer_state(fd);
 			if (state == FREEZER_ERROR) {
 				close(fd);
 				return -1;
 			}
 
-			if (state == FROZEN)
+			if (state == FROZEN || i++ == nr_attempts || alarm_timeouted())
 				break;
-			if (alarm_timeouted())
-				goto err;
+
+			if (!cgroup_v2)
+				cgroupv1_freezer_kludges(fd, i, &req);
+
 			nanosleep(&req, NULL);
 		}
 
-		if (i > nr_attempts) {
-			pr_err("Unable to freeze cgroup %s\n", opts.freeze_cgroup);
+		if (state != FROZEN) {
+			pr_err("Unable to freeze cgroup %s (%lu x %lums attempts, timeout: %us)\n",
+			       opts.freeze_cgroup, i, step_ms, opts.timeout);
 			if (!pr_quelled(LOG_DEBUG))
 				log_unfrozen_stacks(opts.freeze_cgroup);
 			goto err;
@@ -674,8 +707,6 @@ static int collect_children(struct pstree_item *item)
 			goto free;
 		}
 
-		pr_info("Seized task %d, state %d\n", pid, ret);
-
 		c = alloc_pstree_item();
 		if (c == NULL) {
 			ret = -1;
@@ -712,6 +743,8 @@ static int collect_children(struct pstree_item *item)
 
 		if (ret == TASK_STOPPED)
 			c->pid->stop_signo = compel_parse_stop_signo(pid);
+
+		pr_info("Seized task %d, state %d\n", pid, ret);
 
 		c->pid->real = pid;
 		c->parent = item;
@@ -975,7 +1008,7 @@ static int collect_task(struct pstree_item *item)
 	if (ret < 0)
 		goto err_close;
 
-	if ((item->pid->state == TASK_DEAD) && !list_empty(&item->children)) {
+	if ((item->pid->state == TASK_DEAD) && has_children(item)) {
 		pr_err("Zombie with children?! O_o Run, run, run!\n");
 		goto err_close;
 	}
@@ -1017,7 +1050,6 @@ int collect_pstree(void)
 	pid_t pid = root_item->pid->real;
 	int ret, exit_code = -1;
 	struct proc_status_creds creds;
-	struct pstree_item *iter;
 
 	timing_start(TIME_FREEZING);
 
@@ -1028,22 +1060,32 @@ int collect_pstree(void)
 	 */
 	alarm(opts.timeout);
 
-	ret = run_plugins(PAUSE_DEVICES, pid);
-	if (ret < 0 && ret != -ENOTSUP) {
-		goto err;
-	}
-
 	if (opts.freeze_cgroup && cgroup_version())
 		goto err;
 
 	pr_debug("Detected cgroup V%d freezer\n", cgroup_v2 ? 2 : 1);
 
 	if (opts.freeze_cgroup && !compel_interrupt_only_mode) {
+		ret = run_plugins(PAUSE_DEVICES, pid);
+		if (ret < 0 && ret != -ENOTSUP) {
+			goto err;
+		}
+
 		if (freeze_processes())
 			goto err;
 	} else {
 		if (opts.freeze_cgroup && prepare_freezer_for_interrupt_only_mode())
 			goto err;
+
+		/*
+		 * Call PAUSE_DEVICES after prepare_freezer_for_interrupt_only_mode()
+		 * to be able to checkpoint containers in a frozen state.
+		 */
+		ret = run_plugins(PAUSE_DEVICES, pid);
+		if (ret < 0 && ret != -ENOTSUP) {
+			goto err;
+		}
+
 		if (compel_interrupt_task(pid)) {
 			set_cr_errno(ESRCH);
 			goto err;
@@ -1078,6 +1120,21 @@ int collect_pstree(void)
 		goto err;
 	}
 
+	exit_code = 0;
+	timing_stop(TIME_FREEZING);
+	timing_start(TIME_FROZEN);
+
+err:
+	/* Freezing stage finished in time - disable timer. */
+	alarm(0);
+	return exit_code;
+}
+
+int checkpoint_devices(void)
+{
+	struct pstree_item *iter;
+	int ret, exit_code = -1;
+
 	for_each_pstree_item(iter) {
 		if (!task_alive(iter))
 			continue;
@@ -1087,11 +1144,6 @@ int collect_pstree(void)
 	}
 
 	exit_code = 0;
-	timing_stop(TIME_FREEZING);
-	timing_start(TIME_FROZEN);
-
 err:
-	/* Freezing stage finished in time - disable timer. */
-	alarm(0);
 	return exit_code;
 }
