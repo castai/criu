@@ -331,7 +331,7 @@ static void early_vprint(const char *format, unsigned int loglevel, va_list para
 	hdr = (void *)early_log_buffer + early_log_buf_off;
 	hdr->level = loglevel;
 	/* Skip the log entry size */
-	early_log_buf_off += sizeof(*hdr);
+	early_log_buf_off += sizeof(hdr);
 	log_space = EARLY_LOG_BUF_LEN - early_log_buf_off;
 	if (loglevel >= LOG_TIMESTAMP) {
 		/*
