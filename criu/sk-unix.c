@@ -696,12 +696,16 @@ static int unix_resolve_name(int lfd, uint32_t id, struct unix_sk_desc *d, UnixS
 	if (name[0] != '/') {
 		if (cut_path_ending(path, name)) {
 			pr_err("Unable too cut %s from %s\n", name, path);
-			goto out;
+			if (unix_resolve_name_old(lfd, id, d, ue, p)) {
+				pr_err("unix_resolve_name: unix_resolve_name_old failed\n");
+				goto out;
+			}
+            pr_debug("unix_resolve_name: unix_resolve_name_old fallback succeeded\n");
+		} else {
+            ue->name_dir = xstrdup(path);
+            if (!ue->name_dir)
+                goto out;
 		}
-
-		ue->name_dir = xstrdup(path);
-		if (!ue->name_dir)
-			goto out;
 
 		pr_debug("Resolved socket relative name %s to %s/%s\n", name, ue->name_dir, name);
 	}
