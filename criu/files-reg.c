@@ -694,18 +694,23 @@ static int collect_remap_dead_process(struct reg_file_info *rfi, RemapFilePathEn
 
 	/*
 	 * First check if this PID/TID already exists in the dump.
-	 * Even if it's a thread (TASK_THREAD), we still need a helper because
-	 * threads are created later in the restorer (after FDs are opened),
-	 * so /proc/<pid>/task/<tid> won't exist yet when we try to open FDs.
-	 * The helper ensures the path exists during FD restoration.
+	 * If it's a thread (TASK_THREAD), we DON'T create a helper because:
+	 * 1. Creating a helper with the TID would cause a TID collision when
+	 *    the real thread is created later
+	 * 2. The thread will be restored normally and /proc/<pid>/task/<tid>
+	 *    will eventually exist
+	 * 3. FD opening will retry until the thread is created (see open_path)
 	 */
 	pid_node = pstree_pid_by_virt(rfe->remap_id);
 	if (pid_node) {
 		if (pid_node->state == TASK_THREAD) {
-			pr_info("Thread %d exists in dump, creating helper for /proc/.../task/%d\n",
+			pr_info("Thread %d exists in dump, will retry FD opening for /proc/.../task/%d\n",
 				rfe->remap_id, rfe->remap_id);
-			/* Fall through to create helper */
-		} else if (pid_node->state != TASK_UNDEF) {
+			/* Don't create helper - would cause TID collision.
+			 * FD opening will check and retry (see do_open_reg_noseek_flags) */
+			return 0;
+		}
+		if (pid_node->state != TASK_UNDEF) {
 			pr_info("Skipping helper for restoring /proc/%d; pid exists\n", rfe->remap_id);
 			return 0;
 		}
@@ -2591,6 +2596,24 @@ int collect_filemap(struct vma_area *vma)
 static int open_fe_fd(struct file_desc *fd, int *new_fd)
 {
 	int tmp;
+	struct reg_file_info *rfi = container_of(fd, struct reg_file_info, d);
+
+	/*
+	 * For thread-specific /proc paths, check if the thread exists yet.
+	 * Threads are created in the restorer after FDs are opened, so we
+	 * need to retry until the thread is created.
+	 */
+	if (rfi->path && strstr(rfi->path, "/task/")) {
+		int mntns_root = mntns_get_root_by_mnt_id(rfi->rfe->mnt_id);
+		if (mntns_root < 0)
+			return -1;
+		if (faccessat(mntns_root, rfi->path, F_OK, 0) < 0) {
+			if (errno == ENOENT) {
+				pr_debug("Thread proc path %s doesn't exist yet, retrying\n", rfi->path);
+				return 1; /* Retry later */
+			}
+		}
+	}
 
 	tmp = open_path(fd, do_open_reg, NULL);
 	if (tmp < 0)
