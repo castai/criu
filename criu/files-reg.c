@@ -1321,6 +1321,24 @@ static int check_path_remap(struct fd_link *link, const struct fd_parms *parms, 
 			return 0;
 		pid = strtol(start + 1, &end, 10);
 
+		/*
+		 * Check if this is a /proc/<pid>/task/<tid> path.
+		 * In this case, we need to create a helper for the thread (tid),
+		 * not the process (pid), since file descriptors may reference
+		 * thread-specific paths like /proc/1/task/156/stat.
+		 */
+		if (pid != 0 && end && strncmp(end, "/task/", 6) == 0) {
+			pid_t tid;
+			char *tid_end;
+
+			tid = strtol(end + 6, &tid_end, 10);
+			if (tid != 0) {
+				pr_debug("Detected /proc/%d/task/%d path\n", pid, tid);
+				pid = tid;
+				end = tid_end;
+			}
+		}
+
 		/* If strtol didn't convert anything, then we are looking at
 		 * something like /proc/kmsg, which we shouldn't mess with.
 		 * Anything under /proc/<pid> (including that directory itself)
