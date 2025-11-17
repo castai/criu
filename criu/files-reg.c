@@ -694,18 +694,18 @@ static int collect_remap_dead_process(struct reg_file_info *rfi, RemapFilePathEn
 
 	/*
 	 * First check if this PID/TID already exists in the dump.
-	 * If it's a thread (TASK_THREAD), we don't need a helper because
-	 * the thread will be restored normally and /proc/<pid>/task/<tid>
-	 * will exist.
+	 * Even if it's a thread (TASK_THREAD), we still need a helper because
+	 * threads are created later in the restorer (after FDs are opened),
+	 * so /proc/<pid>/task/<tid> won't exist yet when we try to open FDs.
+	 * The helper ensures the path exists during FD restoration.
 	 */
 	pid_node = pstree_pid_by_virt(rfe->remap_id);
 	if (pid_node) {
 		if (pid_node->state == TASK_THREAD) {
-			pr_info("Thread %d exists in dump, no helper needed for /proc/.../task/%d\n",
+			pr_info("Thread %d exists in dump, creating helper for /proc/.../task/%d\n",
 				rfe->remap_id, rfe->remap_id);
-			return 0;
-		}
-		if (pid_node->state != TASK_UNDEF) {
+			/* Fall through to create helper */
+		} else if (pid_node->state != TASK_UNDEF) {
 			pr_info("Skipping helper for restoring /proc/%d; pid exists\n", rfe->remap_id);
 			return 0;
 		}
