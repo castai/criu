@@ -690,6 +690,26 @@ static int open_remap_linked(struct reg_file_info *rfi)
 static int collect_remap_dead_process(struct reg_file_info *rfi, RemapFilePathEntry *rfe)
 {
 	struct pstree_item *helper;
+	struct pid *pid_node;
+
+	/*
+	 * First check if this PID/TID already exists in the dump.
+	 * If it's a thread (TASK_THREAD), we don't need a helper because
+	 * the thread will be restored normally and /proc/<pid>/task/<tid>
+	 * will exist.
+	 */
+	pid_node = pstree_pid_by_virt(rfe->remap_id);
+	if (pid_node) {
+		if (pid_node->state == TASK_THREAD) {
+			pr_info("Thread %d exists in dump, no helper needed for /proc/.../task/%d\n",
+				rfe->remap_id, rfe->remap_id);
+			return 0;
+		}
+		if (pid_node->state != TASK_UNDEF) {
+			pr_info("Skipping helper for restoring /proc/%d; pid exists\n", rfe->remap_id);
+			return 0;
+		}
+	}
 
 	helper = lookup_create_item(rfe->remap_id);
 	if (!helper)
