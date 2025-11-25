@@ -738,6 +738,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	if (req->has_display_stats)
 		opts.display_stats = req->display_stats;
 
+	if (req->has_allow_uprobes)
+		opts.allow_uprobes = req->allow_uprobes;
+
 	/* Evaluate additional configuration file (e.g., runc.conf) to overwrite all RPC settings. */
 	if (req->config_file) {
 		char *tmp_output = opts.output;
