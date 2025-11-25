@@ -783,6 +783,10 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 
 	/* Evaluate additional configuration file a second time to overwrite
 	 * all RPC settings. */
+	if (req->has_allow_uprobes)
+		opts.allow_uprobes = req->allow_uprobes;
+
+	/* Evaluate additional configuration file (e.g., runc.conf) to overwrite all RPC settings. */
 	if (req->config_file) {
 		rpc_cfg_file = req->config_file;
 		i = parse_options(0, NULL, &dummy, &dummy, PARSING_RPC_CONF);
