@@ -170,6 +170,11 @@ message criu_opts {
 	/* Plugin-owned namespaced options in PLUGIN.NAME[=VALUE] form. */
 	repeated string			plugin_options		= 77;
 	optional bool			stream			= 78;
+	/*
+	 * CastAI Live options use the 1000+ range to stay clear of the
+	 * sequential field numbers allocated by upstream CRIU.
+	 */
+	optional bool			allow_uprobes		= 1000;
 /*	optional bool			check_mounts		= 128;	*/
 }
 
