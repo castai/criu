@@ -9,8 +9,12 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
 	git-core \
 	iptables \
 	libaio-dev \
+	libbpf-dev \
 	libbsd-dev \
 	libcap-dev \
+	libelf-dev \
+	libzstd-dev \
+	zlib1g-dev \
 	libnl-3-dev \
 	libprotobuf-c-dev \
 	libprotobuf-dev \
