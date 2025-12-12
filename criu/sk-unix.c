@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <dlfcn.h>
 #include <libgen.h>
+#include <linux/openat2.h>
 
 #include "libnetlink.h"
 #include "cr_options.h"
@@ -24,6 +25,7 @@
 #include "sockets.h"
 #include "sk-queue.h"
 #include "mount.h"
+#include "mount-v2.h"
 #include "cr-service.h"
 #include "plugin.h"
 #include "namespaces.h"
@@ -255,6 +257,17 @@ static int get_mnt_id(int lfd, int *mnt_id)
 	return 0;
 }
 
+static int openat_resolve_in_root(int dirfd, const char *pathname, int flags)
+{
+	struct open_how how = {
+		.flags = flags,
+		.mode = 0,
+		.resolve = RESOLVE_IN_ROOT,
+	};
+
+	return sys_openat2(dirfd, pathname, &how, sizeof(how));
+}
+
 static int resolve_rel_name(uint32_t id, struct unix_sk_desc *sk, const struct fd_parms *p, char **pdir)
 {
 	const char *dirs[] = { "cwd", "root" };
@@ -285,7 +298,7 @@ static int resolve_rel_name(uint32_t id, struct unix_sk_desc *sk, const struct f
 	for (i = 0; i < ARRAY_SIZE(dirs); i++) {
 		char dir[PATH_MAX], path[PATH_MAX];
 		struct stat st;
-		int ret;
+		int ret, path_fd;
 
 		snprintf(path, sizeof(path), "/proc/%d/%s", p->pid, dirs[i]);
 		ret = readlink(path, dir, sizeof(dir));
@@ -299,9 +312,25 @@ static int resolve_rel_name(uint32_t id, struct unix_sk_desc *sk, const struct f
 			pr_err("The path .%s/%s is too long\n", dir, sk->name);
 			goto err;
 		}
-		if (fstatat(mntns_root, path, &st, 0)) {
-			if (errno == ENOENT)
+
+		/*
+		 * Use openat2 with RESOLVE_IN_ROOT to properly handle absolute
+		 * symlinks within the mount namespace. This prevents symlinks like
+		 * /var/run -> /run from escaping to the host's namespace.
+		 */
+		path_fd = openat_resolve_in_root(mntns_root, path, O_PATH | O_NOFOLLOW);
+		if (path_fd < 0) {
+			if (errno == ENOENT) {
+				pr_debug("Socket path %s does not exist\n", path);
 				continue;
+			}
+			goto err;
+		}
+
+		ret = fstat(path_fd, &st);
+		close(path_fd);
+		if (ret < 0) {
+			pr_perror("Can't fstat socket path %s", path);
 			goto err;
 		}
 
