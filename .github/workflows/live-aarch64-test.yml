@@ -1,0 +1,27 @@
+name: LIVE aarch64 GCC Test
+
+on:
+  push:
+    branches: [live-dev]
+  pull_request:
+
+concurrency:
+  group: live-aarch64-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+    - uses: actions/checkout@v4
+    - name: Run aarch64 GCC Test
+      run: |
+        # The 'sched_policy00' needs the following:
+        sudo sysctl -w kernel.sched_rt_runtime_us=-1
+        # etc/hosts entry is needed for netns_lock_iptables
+        echo "127.0.0.1   localhost" | sudo tee -a /etc/hosts
+        # Clean test plugins - they don't work with static linking (missing -rdynamic symbols)
+        make -C test/plugins clean || true
+        sudo -E SKIP_PLUGIN_TESTS=1 make -C scripts/ci live-local GCC=1 RUN_TESTS=1 NO_GNUTLS=1 \
+          COMPILE_FLAGS="NO_CUDA_PLUGIN=1" \
+          ZDTM_OPTS="-p $(nproc) -x zdtm/static/change_mnt_context -x zdtm/static/maps05 -x zdtm/static/socket-tcp-close0 -x zdtm/static/socket-dump-tcp-close"
