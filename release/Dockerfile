@@ -28,7 +28,8 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
 
 COPY . /work
 WORKDIR /work
-RUN make -j $(nproc) criu
+RUN make -j $(nproc) criu cuda_plugin
 
 FROM scratch
 COPY --from=build /work/criu/criu .
+COPY --from=build /work/plugins/cuda/cuda_plugin.so .
