@@ -88,7 +88,18 @@ $(obj)/%: pie
 
 $(obj)/criu: $(PROGRAM-BUILTINS)
 	$(call msg-link, $@)
-	$(Q) $(CC) $(CFLAGS) $^ $(LDFLAGS) $(LIBS) $(WRAPFLAGS) $(GMONLDOPT) -rdynamic -o $@
+	$(Q) $(CC) $(CFLAGS) $^ $(LDFLAGS) $(LIBS) $(WRAPFLAGS) $(GMONLDOPT) -rdynamic \
+		-Wl,--undefined=fi_strategy \
+		-Wl,--undefined=set_compel_interrupt_only_mode \
+		-Wl,--undefined=close_fds \
+		-Wl,--undefined=add_inventory_plugin \
+		-Wl,--undefined=check_and_remove_inventory_plugin \
+		-Wl,--undefined=alarm_timeouted \
+		-Wl,--undefined=opts \
+		-Wl,--undefined=parse_pid_status \
+		-Wl,--undefined=xmalloc \
+		-Wl,--undefined=xfree \
+		-o $@
 
 UNIT-BUILTINS		+= $(obj)/util.o
 UNIT-BUILTINS		+= $(obj)/config.o
