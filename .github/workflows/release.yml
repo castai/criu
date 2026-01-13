@@ -35,8 +35,8 @@ jobs:
 
       - name: Create tar
         run: |
-          tar -czf criu-${{ github.ref_name}}-linux-amd64.tar.gz -C amd64-bins criu
-          tar -czf criu-${{ github.ref_name}}-linux-arm64.tar.gz -C arm64-bins criu
+          tar -czf criu-${{ github.ref_name}}-linux-amd64.tar.gz -C amd64-bins .
+          tar -czf criu-${{ github.ref_name}}-linux-arm64.tar.gz -C arm64-bins .
           sha256sum criu-${{ github.ref_name}}-linux-amd64.tar.gz >> SHA256SUMS
           sha256sum criu-${{ github.ref_name}}-linux-arm64.tar.gz >> SHA256SUMS
 
