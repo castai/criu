@@ -38,7 +38,7 @@ copy_deps() {
 		# or: /lib64/ld-linux-x86-64.so.2 (0xaddress)
 
 		# Extract library path
-		libpath=$(echo "$line" | grep -oP '=> \K[^ ]+' || echo "$line" | grep -oP '^[[:space:]]*\K/[^ ]+')
+		libpath=$(echo "$line" | awk '{if($2=="=>") print $3; else if(substr($1,1,1)=="/") print $1}')
 
 		# Skip if no path found or if it's a virtual library
 		if [ -z "$libpath" ] || [ "$libpath" = "=>" ] || [[ "$line" =~ "not found" ]]; then
