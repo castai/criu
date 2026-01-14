@@ -11,11 +11,14 @@ if [ $# -lt 2 ]; then
 fi
 
 # Last argument is the output directory
-OUTPUT_DIR="${@: -1}"
+OUTPUT_DIR="${!#}"
 # All other arguments are binaries
-BINARIES=("${@:1:$#-1}")
+BINARIES=()
+for ((i=1; i<$#; i++)); do
+	BINARIES+=("${!i}")
+done
 
-echo "Gathering dependencies for: ${BINARIES[@]}"
+echo "Gathering dependencies for: ${BINARIES[*]}"
 echo "Output directory: $OUTPUT_DIR"
 
 mkdir -p "$OUTPUT_DIR"
@@ -90,4 +93,4 @@ for binary in "${BINARIES[@]}"; do
 done
 
 echo "Done! Dependencies copied to $OUTPUT_DIR"
-echo "Total libraries: $(ls -1 "$OUTPUT_DIR" | wc -l)"
+echo "Total libraries: $(find "$OUTPUT_DIR" -maxdepth 1 -type f | wc -l)"
