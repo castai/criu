@@ -28,8 +28,20 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
 
 COPY . /work
 WORKDIR /work
-RUN make -j $(nproc) criu cuda_plugin
+
+# Build with HERMETIC=1 to enable dynamic linking with rpath
+RUN make -j $(nproc) HERMETIC=1 criu cuda_plugin
+
+# Gather all shared library dependencies
+RUN mkdir -p /bundle/lib && \
+	./scripts/gather-deps.sh \
+		/work/criu/criu \
+		/work/plugins/cuda/cuda_plugin.so \
+		/bundle/lib
+
+# Copy binaries to bundle
+RUN cp /work/criu/criu /bundle/ && \
+	cp /work/plugins/cuda/cuda_plugin.so /bundle/
 
 FROM scratch
-COPY --from=build /work/criu/criu .
-COPY --from=build /work/plugins/cuda/cuda_plugin.so .
+COPY --from=build /bundle/ .

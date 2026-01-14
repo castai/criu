@@ -1,5 +1,11 @@
+# Build mode: set HERMETIC=1 for hermetic bundle with rpath, otherwise static
+ifeq ($(HERMETIC),1)
+CFLAGS          += -DHERMETIC
+LDFLAGS         += -Wl,-rpath,'$$ORIGIN/lib'
+else
 LDFLAGS         += -static
 WRAPFLAGS       += -Wl,--wrap=__strlcpy
+endif
 
 # here is a workaround for a bug in libnl-3:
 # 6a8d90f5fec4 "attr: Allow attribute type 0"

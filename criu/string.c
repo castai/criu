@@ -17,7 +17,13 @@
  * of course, the buffer size is zero). It does not pad
  * out the result like strncpy() does.
  */
+#ifdef HERMETIC
+/* In HERMETIC mode (dynamic linking), provide the function directly */
+size_t __strlcpy(char *dest, const char *src, size_t size)
+#else
+/* In static mode, use linker wrapping */
 size_t __wrap___strlcpy(char *dest, const char *src, size_t size)
+#endif
 {
 	size_t ret = strlen(src);
 
@@ -34,6 +40,8 @@ size_t __wrap___strlcpy(char *dest, const char *src, size_t size)
  * @dest: The string to be appended to
  * @src: The string to append to it
  * @count: The size of the destination buffer.
+ *
+ * Note: strlcat is always provided directly, not wrapped.
  */
 size_t __strlcat(char *dest, const char *src, size_t count)
 {
