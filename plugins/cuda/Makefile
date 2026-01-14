@@ -12,6 +12,11 @@ COMPEL := ../../compel/compel-host
 
 PLUGIN_CFLAGS := -g -Wall -Werror -shared -nostartfiles -fPIC
 
+# Set RPATH for hermetic bundle builds
+ifeq ($(HERMETIC),1)
+PLUGIN_LDFLAGS := -Wl,-rpath,'$$ORIGIN/lib'
+endif
+
 __nmk_dir ?= ../../scripts/nmk/scripts/
 include $(__nmk_dir)msg.mk
 

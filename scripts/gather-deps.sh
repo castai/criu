@@ -50,6 +50,19 @@ copy_deps() {
 			continue
 		fi
 
+		# Skip glibc and dynamic linker (they must come from the system)
+		# Bundling glibc causes version conflicts with GLIBC_PRIVATE symbols
+		libname=$(basename "$libpath")
+		if [[ "$libname" =~ ^libc\.so\. ]] || \
+		   [[ "$libname" =~ ^ld-linux ]] || \
+		   [[ "$libname" =~ ^libpthread\.so\. ]] || \
+		   [[ "$libname" =~ ^libm\.so\. ]] || \
+		   [[ "$libname" =~ ^libdl\.so\. ]] || \
+		   [[ "$libname" =~ ^librt\.so\. ]]; then
+			echo "Skipping glibc component: $libname"
+			continue
+		fi
+
 		# Skip if already copied
 		if [ -n "${COPIED_LIBS[$libpath]}" ]; then
 			continue

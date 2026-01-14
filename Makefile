@@ -353,7 +353,7 @@ amdgpu_plugin: criu
 .PHONY: amdgpu_plugin
 
 cuda_plugin: criu
-	$(Q) $(MAKE) -C plugins/cuda all
+	$(Q) $(MAKE) -C plugins/cuda all HERMETIC=$(HERMETIC)
 .PHONY: cuda_plugin
 
 crit: lib
