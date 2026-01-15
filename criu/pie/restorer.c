@@ -51,6 +51,9 @@
 
 #include "shmem.h"
 
+/* AIO restoration with relocation support for live migration */
+#include "live_restore_aio.c"
+
 /*
  * sys_getgroups() buffer size. Not too much, to avoid stack overflow.
  */
@@ -936,6 +939,7 @@ static int restore_aio_ring(struct rst_aio_ring *raio)
 	unsigned tail = ring->tail;
 	struct iocb *iocb, **iocbp;
 	unsigned long ctx = 0;
+	unsigned long ring_len;
 	unsigned size;
 	char buf[1];
 
@@ -947,11 +951,21 @@ static int restore_aio_ring(struct rst_aio_ring *raio)
 
 	new = (struct aio_ring *)ctx;
 	i = (raio->len - sizeof(struct aio_ring)) / sizeof(struct io_event);
-	if (tail >= ring->nr || head >= ring->nr || ring->nr != i || new->nr != ring->nr) {
+	if (tail >= ring->nr || head >= ring->nr || ring->nr != i || new->nr < ring->nr) {
 		pr_err("wrong aio: tail=%x head=%x req=%x old_nr=%x new_nr=%x expect=%x\n", tail, head, raio->nr_req,
 		       ring->nr, new->nr, i);
 
 		return -1;
+	}
+
+	ring_len = raio->len;
+
+	/* Handle ring expansion for live migration (more CPUs on restore) */
+	if (new->nr > ring->nr) {
+		pr_info("AIO ring expanded: old_nr=%x new_nr=%x\n", ring->nr, new->nr);
+		ring_len = live_handle_aio_expansion(raio, new, ctx);
+		if (!ring_len)
+			return -1;
 	}
 
 	if (tail == 0 && head == 0)
@@ -1028,24 +1042,7 @@ populate:
 	i = offsetof(struct aio_ring, io_events);
 	memcpy((void *)ctx + i, (void *)ring + i, raio->len - i);
 
-	/*
-	 * If we failed to get the proper nr_req right and
-	 * created smaller or larger ring, then this remap
-	 * will (should) fail, since AIO rings has immutable
-	 * size.
-	 *
-	 * This is not great, but anyway better than putting
-	 * a ring of wrong size into correct place.
-	 *
-	 * Also, this unmaps temporary anonymous area on raio->addr.
-	 */
-
-	ctx = sys_mremap(ctx, raio->len, raio->len, MREMAP_FIXED | MREMAP_MAYMOVE, raio->addr);
-	if (ctx != raio->addr) {
-		pr_err("Ring remap failed with %ld\n", ctx);
-		return -1;
-	}
-	return 0;
+	return live_finalize_aio_ring(raio, ctx, ring_len);
 }
 
 static void rst_tcp_repair_off(struct rst_tcp_sock *rts)
@@ -1969,13 +1966,20 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	}
 
 	/*
-	 * Now when all VMAs are in their places time to set
-	 * up AIO rings.
+	 * Now when all VMAs are in their places time to set up AIO rings.
 	 */
+	for (i = 0; i < args->rings_n; i++) {
+		struct rst_aio_ring *raio = &args->rings[i];
 
-	for (i = 0; i < args->rings_n; i++)
-		if (restore_aio_ring(&args->rings[i]) < 0)
+		if (restore_aio_ring(raio) < 0)
 			goto core_restore_end;
+
+		/* If ring was relocated, patch memory references */
+		if (raio->new_addr) {
+			if (live_patch_aio_context_refs(args, raio->addr, raio->new_addr) < 0)
+				goto core_restore_end;
+		}
+	}
 
 	/*
 	 * Finally restore madivse() bits
