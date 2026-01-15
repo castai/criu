@@ -1,6 +1,5 @@
 #include <unistd.h>
 #include <stdio.h>
-#include <stdbool.h>
 #include "vma.h"
 #include "xmalloc.h"
 #include "pstree.h"
@@ -12,6 +11,10 @@
 #include "parasite-syscall.h"
 #include "images/mm.pb-c.h"
 #include "compel/infect.h"
+#include "linux/aio_abi.h"
+
+/* AIO preparation with expansion support for live migration */
+#include "live_prepare_aio.c"
 
 #define NR_IOEVENTS_IN_NPAGES(npages) ((PAGE_SIZE * (npages) - sizeof(struct aio_ring)) / sizeof(struct io_event))
 
@@ -125,7 +128,9 @@ int parasite_collect_aios(struct parasite_ctl *ctl, struct vm_area_list *vmas)
 int prepare_aios(struct pstree_item *t, struct task_restore_args *ta)
 {
 	int i;
-	MmEntry *mm = rsti(t)->mm;
+	struct rst_info *ri = rsti(t);
+	MmEntry *mm = ri->mm;
+
 	/*
 	 * Put info about AIO rings, they will get remapped
 	 */
@@ -143,6 +148,9 @@ int prepare_aios(struct pstree_item *t, struct task_restore_args *ta)
 		raio->addr = mm->aios[i]->id;
 		raio->nr_req = mm->aios[i]->nr_req;
 		raio->len = mm->aios[i]->ring_len;
+
+		if (live_prepare_aio_ring(raio, mm->aios[i], &ri->vmas))
+			return -1;
 	}
 
 	return 0;
