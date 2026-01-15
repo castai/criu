@@ -28,8 +28,10 @@ struct aio_ring {
 };
 
 struct rst_aio_ring {
-	unsigned long addr;
-	unsigned long len;
-	unsigned int nr_req;
+	unsigned long addr;	/* Original address from dump */
+	unsigned long len;	/* Original ring length */
+	unsigned int nr_req;	/* Number of requests (for io_setup) */
+	unsigned long max_len;	/* Max available space at addr (for expansion check) */
+	unsigned long new_addr;	/* Set by restorer if relocation needed, 0 otherwise */
 };
 #endif /* __CR_AIO_H__ */
