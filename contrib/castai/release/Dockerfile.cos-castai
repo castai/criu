@@ -25,6 +25,9 @@ RUN apt-get update && apt-get install -y \
 COPY . /work
 WORKDIR /work
 
+# Generate config.h to detect system features (TCP_REPAIR, etc.)
+RUN make include/common/config.h
+
 # Build with RPATH
 RUN make -j $(nproc) \
     LDFLAGS="-Wl,-rpath='\$\$ORIGIN/../lib'" \
