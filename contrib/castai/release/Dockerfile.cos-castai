@@ -54,7 +54,7 @@ WORKDIR /work
 # Create bundle - simple structure without version symlinks
 RUN mkdir -p /bundle-castai/bin /bundle-castai/lib/criu && \
     cp criu/criu /bundle-castai/bin/ && \
-    cp lib/c/libcriu.so.2.0 /bundle-castai/lib/libcriu.so && \
+    find lib/c -name "libcriu.so.*.*" -type f -exec cp {} /bundle-castai/lib/libcriu.so \; && \
     cp plugins/cuda/cuda_plugin.so /bundle-castai/lib/criu/
 
 # Export stage
