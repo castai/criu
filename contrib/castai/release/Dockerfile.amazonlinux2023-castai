@@ -12,13 +12,16 @@ RUN yum install -y \
     git \
     pkg-config \
     patchelf \
-    protobuf-c-devel protobuf-c-compiler protobuf-devel \
+    protobuf-c protobuf-c-devel protobuf-c-compiler \
+    protobuf protobuf-devel protobuf-compiler \
+    python3-protobuf \
     libnl3-devel \
     libnet-devel \
     libcap-devel \
     libaio-devel \
     libbsd-devel \
-    python3 python3-pip python3-devel \
+    libuuid-devel \
+    python3 python3-pip python3-devel python3-pyyaml \
     nftables-devel \
     gnutls-devel
 
