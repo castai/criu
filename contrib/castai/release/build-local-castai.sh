@@ -5,12 +5,12 @@
 # Usage: ./contrib/castai/release/build-local-castai.sh [distro] [arch] [version]
 #
 # Examples:
-#   ./contrib/castai/release/build-local-castai.sh amazonlinux2023 amd64
-#   ./contrib/castai/release/build-local-castai.sh cos arm64 v1.0.0
+#   ./contrib/castai/release/build-local-castai.sh universal amd64
+#   ./contrib/castai/release/build-local-castai.sh universal arm64 v1.0.0
 
 set -e
 
-DISTRO=${1:-amazonlinux2023}
+DISTRO=${1:-universal}
 ARCH=${2:-amd64}
 VERSION=${3:-local}
 OUTPUT_DIR="${DISTRO}-${ARCH}-bins-castai"
