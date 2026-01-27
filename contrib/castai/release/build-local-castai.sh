@@ -1,0 +1,331 @@
+#!/bin/bash
+# CastAI CRIU Bundle Local Builder and Validator
+# Build CRIU bundles locally for testing before release
+#
+# Usage: ./contrib/castai/release/build-local-castai.sh [distro] [arch] [version]
+#
+# Examples:
+#   ./contrib/castai/release/build-local-castai.sh amazonlinux2023 amd64
+#   ./contrib/castai/release/build-local-castai.sh cos arm64 v1.0.0
+
+set -e
+
+DISTRO=${1:-amazonlinux2023}
+ARCH=${2:-amd64}
+VERSION=${3:-local}
+OUTPUT_DIR="${DISTRO}-${ARCH}-bins-castai"
+TARBALL="criu-castai-${VERSION}-${DISTRO}-${ARCH}.tar.gz"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Cleanup function
+cleanup() {
+	echo "Cleaning up old build artifacts..."
+	rm -rf "${OUTPUT_DIR}"
+	rm -f "${TARBALL}"
+}
+
+# Map architecture names
+get_elf_machine() {
+	case "$1" in
+	amd64 | x86_64)
+		echo "X86-64"
+		;;
+	arm64 | aarch64)
+		echo "AArch64"
+		;;
+	*)
+		echo "Unknown"
+		;;
+	esac
+}
+
+# Validation function
+validate_bundle() {
+	local bundle_dir="$1"
+	echo ""
+	echo "=== Validating CastAI CRIU Bundle ==="
+
+	local failed=0
+	local expected_machine=$(get_elf_machine "$ARCH")
+
+	# Check required files exist
+	echo -n "Checking required files... "
+	local required_files=(
+		"bin/criu"
+		"lib/libcriu.so"
+		"lib/criu/cuda_plugin.so"
+	)
+
+	for file in "${required_files[@]}"; do
+		if [[ ! -e "${bundle_dir}/${file}" ]]; then
+			echo -e "${RED}FAILED${NC}"
+			echo -e "  ${RED}✗${NC} Missing: ${file}"
+			failed=1
+			break
+		fi
+	done
+
+	if [[ $failed -eq 0 ]]; then
+		echo -e "${GREEN}OK${NC}"
+	fi
+
+	# Check if binaries are executable
+	echo -n "Checking executables... "
+	if [[ ! -x "${bundle_dir}/bin/criu" ]]; then
+		echo -e "${RED}FAILED${NC}"
+		echo -e "  ${RED}✗${NC} bin/criu is not executable"
+		failed=1
+	else
+		echo -e "${GREEN}OK${NC}"
+	fi
+
+	# Check RPATH (MUST PASS)
+	echo -n "Checking RPATH... "
+	if ! readelf -d "${bundle_dir}/bin/criu" 2>/dev/null | grep -q 'RPATH.*\$ORIGIN/../lib'; then
+		echo -e "${RED}FAILED${NC}"
+		echo -e "  ${RED}✗${NC} RPATH not set to \$ORIGIN/../lib"
+		echo "  Current RPATH:"
+		readelf -d "${bundle_dir}/bin/criu" | grep -E 'RPATH|RUNPATH' || echo "    (none)"
+		failed=1
+	else
+		echo -e "${GREEN}OK${NC}"
+	fi
+
+	# ELF Architecture Validation
+	echo -n "Validating ELF architecture (${expected_machine})... "
+	local arch_errors=0
+
+	for binary in "bin/criu" "lib/libcriu.so" "lib/criu/cuda_plugin.so"; do
+		if [[ -f "${bundle_dir}/${binary}" ]]; then
+			local actual_machine=$(readelf -h "${bundle_dir}/${binary}" 2>/dev/null | grep "Machine:" | awk '{print $2}')
+			if [[ "$actual_machine" != "$expected_machine" ]]; then
+				if [[ $arch_errors -eq 0 ]]; then
+					echo -e "${RED}FAILED${NC}"
+				fi
+				echo -e "  ${RED}✗${NC} ${binary}: expected ${expected_machine}, got ${actual_machine}"
+				arch_errors=1
+				failed=1
+			fi
+		fi
+	done
+
+	if [[ $arch_errors -eq 0 ]]; then
+		echo -e "${GREEN}OK${NC}"
+	fi
+
+	# ELF Type Validation
+	echo -n "Validating ELF types... "
+	local type_errors=0
+
+	# Check bin/criu is executable (EXEC or DYN)
+	local criu_type=$(readelf -h "${bundle_dir}/bin/criu" 2>/dev/null | grep "Type:" | awk '{print $2}')
+	if [[ "$criu_type" != "EXEC" && "$criu_type" != "DYN" ]]; then
+		if [[ $type_errors -eq 0 ]]; then
+			echo -e "${RED}FAILED${NC}"
+		fi
+		echo -e "  ${RED}✗${NC} bin/criu: expected EXEC or DYN, got ${criu_type}"
+		type_errors=1
+		failed=1
+	fi
+
+	# Check libraries are DYN (shared objects)
+	for lib in "lib/libcriu.so" "lib/criu/cuda_plugin.so"; do
+		local lib_type=$(readelf -h "${bundle_dir}/${lib}" 2>/dev/null | grep "Type:" | awk '{print $2}')
+		if [[ "$lib_type" != "DYN" ]]; then
+			if [[ $type_errors -eq 0 ]]; then
+				echo -e "${RED}FAILED${NC}"
+			fi
+			echo -e "  ${RED}✗${NC} ${lib}: expected DYN, got ${lib_type}"
+			type_errors=1
+			failed=1
+		fi
+	done
+
+	if [[ $type_errors -eq 0 ]]; then
+		echo -e "${GREEN}OK${NC}"
+	fi
+
+	# Dynamic Section Validation
+	echo -n "Validating dynamic sections... "
+	local dyn_errors=0
+
+	# Check bin/criu has NEEDED entries
+	if ! readelf -d "${bundle_dir}/bin/criu" 2>/dev/null | grep -q "NEEDED"; then
+		if [[ $dyn_errors -eq 0 ]]; then
+			echo -e "${RED}FAILED${NC}"
+		fi
+		echo -e "  ${RED}✗${NC} bin/criu: no NEEDED entries found"
+		dyn_errors=1
+		failed=1
+	fi
+
+	# Check bin/criu has RPATH or RUNPATH
+	if ! readelf -d "${bundle_dir}/bin/criu" 2>/dev/null | grep -qE "RPATH|RUNPATH"; then
+		if [[ $dyn_errors -eq 0 ]]; then
+			echo -e "${RED}FAILED${NC}"
+		fi
+		echo -e "  ${RED}✗${NC} bin/criu: no RPATH or RUNPATH found"
+		dyn_errors=1
+		failed=1
+	fi
+
+	# Check libcriu.so has NEEDED entries
+	if ! readelf -d "${bundle_dir}/lib/libcriu.so" 2>/dev/null | grep -q "NEEDED"; then
+		if [[ $dyn_errors -eq 0 ]]; then
+			echo -e "${YELLOW}WARNING${NC}"
+		fi
+		echo -e "  ${YELLOW}⚠${NC} lib/libcriu.so: no NEEDED entries found"
+		# Not a hard failure
+	fi
+
+	if [[ $dyn_errors -eq 0 ]]; then
+		echo -e "${GREEN}OK${NC}"
+	fi
+
+	# Symbol Table Validation
+	echo -n "Validating symbol exports... "
+	local expected_symbols=("criu_init_opts" "criu_dump" "criu_restore")
+	local sym_warnings=0
+
+	for sym in "${expected_symbols[@]}"; do
+		if ! readelf -s "${bundle_dir}/lib/libcriu.so" 2>/dev/null | grep -q "FUNC.*GLOBAL.*${sym}"; then
+			if [[ $sym_warnings -eq 0 ]]; then
+				echo -e "${YELLOW}WARNING${NC}"
+			fi
+			echo -e "  ${YELLOW}⚠${NC} Expected symbol not found: ${sym}"
+			sym_warnings=1
+			# Not a hard failure, just informational
+		fi
+	done
+
+	if [[ $sym_warnings -eq 0 ]]; then
+		echo -e "${GREEN}OK${NC}"
+	fi
+
+	# Check dependencies (only on Linux)
+	if [[ "$(uname -s)" == "Linux" ]]; then
+		echo -n "Checking dependencies... "
+		local missing_deps=$(ldd "${bundle_dir}/bin/criu" 2>&1 | grep "not found" || true)
+		if [[ -n "$missing_deps" ]]; then
+			echo -e "${RED}FAILED${NC}"
+			echo -e "  ${RED}✗${NC} Missing dependencies:"
+			echo "$missing_deps" | sed 's/^/    /'
+			failed=1
+		else
+			echo -e "${GREEN}OK${NC}"
+		fi
+
+		# Verify libcriu.so is found
+		echo -n "Checking libcriu.so resolution... "
+		if ldd "${bundle_dir}/bin/criu" 2>&1 | grep -q "libcriu.so.*not found"; then
+			echo -e "${RED}FAILED${NC}"
+			echo -e "  ${RED}✗${NC} libcriu.so not resolved (RPATH issue?)"
+			failed=1
+		else
+			echo -e "${GREEN}OK${NC}"
+		fi
+	else
+		echo -e "${BLUE}SKIP${NC} dependency checks (not on Linux)"
+	fi
+
+	# Check plugin is a shared object
+	echo -n "Checking plugin format... "
+	if ! file "${bundle_dir}/lib/criu/cuda_plugin.so" | grep -q "shared object"; then
+		echo -e "${RED}FAILED${NC}"
+		echo -e "  ${RED}✗${NC} cuda_plugin.so is not a shared object"
+		failed=1
+	else
+		echo -e "${GREEN}OK${NC}"
+	fi
+
+	# Show bundle size
+	echo ""
+	echo "Bundle size:"
+	du -sh "${bundle_dir}"
+
+	# Show detailed file list
+	echo ""
+	echo "Bundle contents:"
+	find "${bundle_dir}" -type f -o -type l | sort | sed 's/^/  /'
+
+	echo ""
+	if [[ $failed -eq 0 ]]; then
+		echo -e "${GREEN}=== Validation PASSED ===${NC}"
+		return 0
+	else
+		echo -e "${RED}=== Validation FAILED ===${NC}"
+		return 1
+	fi
+}
+
+# Main build process
+echo "========================================="
+echo "CastAI CRIU Bundle Builder"
+echo "========================================="
+echo "Distro:  ${DISTRO}"
+echo "Arch:    ${ARCH}"
+echo "Version: ${VERSION}"
+echo "========================================="
+echo ""
+
+# Check if Dockerfile exists
+DOCKERFILE="contrib/castai/release/Dockerfile.${DISTRO}-castai"
+if [[ ! -f "${DOCKERFILE}" ]]; then
+	echo -e "${RED}Error: ${DOCKERFILE} does not exist${NC}"
+	exit 1
+fi
+
+# Cleanup old builds
+cleanup
+
+# Build using Docker buildx
+echo "Running Docker build..."
+docker buildx build \
+	--platform linux/${ARCH} \
+	-f ${DOCKERFILE} \
+	--output ${OUTPUT_DIR} \
+	.
+
+echo ""
+echo "Build complete. Creating tarball..."
+
+# Create tarball
+tar -czf ${TARBALL} -C ${OUTPUT_DIR} .
+
+echo -e "${GREEN}✓${NC} Created: ${TARBALL}"
+
+# Validate bundle
+if validate_bundle "${OUTPUT_DIR}"; then
+	echo ""
+	echo -e "${GREEN}✓ Bundle validation passed!${NC}"
+	exit_code=0
+else
+	echo ""
+	echo -e "${RED}✗ Bundle validation failed!${NC}"
+	exit_code=1
+fi
+
+# Usage instructions
+echo ""
+echo "========================================="
+echo "Testing Instructions:"
+echo "========================================="
+echo "Extract and test:"
+echo "  mkdir test-castai && tar -xzf ${TARBALL} -C test-castai"
+echo "  test-castai/bin/criu --version"
+echo "  test-castai/bin/criu check"
+echo ""
+echo "Test plugin loading:"
+echo "  test-castai/bin/criu dump -t <pid> -D /tmp/test -L \$(pwd)/test-castai/lib/criu"
+echo ""
+echo "Clean up:"
+echo "  rm -rf ${OUTPUT_DIR} ${TARBALL} test-castai"
+echo "========================================="
+
+exit $exit_code
