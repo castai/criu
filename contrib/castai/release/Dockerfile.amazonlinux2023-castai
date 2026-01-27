@@ -31,29 +31,22 @@ WORKDIR /work
 # Generate config.h to detect system features (TCP_REPAIR, etc.)
 RUN make include/common/config.h
 
-# Build CRIU and libraries
-RUN make -j $(nproc) criu lib cuda_plugin
+# Build CRIU binary and CUDA plugin (no libraries needed)
+RUN make -j $(nproc) criu cuda_plugin
 
 # List what was built
 RUN echo "=== Built files ===" && \
-    ls -la criu/ | grep criu$ && \
-    ls -la lib/c/ && \
-    ls -la plugins/cuda/
-
-# Set RPATH after build using patchelf for portable deployment  
-RUN patchelf --set-rpath '$ORIGIN/../lib' criu/criu && \
-    find lib/c -name "libcriu.so.*" -type f -exec patchelf --set-rpath '$ORIGIN' {} \; && \
-    patchelf --set-rpath '$ORIGIN/..' plugins/cuda/cuda_plugin.so
+    ls -la criu/criu && \
+    ls -la plugins/cuda/cuda_plugin.so
 
 # Package stage - create clean bundle structure
 FROM ${IMAGE}:${VERSION} AS package
 COPY --from=build /work /work
 WORKDIR /work
 
-# Create bundle - simple structure without version symlinks
+# Create bundle - minimal runtime only
 RUN mkdir -p /bundle-castai/bin /bundle-castai/lib/criu && \
     cp criu/criu /bundle-castai/bin/ && \
-    find lib/c -name "libcriu.so.*.*" -type f -exec cp {} /bundle-castai/lib/libcriu.so \; && \
     cp plugins/cuda/cuda_plugin.so /bundle-castai/lib/criu/
 
 # Export stage - minimal output
