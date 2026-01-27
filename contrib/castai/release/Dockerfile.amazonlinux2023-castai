@@ -31,12 +31,20 @@ WORKDIR /work
 # Generate config.h to detect system features (TCP_REPAIR, etc.)
 RUN make include/common/config.h
 
-# Build CRIU (without custom RPATH - we'll set it after)
-RUN make -j $(nproc) criu lib cuda_plugin
+# Build CRIU and libraries
+RUN make -j $(nproc) criu && \
+    make -j $(nproc) lib-c && \
+    make -j $(nproc) cuda_plugin
 
-# Set RPATH after build using patchelf for portable deployment
+# List what was built
+RUN echo "=== Built files ===" && \
+    ls -la criu/ | grep criu$ && \
+    ls -la lib/c/ && \
+    ls -la plugins/cuda/
+
+# Set RPATH after build using patchelf for portable deployment  
 RUN patchelf --set-rpath '$ORIGIN/../lib' criu/criu && \
-    patchelf --set-rpath '$ORIGIN' lib/c/libcriu.so.2.0 && \
+    find lib/c -name "libcriu.so.*" -type f -exec patchelf --set-rpath '$ORIGIN' {} \; && \
     patchelf --set-rpath '$ORIGIN/..' plugins/cuda/cuda_plugin.so
 
 # Package stage - create clean bundle structure
