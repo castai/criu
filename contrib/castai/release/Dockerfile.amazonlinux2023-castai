@@ -42,8 +42,8 @@ RUN echo "=== Built files ===" && \
 # Package stage - create portable bundle with dependencies
 FROM ${IMAGE}:${VERSION} AS package
 
-# Install patchelf for RPATH modification
-RUN yum install -y patchelf
+# Install patchelf for RPATH modification and findutils for xargs
+RUN yum install -y patchelf findutils
 
 COPY --from=build /work /work
 WORKDIR /work
