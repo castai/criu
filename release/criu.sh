@@ -25,7 +25,7 @@ while IFS= read -r line; do
 
     cp $source "$CRIU_BUNDLE"
 
-    # Make sure the binary is loading the libraires it has been built with.
+    # Make sure the binary is loading the libraries it has been built with.
     # These must be placed in the INSTALL_LIB_DIR on the target system. See
     # install.sh
     patchelf --replace-needed "$filename" "$INSTALL_LIB_DIR/$filename" "$CRIU_BUNDLE/criu"
