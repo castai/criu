@@ -39,15 +39,42 @@ RUN echo "=== Built files ===" && \
     ls -la criu/criu && \
     ls -la plugins/cuda/cuda_plugin.so
 
-# Package stage - create clean bundle structure
+# Package stage - create portable bundle with dependencies
 FROM ${IMAGE}:${VERSION} AS package
+
+# Install patchelf for RPATH modification
+RUN yum install -y patchelf
+
 COPY --from=build /work /work
 WORKDIR /work
 
-# Create bundle - minimal runtime only
-RUN mkdir -p /bundle-castai/bin /bundle-castai/lib/criu && \
-    cp criu/criu /bundle-castai/bin/ && \
-    cp plugins/cuda/cuda_plugin.so /bundle-castai/lib/criu/
+# Create bundle structure
+RUN mkdir -p /bundle-castai/bin /bundle-castai/lib /bundle-castai/lib/criu
+
+# Copy CRIU binary
+RUN cp criu/criu /bundle-castai/bin/
+
+# Copy CUDA plugin
+RUN cp plugins/cuda/cuda_plugin.so /bundle-castai/lib/criu/
+
+# Find and copy all required shared libraries (excluding system-level libs)
+# We bundle: libprotobuf-c, libnet, libnl, libcap, libaio, libbsd, libnftables, libgnutls
+# We exclude: libc, libm, libpthread, libdl, librt (provided by glibc on all systems)
+RUN ldd /bundle-castai/bin/criu | grep "=> /" | \
+    awk '{print $3}' | \
+    grep -vE '(libc\.|libm\.|libpthread\.|libdl\.|librt\.|libgcc_s\.|ld-linux)' | \
+    xargs -I {} cp {} /bundle-castai/lib/
+
+# Set RPATH on criu binary to look in ../lib first
+RUN patchelf --set-rpath '$ORIGIN/../lib' /bundle-castai/bin/criu
+
+# Verify RPATH was set correctly
+RUN echo "=== RPATH verification ===" && \
+    patchelf --print-rpath /bundle-castai/bin/criu
+
+# List bundled files
+RUN echo "=== Bundle contents ===" && \
+    find /bundle-castai -type f | sort
 
 # Export stage - minimal output
 FROM scratch
