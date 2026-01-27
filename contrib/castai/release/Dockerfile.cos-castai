@@ -37,7 +37,7 @@ RUN make -j $(nproc) criu lib cuda_plugin
 
 # Set RPATH after build using patchelf for portable deployment
 RUN patchelf --set-rpath '$ORIGIN/../lib' criu/criu && \
-    patchelf --set-rpath '$ORIGIN' lib/c/libcriu.so.*.* && \
+    patchelf --set-rpath '$ORIGIN' lib/c/libcriu.so.2.0 && \
     patchelf --set-rpath '$ORIGIN/..' plugins/cuda/cuda_plugin.so
 
 # Package stage
@@ -48,7 +48,7 @@ WORKDIR /work
 # Create bundle - simple structure without version symlinks
 RUN mkdir -p /bundle-castai/bin /bundle-castai/lib/criu && \
     cp criu/criu /bundle-castai/bin/ && \
-    cp lib/c/libcriu.so.*.* /bundle-castai/lib/libcriu.so && \
+    cp lib/c/libcriu.so.2.0 /bundle-castai/lib/libcriu.so && \
     cp plugins/cuda/cuda_plugin.so /bundle-castai/lib/criu/
 
 # Export stage
