@@ -43,8 +43,8 @@ RUN echo "=== Built files ===" && \
 # Package stage - create portable bundle with dependencies
 FROM ${IMAGE}:${VERSION} AS package
 
-# Install patchelf for RPATH modification
-RUN apt-get update && apt-get install -y patchelf
+# Install patchelf for RPATH modification (findutils has xargs, already in debian base)
+RUN apt-get update && apt-get install -y patchelf findutils
 
 COPY --from=build /work /work
 WORKDIR /work
