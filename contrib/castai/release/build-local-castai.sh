@@ -2,19 +2,36 @@
 # CastAI CRIU Bundle Local Builder and Validator
 # Build CRIU bundles locally for testing before release
 #
-# Usage: ./contrib/castai/release/build-local-castai.sh [distro] [arch] [version]
+# Usage: ./contrib/castai/release/build-local-castai.sh [arch] [version]
 #
 # Examples:
-#   ./contrib/castai/release/build-local-castai.sh universal amd64
-#   ./contrib/castai/release/build-local-castai.sh universal arm64 v1.0.0
+#   ./contrib/castai/release/build-local-castai.sh           # Auto-detect architecture
+#   ./contrib/castai/release/build-local-castai.sh amd64
+#   ./contrib/castai/release/build-local-castai.sh arm64 v1.0.0
 
 set -e
 
-DISTRO=${1:-universal}
-ARCH=${2:-amd64}
-VERSION=${3:-local}
-OUTPUT_DIR="${DISTRO}-${ARCH}-bins-castai"
-TARBALL="criu-castai-${VERSION}-${DISTRO}-${ARCH}.tar.gz"
+# Auto-detect architecture if not provided
+detect_arch() {
+  local machine
+  machine=$(uname -m)
+  case "$machine" in
+    x86_64)
+      echo "amd64"
+      ;;
+    aarch64)
+      echo "arm64"
+      ;;
+    *)
+      echo "amd64" # Default to amd64 if unknown
+      ;;
+  esac
+}
+
+ARCH=${1:-$(detect_arch)}
+VERSION=${2:-local}
+OUTPUT_DIR="universal-${ARCH}-bins-castai"
+TARBALL="criu-castai-${VERSION}-${ARCH}.tar.gz"
 
 # Colors for output
 RED='\033[0;31m'
@@ -248,18 +265,48 @@ validate_bundle() {
   fi
 }
 
+# Function to ensure multi-arch builder exists
+ensure_builder() {
+  local builder_name="criu-castai-builder"
+  
+  echo "Checking for multi-architecture builder..."
+  
+  # Check if builder exists and supports required platforms
+  if docker buildx inspect "$builder_name" &>/dev/null; then
+    echo "✓ Using existing builder: $builder_name"
+    docker buildx use "$builder_name"
+    return 0
+  fi
+  
+  echo "Creating multi-architecture builder..."
+  
+  # Setup QEMU for cross-platform builds (if not already done)
+  echo "  Setting up QEMU for ARM64 emulation..."
+  if ! docker run --rm --privileged multiarch/qemu-user-static --reset -p yes &>/dev/null; then
+    echo "  ${YELLOW}Warning: Failed to setup QEMU. ARM64 builds may not work.${NC}"
+  fi
+  
+  # Create builder with support for amd64 and arm64
+  docker buildx create \
+    --name "$builder_name" \
+    --driver docker-container \
+    --platform linux/amd64,linux/arm64 \
+    --use
+  
+  echo -e "  ${GREEN}✓${NC} Created and activated builder: $builder_name"
+}
+
 # Main build process
 echo "========================================="
 echo "CastAI CRIU Bundle Builder"
 echo "========================================="
-echo "Distro:  ${DISTRO}"
 echo "Arch:    ${ARCH}"
 echo "Version: ${VERSION}"
 echo "========================================="
 echo ""
 
 # Check if Dockerfile exists
-DOCKERFILE="contrib/castai/release/Dockerfile.${DISTRO}-castai"
+DOCKERFILE="contrib/castai/release/Dockerfile.universal-castai"
 if [[ ! -f "${DOCKERFILE}" ]]; then
   echo -e "${RED}Error: ${DOCKERFILE} does not exist${NC}"
   exit 1
@@ -268,8 +315,12 @@ fi
 # Cleanup old builds
 cleanup
 
+# Ensure multi-arch builder exists
+ensure_builder
+
 # Build using Docker buildx
-echo "Running Docker build..."
+echo ""
+echo "Running Docker build for linux/${ARCH}..."
 docker buildx build \
   --platform "linux/${ARCH}" \
   -f "${DOCKERFILE}" \
