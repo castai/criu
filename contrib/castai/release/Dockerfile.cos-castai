@@ -9,22 +9,22 @@ FROM ${IMAGE}:${VERSION} AS build
 
 # Install build dependencies (including patchelf for RPATH modification)
 RUN apt-get update && apt-get install -y \
-    gcc make \
-    pkg-config \
-    git \
-    patchelf \
-    libprotobuf-dev libprotobuf-c-dev \
-    protobuf-c-compiler protobuf-compiler \
-    python3-protobuf python3-yaml \
-    libnl-3-dev \
-    libnet1-dev \
-    libcap-dev \
-    libaio-dev \
-    libbsd-dev \
-    uuid-dev \
-    python3 python3-pip python3-dev \
-    libnftables-dev \
-    libgnutls28-dev
+  gcc make \
+  pkg-config \
+  git \
+  patchelf \
+  libprotobuf-dev libprotobuf-c-dev \
+  protobuf-c-compiler protobuf-compiler \
+  python3-protobuf python3-yaml \
+  libnl-3-dev \
+  libnet1-dev \
+  libcap-dev \
+  libaio-dev \
+  libbsd-dev \
+  uuid-dev \
+  python3 python3-pip python3-dev \
+  libnftables-dev \
+  libgnutls28-dev
 
 COPY . /work
 WORKDIR /work
@@ -37,16 +37,22 @@ RUN make -j $(nproc) criu cuda_plugin
 
 # List what was built
 RUN echo "=== Built files ===" && \
-    ls -la criu/criu && \
-    ls -la plugins/cuda/cuda_plugin.so
+  ls -la criu/criu && \
+  ls -la plugins/cuda/cuda_plugin.so
 
 # Package stage - create portable bundle with dependencies
 FROM ${IMAGE}:${VERSION} AS package
 
-# Install patchelf for RPATH modification (findutils has xargs, already in debian base)
-RUN apt-get update && apt-get install -y patchelf findutils
+# Install patchelf for RPATH modification
+RUN apt-get update && apt-get install -y patchelf
 
+# Copy work directory and libraries from build stage
 COPY --from=build /work /work
+COPY --from=build /lib /build-lib
+COPY --from=build /lib/x86_64-linux-gnu /build-lib-arch
+COPY --from=build /usr/lib /build-usr-lib
+COPY --from=build /usr/lib/x86_64-linux-gnu /build-usr-lib-arch
+
 WORKDIR /work
 
 # Create bundle structure
@@ -58,32 +64,21 @@ RUN cp criu/criu /bundle-castai/bin/
 # Copy CUDA plugin
 RUN cp plugins/cuda/cuda_plugin.so /bundle-castai/lib/criu/
 
-# Find and copy all required shared libraries (excluding system-level libs)
-# We bundle: libprotobuf-c, libnet, libnl, libcap, libaio, libbsd, libnftables, libgnutls
-# We exclude: libc, libm, libpthread, libdl, librt (provided by glibc on all systems)
-RUN echo "=== Finding required libraries ===" && \
-    ldd /bundle-castai/bin/criu && \
-    echo "=== Copying libraries ===" && \
-    ldd /bundle-castai/bin/criu | grep "=> /" | awk '{print $3}' | \
-    grep -vE '(libc\.|libm\.|libpthread\.|libdl\.|librt\.|libgcc_s\.|ld-linux)' > /tmp/libs.txt && \
-    cat /tmp/libs.txt && \
-    while IFS= read -r lib; do \
-        echo "Copying: $lib"; \
-        cp -v "$lib" /bundle-castai/lib/; \
-    done < /tmp/libs.txt && \
-    echo "=== Libraries copied ===" && \
-    ls -la /bundle-castai/lib/
+COPY contrib/castai/release/copy-bundle-libs.sh /tmp/
+ENV BUNDLE_DIR=/bundle-castai
+ENV LIB_SOURCE_PATHS="/build-lib /build-lib-arch /build-usr-lib /build-usr-lib-arch"
+RUN bash /tmp/copy-bundle-libs.sh
 
 # Set RPATH on criu binary to look in ../lib first
 RUN patchelf --set-rpath '$ORIGIN/../lib' /bundle-castai/bin/criu
 
 # Verify RPATH was set correctly
 RUN echo "=== RPATH verification ===" && \
-    patchelf --print-rpath /bundle-castai/bin/criu
+  patchelf --print-rpath /bundle-castai/bin/criu
 
 # List bundled files
 RUN echo "=== Bundle contents ===" && \
-    find /bundle-castai -type f | sort
+  find /bundle-castai -type f | sort
 
 # Export stage
 FROM scratch
