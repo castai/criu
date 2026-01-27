@@ -33,9 +33,7 @@ WORKDIR /work
 RUN make include/common/config.h
 
 # Build CRIU and libraries
-RUN make -j $(nproc) criu && \
-    make -j $(nproc) lib-c && \
-    make -j $(nproc) cuda_plugin
+RUN make -j $(nproc) criu lib cuda_plugin
 
 # List what was built
 RUN echo "=== Built files ===" && \
