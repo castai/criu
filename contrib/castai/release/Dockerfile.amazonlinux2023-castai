@@ -60,10 +60,11 @@ RUN cp plugins/cuda/cuda_plugin.so /bundle-castai/lib/criu/
 # Find and copy all required shared libraries (excluding system-level libs)
 # We bundle: libprotobuf-c, libnet, libnl, libcap, libaio, libbsd, libnftables, libgnutls
 # We exclude: libc, libm, libpthread, libdl, librt (provided by glibc on all systems)
-RUN ldd /bundle-castai/bin/criu | grep "=> /" | \
-    awk '{print $3}' | \
+RUN ldd /bundle-castai/bin/criu | grep "=> /" | awk '{print $3}' | \
     grep -vE '(libc\.|libm\.|libpthread\.|libdl\.|librt\.|libgcc_s\.|ld-linux)' | \
-    xargs -I {} cp {} /bundle-castai/lib/
+    while read -r lib; do \
+        cp -v "$lib" /bundle-castai/lib/ || echo "Warning: failed to copy $lib"; \
+    done
 
 # Set RPATH on criu binary to look in ../lib first
 RUN patchelf --set-rpath '$ORIGIN/../lib' /bundle-castai/bin/criu
