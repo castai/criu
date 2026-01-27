@@ -21,7 +21,7 @@ jobs:
         arch: [amd64, arm64]
     steps:
       - name: Check out code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Create multi architecture builder
         run: |
@@ -48,7 +48,7 @@ jobs:
             -C ${{ matrix.distro }}-${{ matrix.arch }}-bins-castai .
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: criu-castai-${{ github.ref_name }}-${{ matrix.arch }}
           path: criu-castai-${{ github.ref_name }}-${{ matrix.arch }}.tar.gz
@@ -62,7 +62,7 @@ jobs:
       contents: write
     steps:
       - name: Download all CastAI artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
 
