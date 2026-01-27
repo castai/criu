@@ -52,7 +52,8 @@ validate_bundle() {
 	echo "=== Validating CastAI CRIU Bundle ==="
 
 	local failed=0
-	local expected_machine=$(get_elf_machine "$ARCH")
+	local expected_machine
+	expected_machine=$(get_elf_machine "$ARCH")
 
 	# Check required files exist
 	echo -n "Checking required files... "
@@ -87,7 +88,9 @@ validate_bundle() {
 
 	# Check RPATH (MUST PASS)
 	echo -n "Checking RPATH... "
-	if ! readelf -d "${bundle_dir}/bin/criu" 2>/dev/null | grep -q 'RPATH.*\$ORIGIN/../lib'; then
+	# Note: Using single quotes to literally match $ORIGIN (not expand as variable)
+	# shellcheck disable=SC2016
+	if ! readelf -d "${bundle_dir}/bin/criu" 2>/dev/null | grep -q 'RPATH.*$ORIGIN/../lib'; then
 		echo -e "${RED}FAILED${NC}"
 		echo -e "  ${RED}✗${NC} RPATH not set to \$ORIGIN/../lib"
 		echo "  Current RPATH:"
@@ -103,7 +106,8 @@ validate_bundle() {
 
 	for binary in "bin/criu" "lib/libcriu.so" "lib/criu/cuda_plugin.so"; do
 		if [[ -f "${bundle_dir}/${binary}" ]]; then
-			local actual_machine=$(readelf -h "${bundle_dir}/${binary}" 2>/dev/null | grep "Machine:" | awk '{print $2}')
+			local actual_machine
+			actual_machine=$(readelf -h "${bundle_dir}/${binary}" 2>/dev/null | grep "Machine:" | awk '{print $2}')
 			if [[ "$actual_machine" != "$expected_machine" ]]; then
 				if [[ $arch_errors -eq 0 ]]; then
 					echo -e "${RED}FAILED${NC}"
@@ -124,7 +128,8 @@ validate_bundle() {
 	local type_errors=0
 
 	# Check bin/criu is executable (EXEC or DYN)
-	local criu_type=$(readelf -h "${bundle_dir}/bin/criu" 2>/dev/null | grep "Type:" | awk '{print $2}')
+	local criu_type
+	criu_type=$(readelf -h "${bundle_dir}/bin/criu" 2>/dev/null | grep "Type:" | awk '{print $2}')
 	if [[ "$criu_type" != "EXEC" && "$criu_type" != "DYN" ]]; then
 		if [[ $type_errors -eq 0 ]]; then
 			echo -e "${RED}FAILED${NC}"
@@ -136,7 +141,8 @@ validate_bundle() {
 
 	# Check libraries are DYN (shared objects)
 	for lib in "lib/libcriu.so" "lib/criu/cuda_plugin.so"; do
-		local lib_type=$(readelf -h "${bundle_dir}/${lib}" 2>/dev/null | grep "Type:" | awk '{print $2}')
+		local lib_type
+		lib_type=$(readelf -h "${bundle_dir}/${lib}" 2>/dev/null | grep "Type:" | awk '{print $2}')
 		if [[ "$lib_type" != "DYN" ]]; then
 			if [[ $type_errors -eq 0 ]]; then
 				echo -e "${RED}FAILED${NC}"
@@ -211,11 +217,14 @@ validate_bundle() {
 	# Check dependencies (only on Linux)
 	if [[ "$(uname -s)" == "Linux" ]]; then
 		echo -n "Checking dependencies... "
-		local missing_deps=$(ldd "${bundle_dir}/bin/criu" 2>&1 | grep "not found" || true)
+		local missing_deps
+		missing_deps=$(ldd "${bundle_dir}/bin/criu" 2>&1 | grep "not found" || true)
 		if [[ -n "$missing_deps" ]]; then
 			echo -e "${RED}FAILED${NC}"
 			echo -e "  ${RED}✗${NC} Missing dependencies:"
-			echo "$missing_deps" | sed 's/^/    /'
+			while IFS= read -r line; do
+				echo "    $line"
+			done <<<"$missing_deps"
 			failed=1
 		else
 			echo -e "${GREEN}OK${NC}"
@@ -287,16 +296,16 @@ cleanup
 # Build using Docker buildx
 echo "Running Docker build..."
 docker buildx build \
-	--platform linux/${ARCH} \
-	-f ${DOCKERFILE} \
-	--output ${OUTPUT_DIR} \
+	--platform "linux/${ARCH}" \
+	-f "${DOCKERFILE}" \
+	--output "${OUTPUT_DIR}" \
 	.
 
 echo ""
 echo "Build complete. Creating tarball..."
 
 # Create tarball
-tar -czf ${TARBALL} -C ${OUTPUT_DIR} .
+tar -czf "${TARBALL}" -C "${OUTPUT_DIR}" .
 
 echo -e "${GREEN}✓${NC} Created: ${TARBALL}"
 
