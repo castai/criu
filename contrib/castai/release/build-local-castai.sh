@@ -25,218 +25,227 @@ NC='\033[0m' # No Color
 
 # Cleanup function
 cleanup() {
-  echo "Cleaning up old build artifacts..."
-  rm -rf "${OUTPUT_DIR}"
-  rm -f "${TARBALL}"
+	echo "Cleaning up old build artifacts..."
+	rm -rf "${OUTPUT_DIR}"
+	rm -f "${TARBALL}"
 }
 
 # Map architecture names
 get_elf_machine() {
-  case "$1" in
-  amd64 | x86_64)
-    echo "X86-64"
-    ;;
-  arm64 | aarch64)
-    echo "AArch64"
-    ;;
-  *)
-    echo "Unknown"
-    ;;
-  esac
+	case "$1" in
+	amd64 | x86_64)
+		echo "X86-64"
+		;;
+	arm64 | aarch64)
+		echo "AArch64"
+		;;
+	*)
+		echo "Unknown"
+		;;
+	esac
 }
 
 # Validation function
 validate_bundle() {
-  local bundle_dir="$1"
-  echo ""
-  echo "=== Validating CastAI CRIU Bundle ==="
+	local bundle_dir="$1"
+	echo ""
+	echo "=== Validating CastAI CRIU Bundle ==="
 
-  local failed=0
-  local expected_machine
-  expected_machine=$(get_elf_machine "$ARCH")
+	local failed=0
+	local expected_machine
+	expected_machine=$(get_elf_machine "$ARCH")
 
-  # Check required files exist
-  echo -n "Checking required files... "
-  local required_files=(
-    "bin/criu"
-    "lib/criu/cuda_plugin.so"
-  )
+	# Check required files exist
+	echo -n "Checking required files... "
+	local required_files=(
+		"bin/criu"
+		"lib/criu/cuda_plugin.so"
+	)
 
-  for file in "${required_files[@]}"; do
-    if [[ ! -e "${bundle_dir}/${file}" ]]; then
-      echo -e "${RED}FAILED${NC}"
-      echo -e "  ${RED}✗${NC} Missing: ${file}"
-      failed=1
-      break
-    fi
-  done
+	for file in "${required_files[@]}"; do
+		if [[ ! -e "${bundle_dir}/${file}" ]]; then
+			echo -e "${RED}FAILED${NC}"
+			echo -e "  ${RED}✗${NC} Missing: ${file}"
+			failed=1
+			break
+		fi
+	done
 
-  if [[ $failed -eq 0 ]]; then
-    echo -e "${GREEN}OK${NC}"
-  fi
+	if [[ $failed -eq 0 ]]; then
+		echo -e "${GREEN}OK${NC}"
+	fi
 
-  # Check if binaries are executable
-  echo -n "Checking executables... "
-  if [[ ! -x "${bundle_dir}/bin/criu" ]]; then
-    echo -e "${RED}FAILED${NC}"
-    echo -e "  ${RED}✗${NC} bin/criu is not executable"
-    failed=1
-  else
-    echo -e "${GREEN}OK${NC}"
-  fi
+	# Check if binaries are executable
+	echo -n "Checking executables... "
+	if [[ ! -x "${bundle_dir}/bin/criu" ]]; then
+		echo -e "${RED}FAILED${NC}"
+		echo -e "  ${RED}✗${NC} bin/criu is not executable"
+		failed=1
+	else
+		echo -e "${GREEN}OK${NC}"
+	fi
 
-  # Check RPATH (MUST PASS)
-  echo -n "Checking RPATH... "
-  # Note: Using single quotes to literally match $ORIGIN (not expand as variable)
-  # shellcheck disable=SC2016
-  if ! readelf -d "${bundle_dir}/bin/criu" 2>/dev/null | grep -q 'RPATH.*$ORIGIN/../lib'; then
-    echo -e "${RED}FAILED${NC}"
-    echo -e "  ${RED}✗${NC} RPATH not set to \$ORIGIN/../lib"
-    echo "  Current RPATH:"
-    readelf -d "${bundle_dir}/bin/criu" | grep -E 'RPATH|RUNPATH' || echo "    (none)"
-    failed=1
-  else
-    echo -e "${GREEN}OK${NC}"
-  fi
+	# Check RPATH (MUST PASS)
+	echo -n "Checking RPATH... "
+	# Note: Using single quotes to literally match $ORIGIN (not expand as variable)
+	# shellcheck disable=SC2016
+	if ! readelf -d "${bundle_dir}/bin/criu" 2>/dev/null | grep -q 'RPATH.*$ORIGIN/../lib'; then
+		echo -e "${RED}FAILED${NC}"
+		echo -e "  ${RED}✗${NC} RPATH not set to \$ORIGIN/../lib"
+		echo "  Current RPATH:"
+		readelf -d "${bundle_dir}/bin/criu" | grep -E 'RPATH|RUNPATH' || echo "    (none)"
+		failed=1
+	else
+		echo -e "${GREEN}OK${NC}"
+	fi
 
-  # ELF Architecture Validation
-  echo -n "Validating ELF architecture (${expected_machine})... "
-  local arch_errors=0
+	# ELF Architecture Validation
+	echo -n "Validating ELF architecture (${expected_machine})... "
+	local arch_errors=0
 
-  for binary in "bin/criu" "lib/criu/cuda_plugin.so"; do
-    if [[ -f "${bundle_dir}/${binary}" ]]; then
-      local actual_machine
-      actual_machine=$(readelf -h "${bundle_dir}/${binary}" 2>/dev/null | grep "Machine:" | awk '{print $2}')
-      if [[ "$actual_machine" != "$expected_machine" ]]; then
-        if [[ $arch_errors -eq 0 ]]; then
-          echo -e "${RED}FAILED${NC}"
-        fi
-        echo -e "  ${RED}✗${NC} ${binary}: expected ${expected_machine}, got ${actual_machine}"
-        arch_errors=1
-        failed=1
-      fi
-    fi
-  done
+	for binary in "bin/criu" "lib/criu/cuda_plugin.so"; do
+		if [[ -f "${bundle_dir}/${binary}" ]]; then
+			local actual_machine
+			# Extract full machine string (handles "Advanced Micro Devices X86-64" and "AArch64")
+			actual_machine=$(readelf -h "${bundle_dir}/${binary}" 2>/dev/null | grep "Machine:" | sed 's/.*Machine:[[:space:]]*//')
 
-  if [[ $arch_errors -eq 0 ]]; then
-    echo -e "${GREEN}OK${NC}"
-  fi
+			# Normalize machine name for comparison
+			if [[ "$actual_machine" =~ X86-64 ]]; then
+				actual_machine="X86-64"
+			elif [[ "$actual_machine" =~ AArch64 ]]; then
+				actual_machine="AArch64"
+			fi
 
-  # ELF Type Validation
-  echo -n "Validating ELF types... "
-  local type_errors=0
+			if [[ "$actual_machine" != "$expected_machine" ]]; then
+				if [[ $arch_errors -eq 0 ]]; then
+					echo -e "${RED}FAILED${NC}"
+				fi
+				echo -e "  ${RED}✗${NC} ${binary}: expected ${expected_machine}, got ${actual_machine}"
+				arch_errors=1
+				failed=1
+			fi
+		fi
+	done
 
-  # Check bin/criu is executable (EXEC or DYN)
-  local criu_type
-  criu_type=$(readelf -h "${bundle_dir}/bin/criu" 2>/dev/null | grep "Type:" | awk '{print $2}')
-  if [[ "$criu_type" != "EXEC" && "$criu_type" != "DYN" ]]; then
-    if [[ $type_errors -eq 0 ]]; then
-      echo -e "${RED}FAILED${NC}"
-    fi
-    echo -e "  ${RED}✗${NC} bin/criu: expected EXEC or DYN, got ${criu_type}"
-    type_errors=1
-    failed=1
-  fi
+	if [[ $arch_errors -eq 0 ]]; then
+		echo -e "${GREEN}OK${NC}"
+	fi
 
-  # Check plugin is DYN (shared object)
-  for lib in "lib/criu/cuda_plugin.so"; do
-    local lib_type
-    lib_type=$(readelf -h "${bundle_dir}/${lib}" 2>/dev/null | grep "Type:" | awk '{print $2}')
-    if [[ "$lib_type" != "DYN" ]]; then
-      if [[ $type_errors -eq 0 ]]; then
-        echo -e "${RED}FAILED${NC}"
-      fi
-      echo -e "  ${RED}✗${NC} ${lib}: expected DYN, got ${lib_type}"
-      type_errors=1
-      failed=1
-    fi
-  done
+	# ELF Type Validation
+	echo -n "Validating ELF types... "
+	local type_errors=0
 
-  if [[ $type_errors -eq 0 ]]; then
-    echo -e "${GREEN}OK${NC}"
-  fi
+	# Check bin/criu is executable (EXEC or DYN)
+	local criu_type
+	criu_type=$(readelf -h "${bundle_dir}/bin/criu" 2>/dev/null | grep "Type:" | awk '{print $2}')
+	if [[ "$criu_type" != "EXEC" && "$criu_type" != "DYN" ]]; then
+		if [[ $type_errors -eq 0 ]]; then
+			echo -e "${RED}FAILED${NC}"
+		fi
+		echo -e "  ${RED}✗${NC} bin/criu: expected EXEC or DYN, got ${criu_type}"
+		type_errors=1
+		failed=1
+	fi
 
-  # Dynamic Section Validation
-  echo -n "Validating dynamic sections... "
-  local dyn_errors=0
+	# Check plugin is DYN (shared object)
+	for lib in "lib/criu/cuda_plugin.so"; do
+		local lib_type
+		lib_type=$(readelf -h "${bundle_dir}/${lib}" 2>/dev/null | grep "Type:" | awk '{print $2}')
+		if [[ "$lib_type" != "DYN" ]]; then
+			if [[ $type_errors -eq 0 ]]; then
+				echo -e "${RED}FAILED${NC}"
+			fi
+			echo -e "  ${RED}✗${NC} ${lib}: expected DYN, got ${lib_type}"
+			type_errors=1
+			failed=1
+		fi
+	done
 
-  # Check bin/criu has NEEDED entries
-  if ! readelf -d "${bundle_dir}/bin/criu" 2>/dev/null | grep -q "NEEDED"; then
-    if [[ $dyn_errors -eq 0 ]]; then
-      echo -e "${RED}FAILED${NC}"
-    fi
-    echo -e "  ${RED}✗${NC} bin/criu: no NEEDED entries found"
-    dyn_errors=1
-    failed=1
-  fi
+	if [[ $type_errors -eq 0 ]]; then
+		echo -e "${GREEN}OK${NC}"
+	fi
 
-  # Check bin/criu has RPATH or RUNPATH
-  if ! readelf -d "${bundle_dir}/bin/criu" 2>/dev/null | grep -qE "RPATH|RUNPATH"; then
-    if [[ $dyn_errors -eq 0 ]]; then
-      echo -e "${RED}FAILED${NC}"
-    fi
-    echo -e "  ${RED}✗${NC} bin/criu: no RPATH or RUNPATH found"
-    dyn_errors=1
-    failed=1
-  fi
+	# Dynamic Section Validation
+	echo -n "Validating dynamic sections... "
+	local dyn_errors=0
 
-  if [[ $dyn_errors -eq 0 ]]; then
-    echo -e "${GREEN}OK${NC}"
-  fi
+	# Check bin/criu has NEEDED entries
+	if ! readelf -d "${bundle_dir}/bin/criu" 2>/dev/null | grep -q "NEEDED"; then
+		if [[ $dyn_errors -eq 0 ]]; then
+			echo -e "${RED}FAILED${NC}"
+		fi
+		echo -e "  ${RED}✗${NC} bin/criu: no NEEDED entries found"
+		dyn_errors=1
+		failed=1
+	fi
 
-  echo -n "Validating symbol exports... "
-  echo -e "${BLUE}SKIP${NC} (no libcriu.so in minimal bundle)"
+	# Check bin/criu has RPATH or RUNPATH
+	if ! readelf -d "${bundle_dir}/bin/criu" 2>/dev/null | grep -qE "RPATH|RUNPATH"; then
+		if [[ $dyn_errors -eq 0 ]]; then
+			echo -e "${RED}FAILED${NC}"
+		fi
+		echo -e "  ${RED}✗${NC} bin/criu: no RPATH or RUNPATH found"
+		dyn_errors=1
+		failed=1
+	fi
 
-  # Check dependencies (only on Linux)
-  if [[ "$(uname -s)" == "Linux" ]]; then
-    echo -n "Checking dependencies... "
-    local missing_deps
-    missing_deps=$(ldd "${bundle_dir}/bin/criu" 2>&1 | grep "not found" || true)
-    if [[ -n "$missing_deps" ]]; then
-      echo -e "${RED}FAILED${NC}"
-      echo -e "  ${RED}✗${NC} Missing dependencies:"
-      while IFS= read -r line; do
-        echo "    $line"
-      done <<<"$missing_deps"
-      failed=1
-    else
-      echo -e "${GREEN}OK${NC}"
-    fi
+	if [[ $dyn_errors -eq 0 ]]; then
+		echo -e "${GREEN}OK${NC}"
+	fi
 
-    echo -n "Checking libcriu.so resolution... "
-    echo -e "${BLUE}SKIP${NC} (criu doesn't depend on libcriu.so)"
-  else
-    echo -e "${BLUE}SKIP${NC} dependency checks (not on Linux)"
-  fi
+	echo -n "Validating symbol exports... "
+	echo -e "${BLUE}SKIP${NC} (no libcriu.so in minimal bundle)"
 
-  # Check plugin is a shared object
-  echo -n "Checking plugin format... "
-  if ! file "${bundle_dir}/lib/criu/cuda_plugin.so" | grep -q "shared object"; then
-    echo -e "${RED}FAILED${NC}"
-    echo -e "  ${RED}✗${NC} cuda_plugin.so is not a shared object"
-    failed=1
-  else
-    echo -e "${GREEN}OK${NC}"
-  fi
+	# Check dependencies (only on Linux)
+	if [[ "$(uname -s)" == "Linux" ]]; then
+		echo -n "Checking dependencies... "
+		local missing_deps
+		missing_deps=$(ldd "${bundle_dir}/bin/criu" 2>&1 | grep "not found" || true)
+		if [[ -n "$missing_deps" ]]; then
+			echo -e "${RED}FAILED${NC}"
+			echo -e "  ${RED}✗${NC} Missing dependencies:"
+			while IFS= read -r line; do
+				echo "    $line"
+			done <<<"$missing_deps"
+			failed=1
+		else
+			echo -e "${GREEN}OK${NC}"
+		fi
 
-  # Show bundle size
-  echo ""
-  echo "Bundle size:"
-  du -sh "${bundle_dir}"
+		echo -n "Checking libcriu.so resolution... "
+		echo -e "${BLUE}SKIP${NC} (criu doesn't depend on libcriu.so)"
+	else
+		echo -e "${BLUE}SKIP${NC} dependency checks (not on Linux)"
+	fi
 
-  # Show detailed file list
-  echo ""
-  echo "Bundle contents:"
-  find "${bundle_dir}" -type f -o -type l | sort | sed 's/^/  /'
+	# Check plugin is a shared object
+	echo -n "Checking plugin format... "
+	if ! file "${bundle_dir}/lib/criu/cuda_plugin.so" | grep -q "shared object"; then
+		echo -e "${RED}FAILED${NC}"
+		echo -e "  ${RED}✗${NC} cuda_plugin.so is not a shared object"
+		failed=1
+	else
+		echo -e "${GREEN}OK${NC}"
+	fi
 
-  echo ""
-  if [[ $failed -eq 0 ]]; then
-    echo -e "${GREEN}=== Validation PASSED ===${NC}"
-    return 0
-  else
-    echo -e "${RED}=== Validation FAILED ===${NC}"
-    return 1
-  fi
+	# Show bundle size
+	echo ""
+	echo "Bundle size:"
+	du -sh "${bundle_dir}"
+
+	# Show detailed file list
+	echo ""
+	echo "Bundle contents:"
+	find "${bundle_dir}" -type f -o -type l | sort | sed 's/^/  /'
+
+	echo ""
+	if [[ $failed -eq 0 ]]; then
+		echo -e "${GREEN}=== Validation PASSED ===${NC}"
+		return 0
+	else
+		echo -e "${RED}=== Validation FAILED ===${NC}"
+		return 1
+	fi
 }
 
 # Main build process
@@ -252,8 +261,8 @@ echo ""
 # Check if Dockerfile exists
 DOCKERFILE="contrib/castai/release/Dockerfile.${DISTRO}-castai"
 if [[ ! -f "${DOCKERFILE}" ]]; then
-  echo -e "${RED}Error: ${DOCKERFILE} does not exist${NC}"
-  exit 1
+	echo -e "${RED}Error: ${DOCKERFILE} does not exist${NC}"
+	exit 1
 fi
 
 # Cleanup old builds
@@ -262,10 +271,10 @@ cleanup
 # Build using Docker buildx
 echo "Running Docker build..."
 docker buildx build \
-  --platform "linux/${ARCH}" \
-  -f "${DOCKERFILE}" \
-  --output "${OUTPUT_DIR}" \
-  .
+	--platform "linux/${ARCH}" \
+	-f "${DOCKERFILE}" \
+	--output "${OUTPUT_DIR}" \
+	.
 
 echo ""
 echo "Build complete. Creating tarball..."
@@ -277,13 +286,13 @@ echo -e "${GREEN}✓${NC} Created: ${TARBALL}"
 
 # Validate bundle
 if validate_bundle "${OUTPUT_DIR}"; then
-  echo ""
-  echo -e "${GREEN}✓ Bundle validation passed!${NC}"
-  exit_code=0
+	echo ""
+	echo -e "${GREEN}✓ Bundle validation passed!${NC}"
+	exit_code=0
 else
-  echo ""
-  echo -e "${RED}✗ Bundle validation failed!${NC}"
-  exit_code=1
+	echo ""
+	echo -e "${RED}✗ Bundle validation failed!${NC}"
+	exit_code=1
 fi
 
 # Usage instructions
