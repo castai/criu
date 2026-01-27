@@ -1,0 +1,46 @@
+# CastAI CRIU Bundle Builder for Container-Optimized OS
+# Uses Debian base for compatibility
+# This file is isolated in contrib/castai/ to avoid conflicts with upstream CRIU
+
+ARG IMAGE=debian
+ARG VERSION=12
+
+FROM ${IMAGE}:${VERSION} AS build
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    gcc make \
+    pkg-config \
+    git \
+    libprotobuf-c-dev protobuf-c-compiler protobuf-compiler \
+    libnl-3-dev \
+    libnet1-dev \
+    libcap-dev \
+    libaio-dev \
+    libbsd-dev \
+    python3 python3-pip python3-dev \
+    libnftables-dev \
+    libgnutls28-dev
+
+COPY . /work
+WORKDIR /work
+
+# Build with RPATH
+RUN make -j $(nproc) \
+    LDFLAGS="-Wl,-rpath='\$\$ORIGIN/../lib'" \
+    criu lib cuda_plugin
+
+# Package stage
+FROM ${IMAGE}:${VERSION} AS package
+COPY --from=build /work /work
+WORKDIR /work
+
+# Create bundle - simple structure without version symlinks
+RUN mkdir -p /bundle-castai/bin /bundle-castai/lib/criu && \
+    cp criu/criu /bundle-castai/bin/ && \
+    cp lib/c/libcriu.so.*.* /bundle-castai/lib/libcriu.so && \
+    cp plugins/cuda/cuda_plugin.so /bundle-castai/lib/criu/
+
+# Export stage
+FROM scratch
+COPY --from=package /bundle-castai/ /
