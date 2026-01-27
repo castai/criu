@@ -1,0 +1,45 @@
+# CastAI CRIU Bundle Builder for Amazon Linux 2023
+# This file is isolated in contrib/castai/ to avoid conflicts with upstream CRIU
+
+ARG IMAGE=amazonlinux
+ARG VERSION=2023
+
+FROM ${IMAGE}:${VERSION} AS build
+
+# Install build dependencies
+RUN yum install -y \
+    gcc make \
+    git \
+    pkg-config \
+    protobuf-c-devel protobuf-c-compiler protobuf-devel \
+    libnl3-devel \
+    libnet-devel \
+    libcap-devel \
+    libaio-devel \
+    libbsd-devel \
+    python3 python3-pip python3-devel \
+    nftables-devel \
+    gnutls-devel
+
+COPY . /work
+WORKDIR /work
+
+# Build with RPATH set to $ORIGIN/../lib for portable deployment
+RUN make -j $(nproc) \
+    LDFLAGS="-Wl,-rpath='\$\$ORIGIN/../lib'" \
+    criu lib cuda_plugin
+
+# Package stage - create clean bundle structure
+FROM ${IMAGE}:${VERSION} AS package
+COPY --from=build /work /work
+WORKDIR /work
+
+# Create bundle - simple structure without version symlinks
+RUN mkdir -p /bundle-castai/bin /bundle-castai/lib/criu && \
+    cp criu/criu /bundle-castai/bin/ && \
+    cp lib/c/libcriu.so.*.* /bundle-castai/lib/libcriu.so && \
+    cp plugins/cuda/cuda_plugin.so /bundle-castai/lib/criu/
+
+# Export stage - minimal output
+FROM scratch
+COPY --from=package /bundle-castai/ /
