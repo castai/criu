@@ -44,14 +44,14 @@ jobs:
 
       - name: Create CastAI tarball
         run: |
-          tar -czf criu-castai-${{ github.ref_name }}-${{ matrix.distro }}-${{ matrix.arch }}.tar.gz \
+          tar -czf criu-castai-${{ github.ref_name }}-${{ matrix.arch }}.tar.gz \
             -C ${{ matrix.distro }}-${{ matrix.arch }}-bins-castai .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v3
         with:
-          name: criu-castai-${{ github.ref_name }}-${{ matrix.distro }}-${{ matrix.arch }}
-          path: criu-castai-${{ github.ref_name }}-${{ matrix.distro }}-${{ matrix.arch }}.tar.gz
+          name: criu-castai-${{ github.ref_name }}-${{ matrix.arch }}
+          path: criu-castai-${{ github.ref_name }}-${{ matrix.arch }}.tar.gz
           retention-days: 30
 
   create-castai-release:
