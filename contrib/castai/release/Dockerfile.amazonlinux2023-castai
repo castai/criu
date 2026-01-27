@@ -24,6 +24,9 @@ RUN yum install -y \
 COPY . /work
 WORKDIR /work
 
+# Generate config.h to detect system features (TCP_REPAIR, etc.)
+RUN make include/common/config.h
+
 # Build with RPATH set to $ORIGIN/../lib for portable deployment
 RUN make -j $(nproc) \
     LDFLAGS="-Wl,-rpath='\$\$ORIGIN/../lib'" \
