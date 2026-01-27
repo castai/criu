@@ -6,11 +6,12 @@ ARG VERSION=2023
 
 FROM ${IMAGE}:${VERSION} AS build
 
-# Install build dependencies
+# Install build dependencies (including patchelf for RPATH modification)
 RUN yum install -y \
     gcc make \
     git \
     pkg-config \
+    patchelf \
     protobuf-c-devel protobuf-c-compiler protobuf-devel \
     libnl3-devel \
     libnet-devel \
@@ -27,10 +28,13 @@ WORKDIR /work
 # Generate config.h to detect system features (TCP_REPAIR, etc.)
 RUN make include/common/config.h
 
-# Build with RPATH set to $ORIGIN/../lib for portable deployment
-RUN make -j $(nproc) \
-    LDFLAGS="-Wl,-rpath='\$\$ORIGIN/../lib'" \
-    criu lib cuda_plugin
+# Build CRIU (without custom RPATH - we'll set it after)
+RUN make -j $(nproc) criu lib cuda_plugin
+
+# Set RPATH after build using patchelf for portable deployment
+RUN patchelf --set-rpath '$ORIGIN/../lib' criu/criu && \
+    patchelf --set-rpath '$ORIGIN' lib/c/libcriu.so.*.* && \
+    patchelf --set-rpath '$ORIGIN/..' plugins/cuda/cuda_plugin.so
 
 # Package stage - create clean bundle structure
 FROM ${IMAGE}:${VERSION} AS package

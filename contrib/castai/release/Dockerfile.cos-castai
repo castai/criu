@@ -7,11 +7,12 @@ ARG VERSION=12
 
 FROM ${IMAGE}:${VERSION} AS build
 
-# Install build dependencies
+# Install build dependencies (including patchelf for RPATH modification)
 RUN apt-get update && apt-get install -y \
     gcc make \
     pkg-config \
     git \
+    patchelf \
     libprotobuf-c-dev protobuf-c-compiler protobuf-compiler \
     libnl-3-dev \
     libnet1-dev \
@@ -28,10 +29,13 @@ WORKDIR /work
 # Generate config.h to detect system features (TCP_REPAIR, etc.)
 RUN make include/common/config.h
 
-# Build with RPATH
-RUN make -j $(nproc) \
-    LDFLAGS="-Wl,-rpath='\$\$ORIGIN/../lib'" \
-    criu lib cuda_plugin
+# Build CRIU (without custom RPATH - we'll set it after)
+RUN make -j $(nproc) criu lib cuda_plugin
+
+# Set RPATH after build using patchelf for portable deployment
+RUN patchelf --set-rpath '$ORIGIN/../lib' criu/criu && \
+    patchelf --set-rpath '$ORIGIN' lib/c/libcriu.so.*.* && \
+    patchelf --set-rpath '$ORIGIN/..' plugins/cuda/cuda_plugin.so
 
 # Package stage
 FROM ${IMAGE}:${VERSION} AS package
