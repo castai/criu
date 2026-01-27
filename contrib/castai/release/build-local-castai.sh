@@ -85,14 +85,15 @@ validate_bundle() {
 		echo -e "${GREEN}OK${NC}"
 	fi
 
-	# Check RPATH (MUST PASS)
-	echo -n "Checking RPATH... "
+	# Check RPATH/RUNPATH (MUST PASS for portability)
+	echo -n "Checking RPATH/RUNPATH... "
 	# Note: Using single quotes to literally match $ORIGIN (not expand as variable)
 	# shellcheck disable=SC2016
-	if ! readelf -d "${bundle_dir}/bin/criu" 2>/dev/null | grep -q 'RPATH.*$ORIGIN/../lib'; then
+	if ! readelf -d "${bundle_dir}/bin/criu" 2>/dev/null | grep -qE '(RPATH|RUNPATH).*\$ORIGIN/../lib'; then
 		echo -e "${RED}FAILED${NC}"
-		echo -e "  ${RED}✗${NC} RPATH not set to \$ORIGIN/../lib"
-		echo "  Current RPATH:"
+		# shellcheck disable=SC2016
+		echo -e "  ${RED}✗${NC} RPATH/RUNPATH not set to \$ORIGIN/../lib"
+		echo "  Current:"
 		readelf -d "${bundle_dir}/bin/criu" | grep -E 'RPATH|RUNPATH' || echo "    (none)"
 		failed=1
 	else
