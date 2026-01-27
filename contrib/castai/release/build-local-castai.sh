@@ -272,11 +272,20 @@ setup_qemu() {
   native_arch=$(detect_arch)
   
   if [[ "$ARCH" != "$native_arch" ]]; then
-    echo "Setting up QEMU for cross-platform builds..."
-    if docker run --rm --privileged multiarch/qemu-user-static --reset -p yes &>/dev/null 2>&1; then
-      echo -e "${GREEN}✓${NC} QEMU configured for $ARCH emulation"
+    echo "Cross-platform build detected (native: $native_arch, target: $ARCH)"
+    
+    # Check if QEMU is available (not available on macOS)
+    if [[ "$(uname -s)" == "Linux" ]]; then
+      echo "Setting up QEMU for emulation..."
+      if docker run --rm --privileged multiarch/qemu-user-static --reset -p yes &>/dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} QEMU configured for $ARCH emulation"
+      else
+        echo -e "${YELLOW}Warning: Failed to setup QEMU. Cross-architecture build may fail.${NC}"
+        echo -e "${YELLOW}Attempting build anyway (Docker may have QEMU pre-configured)...${NC}"
+      fi
     else
-      echo -e "${YELLOW}Warning: Failed to setup QEMU. Cross-architecture build may fail.${NC}"
+      # On macOS, Docker Desktop handles multi-arch natively
+      echo -e "${BLUE}Note: Running on $(uname -s). Docker Desktop should handle multi-arch natively.${NC}"
     fi
   fi
 }
@@ -306,6 +315,7 @@ setup_qemu
 # Build using Docker buildx
 echo ""
 echo "Running Docker build for linux/${ARCH}..."
+echo "Note: This will use amazonlinux:2023 ${ARCH} base image"
 docker buildx build \
   --platform "linux/${ARCH}" \
   -f "${DOCKERFILE}" \
