@@ -265,35 +265,20 @@ validate_bundle() {
   fi
 }
 
-# Function to ensure multi-arch builder exists
-ensure_builder() {
-  local builder_name="criu-castai-builder"
+# Function to setup QEMU for multi-arch builds
+setup_qemu() {
+  # Only setup QEMU if building for non-native architecture
+  local native_arch
+  native_arch=$(detect_arch)
   
-  echo "Checking for multi-architecture builder..."
-  
-  # Check if builder exists and supports required platforms
-  if docker buildx inspect "$builder_name" &>/dev/null; then
-    echo "✓ Using existing builder: $builder_name"
-    docker buildx use "$builder_name"
-    return 0
+  if [[ "$ARCH" != "$native_arch" ]]; then
+    echo "Setting up QEMU for cross-platform builds..."
+    if docker run --rm --privileged multiarch/qemu-user-static --reset -p yes &>/dev/null 2>&1; then
+      echo -e "${GREEN}✓${NC} QEMU configured for $ARCH emulation"
+    else
+      echo -e "${YELLOW}Warning: Failed to setup QEMU. Cross-architecture build may fail.${NC}"
+    fi
   fi
-  
-  echo "Creating multi-architecture builder..."
-  
-  # Setup QEMU for cross-platform builds (if not already done)
-  echo "  Setting up QEMU for ARM64 emulation..."
-  if ! docker run --rm --privileged multiarch/qemu-user-static --reset -p yes &>/dev/null; then
-    echo "  ${YELLOW}Warning: Failed to setup QEMU. ARM64 builds may not work.${NC}"
-  fi
-  
-  # Create builder with support for amd64 and arm64
-  docker buildx create \
-    --name "$builder_name" \
-    --driver docker-container \
-    --platform linux/amd64,linux/arm64 \
-    --use
-  
-  echo -e "  ${GREEN}✓${NC} Created and activated builder: $builder_name"
 }
 
 # Main build process
@@ -315,8 +300,8 @@ fi
 # Cleanup old builds
 cleanup
 
-# Ensure multi-arch builder exists
-ensure_builder
+# Setup QEMU if needed for cross-architecture builds
+setup_qemu
 
 # Build using Docker buildx
 echo ""
