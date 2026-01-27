@@ -343,21 +343,20 @@ else
   exit_code=1
 fi
 
-# Usage instructions
-echo ""
-echo "========================================="
-echo "Testing Instructions:"
-echo "========================================="
-echo "Extract and test:"
-echo "  mkdir test-castai && tar -xzf ${TARBALL} -C test-castai"
-echo "  test-castai/bin/criu --version"
-echo "  test-castai/bin/criu check"
-echo ""
-echo "Test plugin loading:"
-echo "  test-castai/bin/criu dump -t <pid> -D /tmp/test -L \$(pwd)/test-castai/lib/criu"
-echo ""
-echo "Clean up:"
-echo "  rm -rf ${OUTPUT_DIR} ${TARBALL} test-castai"
-echo "========================================="
+# Test binary execution (only on Linux)
+if [[ "$(uname -s)" == "Linux" ]] && [[ $exit_code -eq 0 ]]; then
+  echo ""
+  echo "=== Testing Binary Execution ==="
+  echo -n "Running criu --version... "
+
+  if version_output=$("${OUTPUT_DIR}/bin/criu" --version 2>&1); then
+    echo -e "${GREEN}OK${NC}"
+    echo "  Version: ${version_output}"
+  else
+    echo -e "${RED}FAILED${NC}"
+    echo "  Error: ${version_output}"
+    exit_code=1
+  fi
+fi
 
 exit $exit_code
