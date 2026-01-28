@@ -57,6 +57,7 @@ copy_lib "libnftables.so.*"
 copy_lib "libnl-3.so.*"
 copy_lib "libnl-route-3.so.*"
 copy_lib "libuuid.so.1*"
+copy_lib "libibverbs.so.*"
 
 # Copy transitive dependencies (libraries that the above depend on)
 echo "Copying transitive dependencies..."
