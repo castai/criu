@@ -25,23 +25,3 @@ jobs:
         sudo -E SKIP_PLUGIN_TESTS=1 make -C scripts/ci live-local GCC=1 RUN_TESTS=1 NO_GNUTLS=1 \
           COMPILE_FLAGS="NO_CUDA_PLUGIN=1" \
           ZDTM_OPTS="-p $(nproc) -x zdtm/static/change_mnt_context -x zdtm/static/maps05 -x zdtm/static/socket-tcp-close0 -x zdtm/static/socket-dump-tcp-close"
-
-  validate-castai-bundle:
-    runs-on: ubuntu-24.04-arm
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-    
-    - name: Build and validate CastAI bundle for arm64
-      run: |
-        ./contrib/castai/release/build-local-castai.sh arm64
-    
-    - name: Upload bundle artifact
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: criu-castai-test-arm64
-        path: criu-castai-local-arm64.tar.gz
-        retention-days: 7
