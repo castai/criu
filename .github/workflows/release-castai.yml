@@ -1,0 +1,86 @@
+name: CastAI CRIU Release
+
+on:
+  push:
+    tags:
+      - '*'
+
+permissions:
+  packages: write
+  contents: read
+
+jobs:
+  build-castai-bundles:
+    name: Build CastAI CRIU Bundle
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        distro: [universal]
+        arch: [amd64, arm64]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Create multi architecture builder
+        run: |
+          docker buildx create --name multi-arch-castai --platform "linux/arm64,linux/amd64" --driver "docker-container"
+          docker buildx ls --no-trunc
+
+      - name: Build CastAI bundle for ${{ matrix.distro }} ${{ matrix.arch }}
+        run: |
+          docker buildx build \
+            --builder multi-arch-castai \
+            --platform linux/${{ matrix.arch }} \
+            -f contrib/castai/release/Dockerfile.${{ matrix.distro }}-castai \
+            --output ${{ matrix.distro }}-${{ matrix.arch }}-bins-castai \
+            .
+
+      - name: List built binaries
+        run: |
+          echo "Bundle contents for ${{ matrix.distro }}-${{ matrix.arch }}:"
+          find ${{ matrix.distro }}-${{ matrix.arch }}-bins-castai -type f -o -type l | sort
+
+      - name: Create CastAI tarball
+        run: |
+          tar -czf criu-castai-${{ github.ref_name }}-${{ matrix.arch }}.tar.gz \
+            -C ${{ matrix.distro }}-${{ matrix.arch }}-bins-castai .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: criu-castai-${{ github.ref_name }}-${{ matrix.arch }}
+          path: criu-castai-${{ github.ref_name }}-${{ matrix.arch }}.tar.gz
+          retention-days: 30
+
+  create-castai-release:
+    name: Create CastAI GitHub Release
+    needs: build-castai-bundles
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all CastAI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Organize CastAI release files
+        run: |
+          find artifacts -name '*.tar.gz' -exec mv {} . \;
+          ls -lah criu-castai-*.tar.gz
+
+      - name: Create CastAI SHA256SUMS
+        run: |
+          sha256sum criu-castai-*.tar.gz > SHA256SUMS-castai
+          cat SHA256SUMS-castai
+
+      - name: Upload CastAI Release Assets
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "criu-castai-*.tar.gz,SHA256SUMS-castai"
+          allowUpdates: true
+          artifactErrorsFailBuild: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
