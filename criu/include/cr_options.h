@@ -145,6 +145,7 @@ struct cr_options {
 	int handle_file_locks;
 	int tcp_established_ok;
 	int tcp_close;
+	int keep_network_lock;
 	int evasive_devices;
 	int link_remap_ok;
 	int log_file_per_pid;
