@@ -2095,7 +2095,14 @@ static int cr_dump_finish(int ret)
 	 */
 	if (ret || post_dump_ret || opts.final_state == TASK_ALIVE) {
 		unsuspend_lsm();
-		network_unlock();
+		/*
+		 * For live migration we want to be able to recover the process(es) in case
+		 * the restoration fails. When --keep-network-lock is specified, the network
+		 * lock is kept until we actually need to recover.
+		 */
+		if (!opts.keep_network_lock) {
+			network_unlock();
+		}
 		delete_link_remaps();
 		clean_cr_time_mounts();
 	}
