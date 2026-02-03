@@ -175,6 +175,7 @@ message criu_opts {
 	 * sequential field numbers allocated by upstream CRIU.
 	 */
 	optional bool			allow_uprobes		= 1000;
+	optional bool			keep_network_lock	= 1001;
 /*	optional bool			check_mounts		= 128;	*/
 }
 
