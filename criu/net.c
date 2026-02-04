@@ -3287,6 +3287,11 @@ void network_unlock(void)
 	cpt_unlock_tcp_connections();
 	rst_unlock_tcp_connections();
 
+	if (opts.keep_network_lock) {
+		pr_info("Keeping network lock\n");
+		return;
+	}
+
 	if (root_ns_mask & CLONE_NEWNET) {
 		/* coverity[check_return] */
 		run_scripts(ACT_NET_UNLOCK);
