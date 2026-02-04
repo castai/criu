@@ -58,6 +58,10 @@ extern int disconnect_from_page_server(void);
 
 extern int check_parent_page_xfer(int fd_type, unsigned long id);
 
+struct vm_area_list;
+extern int send_released_pages_to_server(int fd_type, unsigned long img_id,
+					 struct vm_area_list *vmas);
+
 /*
  * The post-copy migration makes it necessary to receive pages from
  * remote dump. The protocol we use for that is quite simple:

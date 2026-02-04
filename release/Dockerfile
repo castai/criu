@@ -24,11 +24,13 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
 	python3-minimal \
 	python3-protobuf \
 	uuid-dev \
-	python3-yaml
+	python3-yaml \
+	bear
 
 COPY . /work
 WORKDIR /work
-RUN make -j $(nproc) criu
+RUN make mrproper && bear -- make -j 32 criu
 
 FROM scratch
 COPY --from=build /work/criu/criu .
+COPY --from=build /work/compile_commands.json .

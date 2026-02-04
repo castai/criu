@@ -253,8 +253,7 @@ int cr_plugin_init(int stage)
 			goto err;
 		}
 
-		if (cr_lib_load(stage, path))
-			goto err;
+		cr_lib_load(stage, path);
 	}
 
 	if (stage == CR_PLUGIN_STAGE__RESTORE && check_inventory_plugins())

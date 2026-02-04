@@ -622,8 +622,28 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	else
 		ret = drain_pages(pp, ctl, args);
 
-	if (!ret && !mdc->pre_dump)
+	if (!ret && !mdc->pre_dump){
 		ret = xfer_pages(pp, &xfer);
+        if (xfer.parent) {
+            pr_debug("CUSTOM: Runing sending released pages to page server\n");
+            ret = send_released_pages_to_server(CR_FD_PAGEMAP, vpid(item),
+                                vma_area_list);
+            if (ret < 0)
+                goto out_xfer;
+        }
+    } else {
+        if (xfer.parent && mdc->pre_dump) {
+            ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, vpid(item));
+            if (ret < 0)
+                goto out_pp;
+            pr_debug("CUSTOM: Runing sending released pages to page server\n");
+            ret = send_released_pages_to_server(CR_FD_PAGEMAP, vpid(item),
+                                vma_area_list);
+            if (ret < 0)
+                goto out_xfer;
+
+        }
+    }
 	if (ret)
 		goto out_xfer;
 

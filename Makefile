@@ -175,7 +175,7 @@ HOSTCFLAGS		+= $(WARNINGS) $(DEFINES) -iquote include/
 export AFLAGS CFLAGS USERCLFAGS HOSTCFLAGS
 
 # Default target
-all: criu lib crit cuda_plugin
+all: criu lib crit
 .PHONY: all
 
 #
@@ -348,13 +348,6 @@ test: zdtm
 	$(Q) $(MAKE) -C test
 .PHONY: test
 
-amdgpu_plugin: criu
-	$(Q) $(MAKE) -C plugins/amdgpu all
-.PHONY: amdgpu_plugin
-
-cuda_plugin: criu
-	$(Q) $(MAKE) -C plugins/cuda all
-.PHONY: cuda_plugin
 
 crit: lib
 	$(Q) $(MAKE) -C crit

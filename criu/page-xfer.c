@@ -27,6 +27,8 @@
 #include "rst_info.h"
 #include "stats.h"
 #include "tls.h"
+#include "vma.h"
+#include "kerndat.h"
 
 static int page_server_sk = -1;
 
@@ -43,13 +45,14 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 	iov->iov_len = ps->nr_pages * PAGE_SIZE;
 }
 
-#define PS_IOV_ADD    1
-#define PS_IOV_HOLE   2
-#define PS_IOV_OPEN   3
-#define PS_IOV_OPEN2  4
-#define PS_IOV_PARENT 5
-#define PS_IOV_ADD_F  6
-#define PS_IOV_GET    7
+#define PS_IOV_ADD      1
+#define PS_IOV_HOLE     2
+#define PS_IOV_OPEN     3
+#define PS_IOV_OPEN2    4
+#define PS_IOV_PARENT   5
+#define PS_IOV_ADD_F    6
+#define PS_IOV_GET      7
+#define PS_IOV_VMA_RANGES 9
 
 #define PS_IOV_CLOSE	   0x1023
 #define PS_IOV_FORCE_CLOSE 0x1024
@@ -247,6 +250,93 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
 
 	if (has_parent)
 		xfer->parent = (void *)1; /* This is required for generate_iovs() */
+
+	return 0;
+}
+
+/*
+ * Send current VMA ranges to the page server, which will compare them
+ * against parent pagemap entries to detect released memory ranges.
+ * The page server will then dedup those released ranges from parent.
+ * This enables proper deduplication for iterative dumps with page server.
+ *
+ * Note: We send VMA ranges (not pagemap) because during predumps only
+ * inventory.proto is saved locally - the parent pagemap is on the page
+ * server side.
+ */
+int send_released_pages_to_server(int fd_type, unsigned long img_id,
+				  struct vm_area_list *vmas)
+{
+	struct vma_area *vma;
+	struct page_server_iov pi;
+	unsigned long nr_pages;
+
+	if (page_server_sk < 0)
+		return 0;  /* Not using page server */
+
+	pr_debug("Sending current VMA ranges to page server for released page detection\n");
+
+	/*
+	 * Send each current VMA range to the page server.
+	 * The page server will use these to determine what memory
+	 * from the parent dump has been released.
+	 */
+	list_for_each_entry(vma, &vmas->h, list) {
+
+		/*[> Skip guard areas - they don't have pagemap entries <]*/
+		/*if (vma_area_is(vma, VMA_AREA_GUARD)) {*/
+			/*pr_debug("Skipping GUARD VMA %#" PRIx64 "-%#" PRIx64 "\n",*/
+				 /*vma->e->start, vma->e->end);*/
+			/*continue;*/
+		/*}*/
+
+		/*[> Only send private and shared anonymous VMAs that get dumped <]*/
+		/*if (!vma_area_is_private(vma, kdat.task_size) &&*/
+			/*!vma_area_is(vma, VMA_ANON_SHARED)){*/
+            /*pr_debug("Skipping non-private/shared-anon VMA %#" PRIx64 "-%#" PRIx64 "\n",*/
+                     /*vma->e->start, vma->e->end);*/
+			/*continue;*/
+        /*}*/
+
+		/*[> Skip special areas that don't get pagemap entries <]*/
+		/*if (vma_entry_is(vma->e, VMA_AREA_VVAR)){*/
+            /*pr_debug("Skipping VVAR VMA %#" PRIx64 "-%#" PRIx64 "\n",*/
+                     /*vma->e->start, vma->e->end);*/
+			/*continue;*/
+        /*}*/
+
+		nr_pages = (vma->e->end - vma->e->start) / PAGE_SIZE;
+
+		pi.cmd = PS_IOV_VMA_RANGES;
+		pi.nr_pages = nr_pages;
+		pi.vaddr = vma->e->start;
+		pi.dst_id = encode_pm(fd_type, img_id);
+
+		pr_debug("Sending VMA range %#" PRIx64 "-%#" PRIx64 " (%lu pages)\n",
+			 vma->e->start, vma->e->end, nr_pages);
+
+		if (send_psi(page_server_sk, &pi)) {
+			pr_err("Failed to send VMA range to page server\n");
+			return -1;
+		}
+	}
+
+	/*
+	 * Send end marker (nr_pages=0) to signal page server
+	 * that all VMA ranges have been sent and it should now
+	 * process them to detect released ranges.
+	 */
+	pi.cmd = PS_IOV_VMA_RANGES;
+	pi.nr_pages = 0;
+	pi.vaddr = 0;
+	pi.dst_id = encode_pm(fd_type, img_id);
+
+	pr_debug("Sending VMA ranges end marker\n");
+
+	if (send_psi(page_server_sk, &pi)) {
+		pr_err("Failed to send VMA ranges end marker\n");
+		return -1;
+	}
 
 	return 0;
 }
@@ -1015,8 +1105,42 @@ static struct pipe_read_dest pipe_read_dest = {
 	.sink_fd = -1,
 };
 
+/*
+ * VMA range storage for released page detection.
+ * Used to collect current VMA ranges from client, then compare
+ * against parent pagemap to find released ranges.
+ */
+struct vma_range {
+	u64 start;
+	u64 end;
+	struct list_head list;
+};
+
+static LIST_HEAD(current_vma_ranges);
+static bool vma_ranges_ready = false;
+
+/* Forward declaration */
+static int process_vma_ranges_for_release(void);
+
+/*
+ * Free all collected VMA ranges
+ */
+static void free_vma_ranges(void)
+{
+	struct vma_range *vma, *tmp;
+
+	list_for_each_entry_safe(vma, tmp, &current_vma_ranges, list) {
+		list_del(&vma->list);
+		xfree(vma);
+	}
+}
+
 static void page_server_close(void)
 {
+    int ret = process_vma_ranges_for_release();
+    if (ret < 0) {
+        pr_err("Failed to process VMA ranges\n");
+    }
 	if (cxfer.dst_id != ~0)
 		cxfer.loc_xfer.close(&cxfer.loc_xfer);
 	if (pipe_read_dest.sink_fd != -1) {
@@ -1184,6 +1308,134 @@ static int page_server_get_pages(int sk, struct page_server_iov *pi)
 	return 0;
 }
 
+/*
+ * Check if a memory range overlaps with any current VMA.
+ * Returns true if the range is covered by current VMAs, false otherwise.
+ */
+static bool range_in_current_vmas(u64 addr, unsigned long len)
+{
+	struct vma_range *vma;
+	u64 end = addr + len;
+
+	list_for_each_entry(vma, &current_vma_ranges, list) {
+		/* Check for any overlap */
+		if (vma->start < end && vma->end > addr)
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Process collected VMA ranges: scan parent pagemap and dedup
+ * any ranges that don't overlap with current VMAs.
+ */
+static int process_vma_ranges_for_release(void)
+{
+	struct page_xfer *lxfer = &cxfer.loc_xfer;
+	struct page_read *parent;
+	int ret = 0;
+
+	if (!lxfer->parent) {
+		pr_debug("No parent pagemap, skipping released range detection\n");
+		goto out;
+	}
+
+	parent = lxfer->parent;
+	pr_debug("Scanning parent pagemap to detect released ranges\n");
+
+	/* Reset to beginning of parent pagemap */
+	parent->reset(parent);
+
+	/* Scan all parent pagemap entries */
+	while (parent->advance(parent) > 0) {
+		u64 vaddr = parent->pe->vaddr;
+		unsigned long len = pagemap_len(parent->pe);
+
+		/*
+		 * Update cvaddr to track current position.
+		 * This is needed for dedup_one_iovec to work correctly.
+		 */
+		parent->cvaddr = vaddr;
+
+		/*
+		 * Check if this parent range overlaps with any current VMA.
+		 * If not, it means the memory was released - dedup it.
+		 */
+		if (!range_in_current_vmas(vaddr, len)) {
+			pr_debug("Detected released range %" PRIx64 "-%" PRIx64 " (%lu pages) at file offset %lu\n",
+				 vaddr, vaddr + len, len / PAGE_SIZE, parent->pi_off);
+
+			ret = dedup_one_iovec(parent, vaddr, len);
+			if (ret < 0) {
+				pr_err("Failed to dedup released range\n");
+				break;
+			}
+		} else {
+			pr_debug("Parent range %" PRIx64 "-%" PRIx64 " (%lu pages) overlaps current VMAs - keeping\n",
+				 vaddr, vaddr + len, len / PAGE_SIZE);
+		}
+
+		/*
+		 * Advance file offset if this entry has pages in the file.
+		 * This is critical for punch_hole to target the correct file offset.
+		 */
+		if (pagemap_present(parent->pe))
+			parent->pi_off += len;
+		parent->cvaddr += len;
+	}
+
+    /*parent->close(parent);*/
+
+
+out:
+	free_vma_ranges();
+	return ret;
+}
+
+/*
+ * Handle PS_IOV_VMA_RANGES command: collect current VMA ranges from client.
+ * When end marker (nr_pages=0) is received, mark ranges as ready but DON'T
+ * process yet. Processing happens later when PS_IOV_CLOSE is received, after
+ * all pagemap entries have been sent.
+ */
+static int page_server_vma_ranges(struct page_server_iov *pi)
+{
+	struct vma_range *vma;
+    /*int ret;*/
+
+	if (prep_loc_xfer(pi))
+		return -1;
+
+	/* End marker - mark VMA ranges as ready for later processing */
+	if (pi->nr_pages == 0) {
+		pr_debug("Received VMA ranges end marker, deferring processing until close\n");
+		vma_ranges_ready = true;
+        /*ret = process_vma_ranges_for_release();*/
+        /*if (ret < 0) {*/
+            /*pr_err("Failed to process VMA ranges\n");*/
+            /*return -1;*/
+        /*}*/
+		return 0;
+	}
+
+	/* Add this VMA range to the list */
+	vma = xmalloc(sizeof(*vma));
+	if (!vma) {
+		pr_err("Failed to allocate VMA range\n");
+		return -1;
+	}
+
+	vma->start = pi->vaddr;
+	vma->end = pi->vaddr + pi->nr_pages * PAGE_SIZE;
+	list_add_tail(&vma->list, &current_vma_ranges);
+
+	pr_debug("Collected VMA range %" PRIx64 "-%" PRIx64 " (%lu pages)\n",
+		 vma->start, vma->end, pi->nr_pages);
+
+	return 0;
+}
+
 static int page_server_serve(int sk)
 {
 	int ret = -1;
@@ -1273,6 +1525,9 @@ static int page_server_serve(int sk)
 		}
 		case PS_IOV_GET:
 			ret = page_server_get_pages(sk, &pi);
+			break;
+		case PS_IOV_VMA_RANGES:
+			ret = page_server_vma_ranges(&pi);
 			break;
 		default:
 			pr_err("Unknown command %u\n", pi.cmd);

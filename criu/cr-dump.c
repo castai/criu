@@ -1872,9 +1872,9 @@ static int cr_pre_dump_finish(int status)
 
 		pr_info("\tPre-dumping %d\n", vpid(item));
 		timing_start(TIME_MEMWRITE);
-		ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, vpid(item));
-		if (ret < 0)
-			goto err;
+        ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, vpid(item));
+        if (ret < 0)
+            goto err;
 
 		mem_pp = dmpi(item)->mem_pp;
 
