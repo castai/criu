@@ -145,3 +145,42 @@ all-arch:
 .PHONY: test
 test: $(TARGET)
 	@echo "Run on Linux: sudo ./$(TARGET) -t \$\$\$$"
+
+# Linting targets
+.PHONY: lint lint-clang-tidy lint-cppcheck check-style
+
+lint: check-style lint-cppcheck
+	@echo "✅ Lint checks complete"
+
+# Check code style (basic checks without external tools)
+check-style:
+	@echo "Checking code style..."
+	@! grep -rn "^ \+	" *.c *.h 2>/dev/null || (echo "❌ Spaces before tabs found" && false)
+	@! grep -rn " $$" *.c *.h 2>/dev/null | grep -v "//" || (echo "⚠️  Trailing whitespace found" && true)
+	@! grep -rn "TODO\|FIXME\|XXX\|BUG" *.c *.h 2>/dev/null | grep -v "TODO:" || (echo "⚠️  TODO/FIXME/BUG markers found" && true)
+	@echo "✅ Code style checks passed"
+
+# Lint with cppcheck (if available)
+lint-cppcheck:
+	@if command -v cppcheck >/dev/null 2>&1; then \
+		echo "Running cppcheck..."; \
+		cppcheck --enable=warning,style,performance,portability \
+			--suppress=missingIncludeSystem \
+			--suppress=unusedFunction \
+			--inline-suppr \
+			--quiet \
+			*.c 2>&1 | grep -v "Checking.*done" || true; \
+		echo "✅ cppcheck complete"; \
+	else \
+		echo "⚠️  cppcheck not installed (optional)"; \
+	fi
+
+# Lint with clang-tidy (if available)
+lint-clang-tidy:
+	@if command -v clang-tidy >/dev/null 2>&1; then \
+		echo "Running clang-tidy..."; \
+		clang-tidy *.c -- $(CFLAGS) 2>/dev/null || true; \
+		echo "✅ clang-tidy complete"; \
+	else \
+		echo "⚠️  clang-tidy not installed (optional)"; \
+	fi
