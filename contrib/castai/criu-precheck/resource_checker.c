@@ -1,9 +1,9 @@
 #include "resource_checker.h"
 
 int check_process_resources(int pid, struct process_state *pstate,
-			     struct vma_info *vmas, struct fd_info *fds,
-			     struct resource_summary *summary,
-			     struct issue **issues)
+			    struct vma_info *vmas, struct fd_info *fds,
+			    struct resource_summary *summary,
+			    struct issue **issues)
 {
 	(void)pid;
 	(void)issues;
@@ -39,8 +39,7 @@ int check_process_resources(int pid, struct process_state *pstate,
 			SEVERITY_CRITICAL,
 			"Process is a zombie (state Z)",
 			"Cannot checkpoint zombie process. Clean up zombie first.",
-			NULL
-		);
+			NULL);
 		issue_add(issues, issue);
 	}
 
@@ -51,8 +50,7 @@ int check_process_resources(int pid, struct process_state *pstate,
 			"Process is stopped (state T)",
 			"CRIU does not support checkpointing stopped processes. "
 			"Resume process with SIGCONT before checkpoint.",
-			NULL
-		);
+			NULL);
 		issue_add(issues, issue);
 	}
 
@@ -62,8 +60,7 @@ int check_process_resources(int pid, struct process_state *pstate,
 			SEVERITY_CRITICAL,
 			"Process has invalid session ID (0)",
 			"Session leader may be outside PID namespace. This will cause dump failure.",
-			NULL
-		);
+			NULL);
 		issue_add(issues, issue);
 	}
 

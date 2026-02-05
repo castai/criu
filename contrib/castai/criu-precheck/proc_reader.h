@@ -8,7 +8,7 @@
 struct process_state {
 	int pid;
 	char comm[256];
-	char state;		/* R, S, D, Z, T, etc. */
+	char state; /* R, S, D, Z, T, etc. */
 	int ppid;
 	int pgid;
 	int sid;
@@ -36,8 +36,8 @@ struct vma_info {
 	unsigned long start;
 	unsigned long end;
 	unsigned long size;
-	int prot;		/* PROT_READ|WRITE|EXEC flags */
-	int flags;		/* MAP_SHARED|PRIVATE flags */
+	int prot;  /* PROT_READ|WRITE|EXEC flags */
+	int flags; /* MAP_SHARED|PRIVATE flags */
 	char pathname[PATH_MAX];
 	enum vma_type type;
 	bool is_vdso;
@@ -50,8 +50,8 @@ struct vma_info {
 /* File descriptor information */
 struct fd_info {
 	int fd_num;
-	char type[32];		/* "reg", "sock", "pipe", etc. */
-	char target[PATH_MAX];	/* Symlink target */
+	char type[32];	       /* "reg", "sock", "pipe", etc. */
+	char target[PATH_MAX]; /* Symlink target */
 	int flags;
 	bool is_io_uring;
 	bool is_epoll;

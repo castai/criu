@@ -147,17 +147,30 @@ test: $(TARGET)
 	@echo "Run on Linux: sudo ./$(TARGET) -t \$\$\$$"
 
 # Linting targets
-.PHONY: lint lint-clang-tidy lint-cppcheck check-style
+.PHONY: lint lint-clang-tidy lint-cppcheck check-style indent
 
 lint: check-style lint-cppcheck
 	@echo "✅ Lint checks complete"
+
+# Format code using clang-format (same as main CRIU project)
+BASE ?= "HEAD~1"
+OPTS ?= "--quiet"
+indent:
+	@if command -v clang-format >/dev/null 2>&1; then \
+		echo "Formatting code with clang-format..."; \
+		git clang-format --style file --extensions c,h $(OPTS) $(BASE) -- *.c *.h; \
+		echo "✅ Code formatting complete"; \
+	else \
+		echo "❌ clang-format not installed"; \
+		exit 1; \
+	fi
+.PHONY: indent
 
 # Check code style (basic checks without external tools)
 check-style:
 	@echo "Checking code style..."
 	@! grep -rn "^ \+	" *.c *.h 2>/dev/null || (echo "❌ Spaces before tabs found" && false)
-	@! grep -rn " $$" *.c *.h 2>/dev/null | grep -v "//" || (echo "⚠️  Trailing whitespace found" && true)
-	@! grep -rn "TODO\|FIXME\|XXX\|BUG" *.c *.h 2>/dev/null | grep -v "TODO:" || (echo "⚠️  TODO/FIXME/BUG markers found" && true)
+	@! git --no-pager grep -E '[ 	]+$$' *.c *.h 2>/dev/null || (echo "❌ Trailing whitespace found" && false)
 	@echo "✅ Code style checks passed"
 
 # Lint with cppcheck (if available)

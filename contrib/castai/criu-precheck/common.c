@@ -2,7 +2,7 @@
 #include <sys/stat.h>
 #include <ctype.h>
 
-struct options opts = {0};
+struct options opts = { 0 };
 
 /* Create a new issue */
 struct issue *issue_new(enum issue_type type, enum severity severity,
@@ -117,10 +117,7 @@ int safe_atoi(const char *str, int *out)
 	errno = 0;
 	val = strtol(str, &endptr, 10);
 
-	if ((errno == ERANGE && (val == LONG_MAX || val == LONG_MIN))
-	    || (errno != 0 && val == 0)
-	    || endptr == str
-	    || *endptr != '\0') {
+	if ((errno == ERANGE && (val == LONG_MAX || val == LONG_MIN)) || (errno != 0 && val == 0) || endptr == str || *endptr != '\0') {
 		return -1;
 	}
 

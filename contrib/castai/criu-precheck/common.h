@@ -11,18 +11,22 @@
 #include <limits.h>
 
 /* Color codes for terminal output */
-#define COLOR_RESET   "\033[0m"
-#define COLOR_RED     "\033[31m"
-#define COLOR_GREEN   "\033[32m"
-#define COLOR_YELLOW  "\033[33m"
-#define COLOR_BLUE    "\033[34m"
-#define COLOR_BOLD    "\033[1m"
+#define COLOR_RESET  "\033[0m"
+#define COLOR_RED    "\033[31m"
+#define COLOR_GREEN  "\033[32m"
+#define COLOR_YELLOW "\033[33m"
+#define COLOR_BLUE   "\033[34m"
+#define COLOR_BOLD   "\033[1m"
 
 /* Logging macros */
-#define pr_err(fmt, ...)    fprintf(stderr, COLOR_RED "ERROR: " COLOR_RESET fmt "\n", ##__VA_ARGS__)
-#define pr_warn(fmt, ...)   fprintf(stderr, COLOR_YELLOW "WARN: " COLOR_RESET fmt "\n", ##__VA_ARGS__)
-#define pr_info(fmt, ...)   fprintf(stdout, COLOR_BLUE "INFO: " COLOR_RESET fmt "\n", ##__VA_ARGS__)
-#define pr_debug(fmt, ...)  do { if (opts.verbose) fprintf(stdout, "DEBUG: " fmt "\n", ##__VA_ARGS__); } while(0)
+#define pr_err(fmt, ...)  fprintf(stderr, COLOR_RED "ERROR: " COLOR_RESET fmt "\n", ##__VA_ARGS__)
+#define pr_warn(fmt, ...) fprintf(stderr, COLOR_YELLOW "WARN: " COLOR_RESET fmt "\n", ##__VA_ARGS__)
+#define pr_info(fmt, ...) fprintf(stdout, COLOR_BLUE "INFO: " COLOR_RESET fmt "\n", ##__VA_ARGS__)
+#define pr_debug(fmt, ...)                                                  \
+	do {                                                                \
+		if (opts.verbose)                                           \
+			fprintf(stdout, "DEBUG: " fmt "\n", ##__VA_ARGS__); \
+	} while (0)
 
 /* Issue severity levels */
 enum severity {

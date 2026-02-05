@@ -80,18 +80,18 @@ int detect_rseq_usage(int pid, struct vma_info *vmas,
 		      struct feature_results *results, struct issue **issues);
 
 int detect_network_features(int pid, struct fd_info *fds,
-			     struct feature_results *results, struct issue **issues);
+			    struct feature_results *results, struct issue **issues);
 
 int detect_sysvipc_issues(struct vma_info *vmas, struct namespace_info *nsinfo,
-			   struct feature_results *results, struct issue **issues);
+			  struct feature_results *results, struct issue **issues);
 
 int check_aio_ring_alignment(struct vma_info *vmas,
-			      struct feature_results *results, struct issue **issues);
+			     struct feature_results *results, struct issue **issues);
 
 int check_kernel_features(struct kernel_features *kfeatures);
 
 int detect_multithreading(int pid, struct feature_results *results,
-			   struct issue **issues);
+			  struct issue **issues);
 
 int detect_mptcp(int pid, struct feature_results *results,
 		 struct issue **issues);
@@ -103,8 +103,8 @@ int detect_seccomp(int pid, struct feature_results *results,
 		   struct issue **issues);
 
 int detect_zombie_with_threads(struct process_state *pstate,
-				struct feature_results *results,
-				struct issue **issues);
+			       struct feature_results *results,
+			       struct issue **issues);
 
 int detect_vdso(struct vma_info *vmas, struct feature_results *results,
 		struct issue **issues);
@@ -116,16 +116,16 @@ int detect_autofs(struct mount_info *mounts, struct feature_results *results,
 		  struct issue **issues);
 
 int detect_ghost_files(struct fd_info *fds, struct feature_results *results,
-			struct issue **issues);
+		       struct issue **issues);
 
 int detect_nested_pid_ns(int pid, struct namespace_info *nsinfo,
-			  struct feature_results *results,
-			  struct issue **issues);
+			 struct feature_results *results,
+			 struct issue **issues);
 
 int detect_inotify(struct fd_info *fds, struct feature_results *results,
 		   struct issue **issues);
 
 int enhance_kernel_feature_checks(struct kernel_features *kfeatures,
-				   struct issue **issues);
+				  struct issue **issues);
 
 #endif /* CRIU_PRECHECK_FEATURE_DETECTOR_H */

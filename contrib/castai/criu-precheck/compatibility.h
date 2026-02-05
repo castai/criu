@@ -4,8 +4,8 @@
 #include "common.h"
 
 struct compatibility_score {
-	int score;		/* 0-100 */
-	const char *level;	/* "very_likely", "likely", "uncertain", "unlikely" */
+	int score;	   /* 0-100 */
+	const char *level; /* "very_likely", "likely", "uncertain", "unlikely" */
 	int passed;
 	int warnings;
 	int critical;

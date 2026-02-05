@@ -85,12 +85,12 @@ int parse_vma_list(int pid, struct vma_info **vmas, unsigned long *total_private
 
 	while ((read = getline(&line, &len, f)) != -1) {
 		/* New VMA line: "address-address perms offset dev:inode pathname" */
-		if (sscanf(line, "%lx-%lx", &(unsigned long){0}, &(unsigned long){0}) == 2) {
+		if (sscanf(line, "%lx-%lx", &(unsigned long){ 0 }, &(unsigned long){ 0 }) == 2) {
 			struct vma_info *vma = calloc(1, sizeof(*vma));
 			if (!vma)
 				break;
 
-			char perms[5] = {0};
+			char perms[5] = { 0 };
 			unsigned long offset, dev_major, dev_minor;
 			ino_t inode;
 
@@ -103,9 +103,12 @@ int parse_vma_list(int pid, struct vma_info **vmas, unsigned long *total_private
 
 			/* Parse permissions */
 			vma->prot = 0;
-			if (perms[0] == 'r') vma->prot |= 0x1; /* PROT_READ */
-			if (perms[1] == 'w') vma->prot |= 0x2; /* PROT_WRITE */
-			if (perms[2] == 'x') vma->prot |= 0x4; /* PROT_EXEC */
+			if (perms[0] == 'r')
+				vma->prot |= 0x1; /* PROT_READ */
+			if (perms[1] == 'w')
+				vma->prot |= 0x2; /* PROT_WRITE */
+			if (perms[2] == 'x')
+				vma->prot |= 0x4; /* PROT_EXEC */
 
 			/* Parse flags */
 			vma->flags = (perms[3] == 'p') ? 0x02 : 0x01; /* MAP_PRIVATE : MAP_SHARED */
@@ -135,7 +138,7 @@ int parse_vma_list(int pid, struct vma_info **vmas, unsigned long *total_private
 		/* Parse VMA details */
 		else if (current) {
 			if (sscanf(line, "Private_Clean: %lu", &current->private_kb) == 1 ||
-			    sscanf(line, "Private_Dirty: %lu", &(unsigned long){0}) == 1) {
+			    sscanf(line, "Private_Dirty: %lu", &(unsigned long){ 0 }) == 1) {
 				unsigned long val;
 				if (sscanf(line, "Private_Dirty: %lu", &val) == 1) {
 					current->private_kb += val;
@@ -143,7 +146,7 @@ int parse_vma_list(int pid, struct vma_info **vmas, unsigned long *total_private
 				}
 			}
 			if (sscanf(line, "Shared_Clean: %lu", &current->shared_kb) == 1 ||
-			    sscanf(line, "Shared_Dirty: %lu", &(unsigned long){0}) == 1) {
+			    sscanf(line, "Shared_Dirty: %lu", &(unsigned long){ 0 }) == 1) {
 				unsigned long val;
 				if (sscanf(line, "Shared_Dirty: %lu", &val) == 1) {
 					current->shared_kb += val;
@@ -251,9 +254,9 @@ int parse_namespaces(int pid, struct namespace_info *nsinfo)
 {
 	char path[PATH_MAX];
 	struct stat st;
-	const char *ns_types[] = {"mnt", "net", "ipc", "uts", "pid", "user", "cgroup", "time"};
-	ino_t init_ns[8] = {0};
-	ino_t proc_ns[8] = {0};
+	const char *ns_types[] = { "mnt", "net", "ipc", "uts", "pid", "user", "cgroup", "time" };
+	ino_t init_ns[8] = { 0 };
+	ino_t proc_ns[8] = { 0 };
 
 	/* Read init (PID 1) namespace IDs */
 	for (int i = 0; i < 8; i++) {

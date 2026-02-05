@@ -46,17 +46,17 @@ static void usage(const char *prog)
 static int parse_options(int argc, char **argv)
 {
 	static struct option long_options[] = {
-		{"pid",              required_argument, 0, 't'},
-		{"json",             no_argument,       0, 'j'},
-		{"verbose",          no_argument,       0, 'v'},
-		{"output",           required_argument, 0, 'o'},
-		{"check-network",    no_argument,       0, 'n'},
-		{"check-memory",     no_argument,       0, 'm'},
-		{"check-namespaces", no_argument,       0, 's'},
-		{"suggest-command",  no_argument,       0, 'c'},
-		{"exit-code-only",   no_argument,       0, 'e'},
-		{"help",             no_argument,       0, 'h'},
-		{0, 0, 0, 0}
+		{ "pid", required_argument, 0, 't' },
+		{ "json", no_argument, 0, 'j' },
+		{ "verbose", no_argument, 0, 'v' },
+		{ "output", required_argument, 0, 'o' },
+		{ "check-network", no_argument, 0, 'n' },
+		{ "check-memory", no_argument, 0, 'm' },
+		{ "check-namespaces", no_argument, 0, 's' },
+		{ "suggest-command", no_argument, 0, 'c' },
+		{ "exit-code-only", no_argument, 0, 'e' },
+		{ "help", no_argument, 0, 'h' },
+		{ 0, 0, 0, 0 }
 	};
 
 	int c;
@@ -112,15 +112,15 @@ static int parse_options(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
-	struct process_state pstate = {0};
+	struct process_state pstate = { 0 };
 	struct vma_info *vmas = NULL;
 	struct fd_info *fds = NULL;
-	struct namespace_info nsinfo = {0};
+	struct namespace_info nsinfo = { 0 };
 	struct mount_info *mounts = NULL;
 	struct issue *issues = NULL;
-	struct feature_results features = {0};
-	struct resource_summary resources = {0};
-	struct compatibility_score compat = {0};
+	struct feature_results features = { 0 };
+	struct resource_summary resources = { 0 };
+	struct compatibility_score compat = { 0 };
 	unsigned long total_private_kb = 0;
 	int ret = 1;
 

@@ -3,20 +3,28 @@
 static const char *severity_str(enum severity sev)
 {
 	switch (sev) {
-	case SEVERITY_CRITICAL: return "CRITICAL";
-	case SEVERITY_WARNING:  return "WARNING";
-	case SEVERITY_INFO:     return "INFO";
-	default:                return "UNKNOWN";
+	case SEVERITY_CRITICAL:
+		return "CRITICAL";
+	case SEVERITY_WARNING:
+		return "WARNING";
+	case SEVERITY_INFO:
+		return "INFO";
+	default:
+		return "UNKNOWN";
 	}
 }
 
 static const char *severity_symbol(enum severity sev)
 {
 	switch (sev) {
-	case SEVERITY_CRITICAL: return COLOR_RED "❌" COLOR_RESET;
-	case SEVERITY_WARNING:  return COLOR_YELLOW "⚠️ " COLOR_RESET;
-	case SEVERITY_INFO:     return COLOR_GREEN "✅" COLOR_RESET;
-	default:                return "?";
+	case SEVERITY_CRITICAL:
+		return COLOR_RED "❌" COLOR_RESET;
+	case SEVERITY_WARNING:
+		return COLOR_YELLOW "⚠️ " COLOR_RESET;
+	case SEVERITY_INFO:
+		return COLOR_GREEN "✅" COLOR_RESET;
+	default:
+		return "?";
 	}
 }
 
@@ -39,7 +47,8 @@ int print_report(int pid, struct process_state *pstate,
 	       pstate->state == 'S' ? "Sleeping" :
 	       pstate->state == 'D' ? "Disk sleep" :
 	       pstate->state == 'Z' ? "Zombie" :
-	       pstate->state == 'T' ? "Stopped" : "Unknown");
+	       pstate->state == 'T' ? "Stopped" :
+				      "Unknown");
 	printf("  Threads:     %d\n", pstate->num_threads);
 	printf("  Session:     %d %s\n", pstate->sid,
 	       pstate->sid == 0 ? COLOR_RED "(invalid!)" COLOR_RESET : "(valid)");
@@ -166,7 +175,8 @@ int print_json_report(int pid, struct process_state *pstate,
 	bool first = true;
 	for (struct issue *i = issues; i; i = i->next) {
 		if (i->severity == SEVERITY_CRITICAL) {
-			if (!first) printf(",\n");
+			if (!first)
+				printf(",\n");
 			printf("      {\n");
 			printf("        \"type\": \"%s\",\n", severity_str(i->severity));
 			printf("        \"description\": \"%s\",\n", i->description);
@@ -183,7 +193,8 @@ int print_json_report(int pid, struct process_state *pstate,
 	first = true;
 	for (struct issue *i = issues; i; i = i->next) {
 		if (i->severity == SEVERITY_WARNING) {
-			if (!first) printf(",\n");
+			if (!first)
+				printf(",\n");
 			printf("      {\n");
 			printf("        \"type\": \"%s\",\n", severity_str(i->severity));
 			printf("        \"description\": \"%s\",\n", i->description);

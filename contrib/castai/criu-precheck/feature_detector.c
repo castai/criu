@@ -24,8 +24,7 @@ int detect_io_uring(struct fd_info *fds, struct vma_info *vmas,
 				"io_uring detected - CRIU checkpoint will likely fail",
 				"Close io_uring before checkpoint, or skip this process. "
 				"io_uring state cannot be fully captured by CRIU.",
-				affected
-			);
+				affected);
 			issue_add(issues, issue);
 		}
 	}
@@ -71,7 +70,6 @@ int detect_rseq_usage(int pid, struct vma_info *vmas,
 		/* Check kernel support */
 		if (!results->kfeatures.has_rseq ||
 		    !results->kfeatures.has_ptrace_get_rseq_conf) {
-
 			struct issue *issue = issue_new(
 				ISSUE_RSEQ_NO_KERNEL_SUPPORT,
 				SEVERITY_CRITICAL,
@@ -79,8 +77,7 @@ int detect_rseq_usage(int pid, struct vma_info *vmas,
 				"PTRACE_GET_RSEQ_CONFIGURATION support",
 				"Upgrade kernel to 5.13+ or use glibc < 2.35 to avoid RSEQ. "
 				"CRIU dump will fail without ptrace rseq support.",
-				"kernel"
-			);
+				"kernel");
 			issue_add(issues, issue);
 
 			results->rseq_kernel_support_missing = true;
@@ -91,8 +88,7 @@ int detect_rseq_usage(int pid, struct vma_info *vmas,
 				SEVERITY_INFO,
 				"Process likely uses RSEQ (modern glibc detected)",
 				"Kernel has PTRACE_GET_RSEQ_CONFIGURATION support - should be OK",
-				NULL
-			);
+				NULL);
 			issue_add(issues, issue);
 		}
 
@@ -104,7 +100,7 @@ int detect_rseq_usage(int pid, struct vma_info *vmas,
 
 /* Detect network features from /proc/PID/net */
 int detect_network_features(int pid, struct fd_info *fds,
-			     struct feature_results *results, struct issue **issues)
+			    struct feature_results *results, struct issue **issues)
 {
 	int tcp_count = 0;
 	char path[PATH_MAX];
@@ -143,7 +139,6 @@ int detect_network_features(int pid, struct fd_info *fds,
 			/* Parse line: sl local_address rem_address st tx_queue:rx_queue ... inode */
 			if (sscanf(line, "%*d: %s %s %s %*s %*s %*s %*s %*s %*s %llu",
 				   local, remote, state, (unsigned long long *)&inode) == 4) {
-
 				/* Check if this socket belongs to our process */
 				bool is_our_socket = false;
 				for (int i = 0; i < socket_count; i++) {
@@ -178,7 +173,6 @@ int detect_network_features(int pid, struct fd_info *fds,
 
 			if (sscanf(line, "%*d: %s %s %s %*s %*s %*s %*s %*s %*s %llu",
 				   local, remote, state, (unsigned long long *)&inode) == 4) {
-
 				bool is_our_socket = false;
 				for (int i = 0; i < socket_count; i++) {
 					if (socket_inodes[i] == inode) {
@@ -206,8 +200,7 @@ int detect_network_features(int pid, struct fd_info *fds,
 			desc,
 			"Use --tcp-established flag with CRIU dump. "
 			"Active TCP connections require kernel TCP_REPAIR support.",
-			"network"
-		);
+			"network");
 		issue_add(issues, issue);
 
 		results->tcp_established = true;
@@ -222,7 +215,7 @@ out:
 
 /* Detect SysVIPC issues */
 int detect_sysvipc_issues(struct vma_info *vmas, struct namespace_info *nsinfo,
-			   struct feature_results *results, struct issue **issues)
+			  struct feature_results *results, struct issue **issues)
 {
 	bool has_sysvipc = false;
 
@@ -240,8 +233,7 @@ int detect_sysvipc_issues(struct vma_info *vmas, struct namespace_info *nsinfo,
 			"SysVIPC shared memory detected without IPC namespace isolation",
 			"This is a guaranteed dump failure. Process must be in isolated IPC namespace "
 			"to use SysVIPC shared memory. Restart process in IPC namespace.",
-			"memory"
-		);
+			"memory");
 		issue_add(issues, issue);
 
 		results->sysvipc_without_ipc_ns = true;
@@ -252,7 +244,7 @@ int detect_sysvipc_issues(struct vma_info *vmas, struct namespace_info *nsinfo,
 
 /* Check AIO ring alignment */
 int check_aio_ring_alignment(struct vma_info *vmas,
-			      struct feature_results *results, struct issue **issues)
+			     struct feature_results *results, struct issue **issues)
 {
 	for (struct vma_info *vma = vmas; vma; vma = vma->next) {
 		if (vma->type == VMA_AIORING) {
@@ -267,8 +259,7 @@ int check_aio_ring_alignment(struct vma_info *vmas,
 					SEVERITY_CRITICAL,
 					desc,
 					"AIO ring size must be page-aligned. This will cause dump failure.",
-					"memory"
-				);
+					"memory");
 				issue_add(issues, issue);
 
 				results->aio_ring_misaligned = true;
@@ -304,22 +295,22 @@ int check_kernel_features(struct kernel_features *kfeatures)
 	/* Feature availability based on kernel version */
 	/* These are rough estimates - actual availability depends on config */
 
-	kfeatures->has_kcmp = (major >= 3 && minor >= 5); /* 3.5+ */
+	kfeatures->has_kcmp = (major >= 3 && minor >= 5);	/* 3.5+ */
 	kfeatures->has_tcp_repair = (major >= 3 && minor >= 5); /* 3.5+ */
 
 	kfeatures->has_memfd = (major >= 3 && minor >= 17); /* 3.17+ */
-	kfeatures->has_uffd = (major >= 4 && minor >= 3); /* 4.3+ */
+	kfeatures->has_uffd = (major >= 4 && minor >= 3);   /* 4.3+ */
 	kfeatures->has_userns = (major >= 3 && minor >= 8); /* 3.8+ */
 
-	kfeatures->has_rseq = (major >= 4 && minor >= 18); /* 4.18+ */
+	kfeatures->has_rseq = (major >= 4 && minor >= 18);		   /* 4.18+ */
 	kfeatures->has_ptrace_get_rseq_conf = (major >= 5 && minor >= 13); /* 5.13+ */
 
-	kfeatures->has_timens = (major >= 5 && minor >= 6); /* 5.6+ */
+	kfeatures->has_timens = (major >= 5 && minor >= 6);	    /* 5.6+ */
 	kfeatures->has_clone3_set_tid = (major >= 5 && minor >= 5); /* 5.5+ */
-	kfeatures->has_pidfd_open = (major >= 5 && minor >= 3); /* 5.3+ */
+	kfeatures->has_pidfd_open = (major >= 5 && minor >= 3);	    /* 5.3+ */
 
 	kfeatures->has_timerfd = (major >= 2 && minor >= 6 && major > 2); /* 2.6.27+ */
-	kfeatures->has_cgroupns = (major >= 4 && minor >= 6); /* 4.6+ */
+	kfeatures->has_cgroupns = (major >= 4 && minor >= 6);		  /* 4.6+ */
 
 	/* Check for actual feature availability by trying to access them */
 	/* This is more accurate than version checking */
@@ -334,7 +325,7 @@ int check_kernel_features(struct kernel_features *kfeatures)
 
 /* Detect multithreading */
 int detect_multithreading(int pid, struct feature_results *results,
-			   struct issue **issues)
+			  struct issue **issues)
 {
 	int thread_count = get_thread_count(pid);
 
@@ -351,8 +342,7 @@ int detect_multithreading(int pid, struct feature_results *results,
 			desc,
 			"Multithreaded processes require ptrace for all threads. "
 			"Ensure kernel supports ptrace of all threads.",
-			NULL
-		);
+			NULL);
 		issue_add(issues, issue);
 	}
 
@@ -398,8 +388,7 @@ int detect_mptcp(int pid, struct feature_results *results,
 					"MPTCP is NOT supported by CRIU. Disable MPTCP before checkpoint. "
 					"For Go programs: set GODEBUG=multipathtcp=0 environment variable. "
 					"For system-wide: echo 0 > /proc/sys/net/mptcp/enabled",
-					"network"
-				);
+					"network");
 				issue_add(issues, issue);
 
 				results->mptcp_detected = true;
@@ -438,8 +427,7 @@ int detect_tty(struct fd_info *fds, struct feature_results *results,
 			desc,
 			"TTY handling requires special care. Use --shell-job flag if process "
 			"is a shell job. Ensure controlling terminal is handled properly.",
-			"tty"
-		);
+			"tty");
 		issue_add(issues, issue);
 
 		results->tty_detected = true;
@@ -494,8 +482,7 @@ int detect_seccomp(int pid, struct feature_results *results,
 						desc,
 						"Upgrade kernel to 4.7+ for seccomp filter dumping support. "
 						"Or disable seccomp before checkpoint.",
-						"security"
-					);
+						"security");
 					issue_add(issues, issue);
 
 					results->seccomp_kernel_support_missing = true;
@@ -517,8 +504,7 @@ int detect_seccomp(int pid, struct feature_results *results,
 			desc,
 			"Seccomp filters will be dumped and restored. "
 			"Ensure kernel supports filter dumping (4.7+).",
-			"security"
-		);
+			"security");
 		issue_add(issues, issue);
 	}
 
@@ -527,8 +513,8 @@ int detect_seccomp(int pid, struct feature_results *results,
 
 /* Detect zombie process with threads */
 int detect_zombie_with_threads(struct process_state *pstate,
-				struct feature_results *results,
-				struct issue **issues)
+			       struct feature_results *results,
+			       struct issue **issues)
 {
 	if (pstate->is_zombie && pstate->num_threads > 1) {
 		struct issue *issue = issue_new(
@@ -537,8 +523,7 @@ int detect_zombie_with_threads(struct process_state *pstate,
 			"Zombie process with multiple threads detected",
 			"Zombies with threads are NOT supported by CRIU. "
 			"This is a guaranteed dump failure. Clean up zombie process.",
-			"process"
-		);
+			"process");
 		issue_add(issues, issue);
 
 		results->zombie_with_threads = true;
@@ -568,8 +553,7 @@ int detect_vdso(struct vma_info *vmas, struct feature_results *results,
 			"vDSO (virtual dynamic shared object) not found in process memory",
 			"This is unusual. Ensure kernel provides vDSO and process hasn't unmapped it. "
 			"Check kernel config: CONFIG_VDSO=y",
-			"memory"
-		);
+			"memory");
 		issue_add(issues, issue);
 
 		results->vdso_missing = true;
@@ -604,8 +588,7 @@ int detect_lsm(int pid, struct feature_results *results,
 			desc,
 			"AppArmor/SELinux profile detected. Ensure CRIU has LSM dumping support enabled. "
 			"Profile will be dumped and must be available on restore.",
-			"security"
-		);
+			"security");
 		issue_add(issues, issue);
 	}
 
@@ -638,8 +621,7 @@ int detect_autofs(struct mount_info *mounts, struct feature_results *results,
 			desc,
 			"AutoFS has migration limitations. Checkpoint may succeed but restore "
 			"may have issues if automount paths are not available on target.",
-			"filesystem"
-		);
+			"filesystem");
 		issue_add(issues, issue);
 
 		results->autofs_detected = true;
@@ -651,7 +633,7 @@ int detect_autofs(struct mount_info *mounts, struct feature_results *results,
 
 /* Detect ghost files (deleted files still open) */
 int detect_ghost_files(struct fd_info *fds, struct feature_results *results,
-			struct issue **issues)
+		       struct issue **issues)
 {
 	int count = 0;
 
@@ -675,8 +657,7 @@ int detect_ghost_files(struct fd_info *fds, struct feature_results *results,
 			desc,
 			"Process has open file descriptors to deleted files. "
 			"These will be restored as anonymous inodes. Usually safe.",
-			"files"
-		);
+			"files");
 		issue_add(issues, issue);
 
 		results->ghost_files_detected = true;
@@ -688,8 +669,8 @@ int detect_ghost_files(struct fd_info *fds, struct feature_results *results,
 
 /* Detect nested PID namespace issues */
 int detect_nested_pid_ns(int pid, struct namespace_info *nsinfo,
-			  struct feature_results *results,
-			  struct issue **issues)
+			 struct feature_results *results,
+			 struct issue **issues)
 {
 	/* Check if process is in isolated PID namespace */
 	if (!nsinfo->pid_isolated)
@@ -712,8 +693,7 @@ int detect_nested_pid_ns(int pid, struct namespace_info *nsinfo,
 				"Process in isolated PID namespace with children",
 				"Nested PID namespaces may have limitations with PGID/SID restore. "
 				"CRIU may not support restore of sid and pgid if nested pid namespace exists.",
-				"namespace"
-			);
+				"namespace");
 			issue_add(issues, issue);
 
 			results->nested_pid_ns = true;
@@ -751,8 +731,7 @@ int detect_inotify(struct fd_info *fds, struct feature_results *results,
 			desc,
 			"File watching mechanisms detected. Inotify watches will be restored. "
 			"Ensure watched paths exist on restore.",
-			"files"
-		);
+			"files");
 		issue_add(issues, issue);
 
 		results->inotify_detected = true;
@@ -764,7 +743,7 @@ int detect_inotify(struct fd_info *fds, struct feature_results *results,
 
 /* Enhanced kernel feature checks */
 int enhance_kernel_feature_checks(struct kernel_features *kfeatures,
-				   struct issue **issues)
+				  struct issue **issues)
 {
 	/* Check UFFD availability */
 	if (!kfeatures->has_uffd) {
@@ -774,8 +753,7 @@ int enhance_kernel_feature_checks(struct kernel_features *kfeatures,
 			"UFFD (userfaultfd) not available",
 			"Lazy page loading (--lazy-pages) will not work. "
 			"This is optional - only needed for very large memory dumps.",
-			"kernel"
-		);
+			"kernel");
 		issue_add(issues, issue);
 	}
 

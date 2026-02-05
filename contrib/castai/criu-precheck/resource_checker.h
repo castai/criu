@@ -15,8 +15,8 @@ struct resource_summary {
 };
 
 int check_process_resources(int pid, struct process_state *pstate,
-			     struct vma_info *vmas, struct fd_info *fds,
-			     struct resource_summary *summary,
-			     struct issue **issues);
+			    struct vma_info *vmas, struct fd_info *fds,
+			    struct resource_summary *summary,
+			    struct issue **issues);
 
 #endif /* CRIU_PRECHECK_RESOURCE_CHECKER_H */
