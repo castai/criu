@@ -15,7 +15,7 @@ int parse_process_state(int pid, struct process_state *state)
 	snprintf(path, sizeof(path), "/proc/%d/stat", pid);
 	f = fopen(path, "r");
 	if (!f) {
-		pr_err("Failed to open %s: %s", path, strerror(errno));
+		pr_err("Failed to open %s: %s\n", path, strerror(errno));
 		return -1;
 	}
 
@@ -79,7 +79,7 @@ int parse_vma_list(int pid, struct vma_info **vmas, unsigned long *total_private
 	snprintf(path, sizeof(path), "/proc/%d/smaps", pid);
 	f = fopen(path, "r");
 	if (!f) {
-		pr_err("Failed to open %s: %s", path, strerror(errno));
+		pr_err("Failed to open %s: %s\n", path, strerror(errno));
 		return -1;
 	}
 
@@ -174,7 +174,7 @@ int parse_fd_list(int pid, struct fd_info **fds)
 	snprintf(path, sizeof(path), "/proc/%d/fd", pid);
 	dir = opendir(path);
 	if (!dir) {
-		pr_err("Failed to open %s: %s", path, strerror(errno));
+		pr_err("Failed to open %s: %s\n", path, strerror(errno));
 		return -1;
 	}
 

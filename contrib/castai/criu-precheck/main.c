@@ -64,7 +64,7 @@ static int parse_options(int argc, char **argv)
 		switch (c) {
 		case 't':
 			if (safe_atoi(optarg, &opts.pid) < 0) {
-				pr_err("Invalid PID: %s", optarg);
+				pr_err("Invalid PID: %s\n", optarg);
 				return -1;
 			}
 			break;
@@ -102,7 +102,7 @@ static int parse_options(int argc, char **argv)
 	}
 
 	if (opts.pid <= 0) {
-		pr_err("PID is required. Use -t/--pid option.");
+		pr_err("PID is required. Use -t/--pid option.\n");
 		usage(argv[0]);
 		return -1;
 	}
@@ -132,37 +132,37 @@ int main(int argc, char **argv)
 	char proc_path[PATH_MAX];
 	snprintf(proc_path, sizeof(proc_path), "/proc/%d", opts.pid);
 	if (!dir_exists(proc_path)) {
-		pr_err("Process %d does not exist", opts.pid);
+		pr_err("Process %d does not exist\n", opts.pid);
 		return 1;
 	}
 
-	pr_debug("Checking process %d", opts.pid);
+	pr_debug("Checking process %d\n", opts.pid);
 
 	/* Parse process state */
 	if (parse_process_state(opts.pid, &pstate) < 0) {
-		pr_err("Failed to parse process state");
+		pr_err("Failed to parse process state\n");
 		goto out;
 	}
 
-	pr_debug("Process state: %s (%c)", pstate.comm, pstate.state);
+	pr_debug("Process state: %s (%c)\n", pstate.comm, pstate.state);
 
 	/* Parse VMAs */
 	if (parse_vma_list(opts.pid, &vmas, &total_private_kb) < 0) {
-		pr_err("Failed to parse memory mappings");
+		pr_err("Failed to parse memory mappings\n");
 		goto out;
 	}
 
-	pr_debug("Parsed %lu KB private memory", total_private_kb);
+	pr_debug("Parsed %lu KB private memory\n", total_private_kb);
 
 	/* Parse file descriptors */
 	if (parse_fd_list(opts.pid, &fds) < 0) {
-		pr_err("Failed to parse file descriptors");
+		pr_err("Failed to parse file descriptors\n");
 		goto out;
 	}
 
 	/* Parse namespaces */
 	if (parse_namespaces(opts.pid, &nsinfo) < 0) {
-		pr_err("Failed to parse namespaces");
+		pr_err("Failed to parse namespaces\n");
 		goto out;
 	}
 
@@ -171,7 +171,7 @@ int main(int argc, char **argv)
 
 	/* Check kernel features */
 	if (check_kernel_features(&features.kfeatures) < 0) {
-		pr_warn("Failed to detect some kernel features");
+		pr_warn("Failed to detect some kernel features\n");
 	}
 
 	/* Run feature detectors */

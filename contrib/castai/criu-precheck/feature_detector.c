@@ -279,18 +279,18 @@ int check_kernel_features(struct kernel_features *kfeatures)
 	memset(kfeatures, 0, sizeof(*kfeatures));
 
 	if (uname(&uts) < 0) {
-		pr_warn("Failed to get kernel version");
+		pr_warn("Failed to get kernel version\n");
 		return -1;
 	}
 
 	/* Parse kernel version */
 	int major, minor;
 	if (sscanf(uts.release, "%d.%d", &major, &minor) != 2) {
-		pr_warn("Failed to parse kernel version: %s", uts.release);
+		pr_warn("Failed to parse kernel version: %s\n", uts.release);
 		return -1;
 	}
 
-	pr_debug("Kernel version: %d.%d", major, minor);
+	pr_debug("Kernel version: %d.%d\n", major, minor);
 
 	/* Feature availability based on kernel version */
 	/* These are rough estimates - actual availability depends on config */
