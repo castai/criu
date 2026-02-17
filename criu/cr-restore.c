@@ -1687,6 +1687,14 @@ static int __restore_task_with_children(void *_arg)
 			goto err;
 	}
 
+	/*
+	 * All children have finished premapping (forking barrier passed).
+	 * Convert PROT_EXEC VMAs from anonymous to memfd-backed so the
+	 * restorer's mprotect won't trigger SELinux execmem/execmod.
+	 */
+	if (finalize_exec_mappings(current))
+		goto err;
+
 	if (restore_one_task(vpid(current), ca->core))
 		goto err;
 
@@ -2517,7 +2525,7 @@ static unsigned long restorer_len;
 static int prepare_restorer_blob(void)
 {
 	/*
-	 * We map anonymous mapping, not mremap the restorer itself later.
+	 * We map anonymous memory, not mremap the restorer itself later.
 	 * Otherwise the restorer vma would be tied to criu binary which
 	 * in turn will lead to set-exe-file prctl to fail with EBUSY.
 	 */
@@ -2539,7 +2547,7 @@ static int prepare_restorer_blob(void)
 	 */
 	restorer_len = round_up(pbd.hdr.args_off, page_size());
 
-	restorer = mmap(NULL, restorer_len, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+	restorer = mmap(NULL, restorer_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
 	if (restorer == MAP_FAILED) {
 		pr_perror("Can't map restorer code");
 		return -1;
@@ -2554,6 +2562,8 @@ static int remap_restorer_blob(void *addr)
 {
 	struct parasite_blob_desc pbd;
 	void *mem;
+	int fd;
+	ssize_t off, ret;
 
 	mem = mremap(restorer, restorer_len, restorer_len, MREMAP_FIXED | MREMAP_MAYMOVE, addr);
 	if (mem != addr) {
@@ -2571,6 +2581,49 @@ static int remap_restorer_blob(void *addr)
 	compel_relocs_apply(addr, addr, &pbd);
 
 	/*
+	 * To avoid SELinux execmem denials, back the restorer blob with a
+	 * memfd instead of anonymous memory. The kernel's
+	 * file_map_prot_check() requires process:execmem when:
+	 *   (PROT_EXEC) && (!file || IS_PRIVATE(inode) || (!shared && PROT_WRITE))
+	 *
+	 * Using MAP_SHARED on a memfd (file-backed, !IS_PRIVATE) makes the
+	 * !shared term false, so execmem is never checked. Instead SELinux
+	 * checks file:execute (which runtime_t has on Bottlerocket).
+	 *
+	 * Each restored process calls remap_restorer_blob() independently
+	 * with its own memfd, so MAP_SHARED pages are not shared across
+	 * the process tree.
+	 */
+	fd = memfd_create("restorer", 0);
+	if (fd < 0) {
+		pr_perror("Can't create memfd for restorer");
+		return -1;
+	}
+
+	if (ftruncate(fd, restorer_len)) {
+		pr_perror("Can't resize restorer memfd");
+		goto err;
+	}
+
+	for (off = 0; off < restorer_len; ) {
+		ret = write(fd, addr + off, restorer_len - off);
+		if (ret <= 0) {
+			pr_perror("Can't write restorer blob to memfd");
+			goto err;
+		}
+		off += ret;
+	}
+
+	mem = mmap(addr, restorer_len, PROT_READ | PROT_WRITE | PROT_EXEC,
+		   MAP_SHARED | MAP_FIXED, fd, 0);
+	if (mem != addr) {
+		pr_perror("Can't map restorer memfd");
+		goto err;
+	}
+
+	close(fd);
+
+	/*
 	 * Ensure the infected thread sees the updated code.
 	 *
 	 * On architectures like ARM64, the Data Cache (D-cache) and
@@ -2582,6 +2635,10 @@ static int remap_restorer_blob(void *addr)
 	__builtin___clear_cache(addr, addr + pbd.hdr.bsize);
 
 	return 0;
+
+err:
+	close(fd);
+	return -1;
 }
 
 static int validate_sched_parm(struct rst_sched_param *sp)

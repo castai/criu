@@ -39,6 +39,8 @@ extern int lsm_check_opts(void);
 int dump_xattr_security_selinux(int fd, FdinfoEntry *e);
 int run_setsockcreatecon(FdinfoEntry *e);
 int reset_setsockcreatecon(void);
+int set_fscreatecon_for_pid(pid_t pid);
+int reset_fscreatecon(void);
 #else
 static inline int dump_xattr_security_selinux(int fd, FdinfoEntry *e)
 {
@@ -49,6 +51,14 @@ static inline int run_setsockcreatecon(FdinfoEntry *e)
 	return 0;
 }
 static inline int reset_setsockcreatecon(void)
+{
+	return 0;
+}
+static inline int set_fscreatecon_for_pid(pid_t pid)
+{
+	return 0;
+}
+static inline int reset_fscreatecon(void)
 {
 	return 0;
 }
