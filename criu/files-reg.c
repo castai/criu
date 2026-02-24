@@ -1351,6 +1351,48 @@ static int check_path_remap(struct fd_link *link, const struct fd_parms *parms, 
 				pr_info("Dumping dead process remap of %d\n", pid);
 				return dump_dead_process_remap(pid, id);
 			}
+
+			/*
+			 * The process is alive, but the path may reference a
+			 * dead thread: /proc/<pid>/task/<tid>/... If the
+			 * thread <tid> has exited, the task/<tid> directory
+			 * no longer exists and the file can't be opened on
+			 * restore. Handle this by creating a TASK_HELPER
+			 * process with vPID=<tid> and rewriting the path to
+			 * /proc/<tid>/task/<tid>/... so it resolves through
+			 * the helper's /proc entry.
+			 */
+			if (*end == '/' && !strncmp(end, "/task/", 6)) {
+				pid_t tid;
+				char *tend;
+				char task_path[PATH_MAX];
+
+				tid = strtol(end + 6, &tend, 10);
+				if (tid != 0 && (*tend == '/' || *tend == '\0')) {
+					/*
+					 * Check if /proc/<pid>/task/<tid>
+					 * exists by temporarily truncating
+					 * the path at the character after
+					 * the tid.
+					 */
+					char saved = *tend;
+					*tend = '\0';
+					ret = faccessat(mntns_root, rpath, F_OK, 0);
+					*tend = saved;
+
+					if (ret) {
+						snprintf(task_path, sizeof(task_path),
+							 "%.*s%d/task/%d%s",
+							 (int)(start - rpath) + 1,
+							 rpath, tid, tid, tend);
+						pr_info("Dumping dead thread remap %d/%d\n",
+							pid, tid);
+						strcpy(link->name, task_path);
+						link->len = strlen(link->name);
+						return dump_dead_process_remap(tid, id);
+					}
+				}
+			}
 		}
 
 		return 0;
@@ -1661,7 +1703,7 @@ static int get_build_id(const int fd, const struct stat *fd_status, unsigned cha
 	 */
 	mapped_size = min_t(size_t, fd_status->st_size, BUILD_ID_MAP_SIZE);
 	start_addr = mmap(0, mapped_size, PROT_READ, MAP_PRIVATE | MAP_FILE, fd, 0);
-	if ((void*)start_addr == MAP_FAILED) {
+	if ((void *)start_addr == MAP_FAILED) {
 		pr_warn("Couldn't mmap file with fd %d\n", fd);
 		return -1;
 	}
