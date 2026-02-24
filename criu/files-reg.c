@@ -1351,48 +1351,6 @@ static int check_path_remap(struct fd_link *link, const struct fd_parms *parms, 
 				pr_info("Dumping dead process remap of %d\n", pid);
 				return dump_dead_process_remap(pid, id);
 			}
-
-			/*
-			 * The process is alive, but the path may reference a
-			 * dead thread: /proc/<pid>/task/<tid>/... If the
-			 * thread <tid> has exited, the task/<tid> directory
-			 * no longer exists and the file can't be opened on
-			 * restore. Handle this by creating a TASK_HELPER
-			 * process with vPID=<tid> and rewriting the path to
-			 * /proc/<tid>/task/<tid>/... so it resolves through
-			 * the helper's /proc entry.
-			 */
-			if (*end == '/' && !strncmp(end, "/task/", 6)) {
-				pid_t tid;
-				char *tend;
-				char task_path[PATH_MAX];
-
-				tid = strtol(end + 6, &tend, 10);
-				if (tid != 0 && (*tend == '/' || *tend == '\0')) {
-					/*
-					 * Check if /proc/<pid>/task/<tid>
-					 * exists by temporarily truncating
-					 * the path at the character after
-					 * the tid.
-					 */
-					char saved = *tend;
-					*tend = '\0';
-					ret = faccessat(mntns_root, rpath, F_OK, 0);
-					*tend = saved;
-
-					if (ret) {
-						snprintf(task_path, sizeof(task_path),
-							 "%.*s%d/task/%d%s",
-							 (int)(start - rpath) + 1,
-							 rpath, tid, tid, tend);
-						pr_info("Dumping dead thread remap %d/%d\n",
-							pid, tid);
-						strcpy(link->name, task_path);
-						link->len = strlen(link->name);
-						return dump_dead_process_remap(tid, id);
-					}
-				}
-			}
 		}
 
 		return 0;
@@ -2638,6 +2596,96 @@ struct file_desc *try_collect_special_file(u32 id, int optional)
 	return fdesc;
 }
 
+/*
+ * On restore, detect paths like proc/<pid>/task/<tid>/... where the
+ * thread <tid> is dead. The dump side may not have rewritten the path
+ * (e.g. images from an older CRIU version), so we handle it here by
+ * creating a TASK_HELPER process with vPID=<tid> and rewriting the
+ * path to proc/<tid>/task/<tid>/... so it resolves through the
+ * helper's /proc entry.
+ */
+static int fixup_dead_thread_path(struct reg_file_info *rfi)
+{
+	char *path = rfi->path;
+	char *task_str, *tid_str, *tid_end;
+	pid_t pid, tid;
+	char *new_path;
+	struct pstree_item *helper;
+
+	/*
+	 * rfi->path looks like "proc/<pid>/task/<tid>/..." (leading
+	 * slash already stripped). We only care about procfs paths.
+	 */
+	if (strncmp(path, "proc/", 5))
+		return 0;
+
+	/* Parse the pid: "proc/<pid>/task/..." */
+	pid = strtol(path + 5, &task_str, 10);
+	if (pid == 0 || *task_str != '/')
+		return 0;
+
+	/* Check for "/task/<tid>" */
+	if (strncmp(task_str, "/task/", 6))
+		return 0;
+
+	tid_str = task_str + 6;
+	tid = strtol(tid_str, &tid_end, 10);
+	if (tid == 0 || (*tid_end != '/' && *tid_end != '\0'))
+		return 0;
+
+	/* If pid == tid the path is already proc/<tid>/task/<tid>/... */
+	if (pid == tid)
+		return 0;
+
+	/*
+	 * If the TID already exists in the process tree (as a live
+	 * thread or process), the path will resolve on restore
+	 * without any fixup.
+	 */
+	if (pstree_pid_by_virt(tid))
+		return 0;
+
+	/*
+	 * The TID is not in the process tree -- the thread is dead.
+	 * Create a TASK_HELPER with vPID=tid so that
+	 * /proc/<tid>/task/<tid>/... resolves on restore.
+	 */
+	helper = lookup_create_item(tid);
+	if (!helper)
+		return -1;
+
+	if (helper->pid->state == TASK_UNDEF) {
+		helper->sid = root_item->sid;
+		helper->pgid = root_item->pgid;
+		helper->pid->ns[0].virt = tid;
+		helper->parent = root_item;
+		helper->ids = root_item->ids;
+		if (init_pstree_helper(helper)) {
+			pr_err("Can't init helper for dead thread %d\n", tid);
+			return -1;
+		}
+		list_add_tail(&helper->sibling, &root_item->children);
+		pr_info("Added a helper for restoring dead thread /proc/%d/task/%d\n",
+			pid, tid);
+	}
+
+	/*
+	 * Rewrite "proc/<pid>/task/<tid>/..." -> "proc/<tid>/task/<tid>/..."
+	 *
+	 * Allocate enough for: "proc/" + tid + "/task/" + tid + rest + '\0'.
+	 * 20 digits is enough for two 64-bit decimal numbers.
+	 */
+	new_path = xmalloc(5 + 20 + 6 + 20 + strlen(tid_end) + 1);
+	if (!new_path)
+		return -1;
+
+	sprintf(new_path, "proc/%d/task/%d%s", tid, tid, tid_end);
+	pr_info("Rewrote dead thread path: %s -> %s\n", rfi->path, new_path);
+	rfi->path = new_path;
+
+	return 0;
+}
+
 static int collect_one_regfile(void *o, ProtobufCMessage *base, struct cr_img *i)
 {
 	struct reg_file_info *rfi = o;
@@ -2651,6 +2699,9 @@ static int collect_one_regfile(void *o, ProtobufCMessage *base, struct cr_img *i
 		rfi->path = rfi->rfe->name + 1;
 	rfi->remap = NULL;
 	rfi->size_mode_checked = false;
+
+	if (fixup_dead_thread_path(rfi))
+		return -1;
 
 	pr_info("Collected [%s] ID %#x\n", rfi->path, rfi->rfe->id);
 	return file_desc_add(&rfi->d, rfi->rfe->id, &reg_desc_ops);
