@@ -411,6 +411,14 @@ docker-test:
 		./test/zdtm.py run -a --keep-going --ignore-taint
 .PHONY: docker-test
 
+#
+# CastAI custom targets
+castai-test:
+	docker build -t criu-test -f test/Dockerfile .
+	docker run --rm --privileged --cgroupns=host -v /lib/modules:/lib/modules \
+		criu-test run -a -p 4 --keep-going --ignore-taint
+.PHONY: castai-test
+
 help:
 	@echo '    Targets:'
 	@echo '      all             - Build all [*] targets'
@@ -429,6 +437,7 @@ help:
 	@echo '      test            - Run zdtm test-suite'
 	@echo '      gcov            - Make code coverage report'
 	@echo '      unittest        - Run unit tests'
+	@echo '      castai-test     - Build and run all ZDTM tests in Docker'
 	@echo '      lint            - Run code linters'
 	@echo '      indent          - Indent C code'
 	@echo '      amdgpu_plugin   - Make AMD GPU plugin'
