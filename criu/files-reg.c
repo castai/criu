@@ -2597,20 +2597,26 @@ struct file_desc *try_collect_special_file(u32 id, int optional)
 }
 
 /*
- * On restore, detect paths like proc/<pid>/task/<tid>/... where the
- * thread <tid> is dead. The dump side may not have rewritten the path
- * (e.g. images from an older CRIU version), so we handle it here by
- * creating a TASK_HELPER process with vPID=<tid> and rewriting the
- * path to proc/<tid>/task/<tid>/... so it resolves through the
- * helper's /proc entry.
+ * On restore, fix up paths like proc/<pid>/task/<tid>/... where
+ * tid != pid. These paths can't be opened at prepare_fds() time
+ * because non-leader threads don't exist yet -- they are created
+ * later by the restorer blob via clone(). Two cases:
+ *
+ * 1) Dead thread (tid not in pstree): create a TASK_HELPER process
+ *    with vPID=tid and rewrite the path to proc/<tid>/task/<tid>/...
+ *    so it resolves through the helper's /proc entry.
+ *
+ * 2) Live thread (tid in pstree as TASK_THREAD): rewrite the path
+ *    to proc/<pid>/task/<pid>/... so it points to the thread-group
+ *    leader, which does exist at prepare_fds() time.
  */
-static int fixup_dead_thread_path(struct reg_file_info *rfi)
+static int fixup_thread_proc_path(struct reg_file_info *rfi)
 {
 	char *path = rfi->path;
 	char *task_str, *tid_str, *tid_end;
 	pid_t pid, tid;
 	char *new_path;
-	struct pstree_item *helper;
+	struct pid *tid_node;
 
 	/*
 	 * rfi->path looks like "proc/<pid>/task/<tid>/..." (leading
@@ -2633,54 +2639,71 @@ static int fixup_dead_thread_path(struct reg_file_info *rfi)
 	if (tid == 0 || (*tid_end != '/' && *tid_end != '\0'))
 		return 0;
 
-	/* If pid == tid the path is already proc/<tid>/task/<tid>/... */
+	/* If pid == tid the path already refers to the leader */
 	if (pid == tid)
 		return 0;
 
+	tid_node = pstree_pid_by_virt(tid);
+
 	/*
-	 * If the TID already exists in the process tree (as a live
-	 * thread or process), the path will resolve on restore
-	 * without any fixup.
+	 * If the TID belongs to a process (not a thread), the path
+	 * will resolve on restore without any fixup.
 	 */
-	if (pstree_pid_by_virt(tid))
+	if (tid_node && tid_node->state != TASK_THREAD)
 		return 0;
 
-	/*
-	 * The TID is not in the process tree -- the thread is dead.
-	 * Create a TASK_HELPER with vPID=tid so that
-	 * /proc/<tid>/task/<tid>/... resolves on restore.
-	 */
-	helper = lookup_create_item(tid);
-	if (!helper)
-		return -1;
+	if (!tid_node) {
+		/*
+		 * Dead thread: tid is not in the process tree.
+		 * Create a TASK_HELPER with vPID=tid so that
+		 * /proc/<tid>/task/<tid>/... resolves on restore.
+		 */
+		struct pstree_item *helper;
 
-	if (helper->pid->state == TASK_UNDEF) {
-		helper->sid = root_item->sid;
-		helper->pgid = root_item->pgid;
-		helper->pid->ns[0].virt = tid;
-		helper->parent = root_item;
-		helper->ids = root_item->ids;
-		if (init_pstree_helper(helper)) {
-			pr_err("Can't init helper for dead thread %d\n", tid);
+		helper = lookup_create_item(tid);
+		if (!helper)
 			return -1;
+
+		if (helper->pid->state == TASK_UNDEF) {
+			helper->sid = root_item->sid;
+			helper->pgid = root_item->pgid;
+			helper->pid->ns[0].virt = tid;
+			helper->parent = root_item;
+			helper->ids = root_item->ids;
+			if (init_pstree_helper(helper)) {
+				pr_err("Can't init helper for dead thread %d\n", tid);
+				return -1;
+			}
+			list_add_tail(&helper->sibling, &root_item->children);
+			pr_info("Added a helper for restoring dead thread /proc/%d/task/%d\n",
+				pid, tid);
 		}
-		list_add_tail(&helper->sibling, &root_item->children);
-		pr_info("Added a helper for restoring dead thread /proc/%d/task/%d\n",
-			pid, tid);
+
+		new_path = xmalloc(5 + 20 + 6 + 20 + strlen(tid_end) + 1);
+		if (!new_path)
+			return -1;
+
+		sprintf(new_path, "proc/%d/task/%d%s", tid, tid, tid_end);
+		pr_info("Rewrote dead thread path: %s -> %s\n",
+			rfi->path, new_path);
+	} else {
+		/*
+		 * Live thread: the thread exists in the pstree but
+		 * won't be created until the restorer blob runs
+		 * clone(), which is after prepare_fds(). Rewrite the
+		 * path to use the thread-group leader's tid instead;
+		 * the leader is the only thread that exists at
+		 * prepare_fds() time.
+		 */
+		new_path = xmalloc(5 + 20 + 6 + 20 + strlen(tid_end) + 1);
+		if (!new_path)
+			return -1;
+
+		sprintf(new_path, "proc/%d/task/%d%s", pid, pid, tid_end);
+		pr_info("Rewrote live thread path: %s -> %s\n",
+			rfi->path, new_path);
 	}
 
-	/*
-	 * Rewrite "proc/<pid>/task/<tid>/..." -> "proc/<tid>/task/<tid>/..."
-	 *
-	 * Allocate enough for: "proc/" + tid + "/task/" + tid + rest + '\0'.
-	 * 20 digits is enough for two 64-bit decimal numbers.
-	 */
-	new_path = xmalloc(5 + 20 + 6 + 20 + strlen(tid_end) + 1);
-	if (!new_path)
-		return -1;
-
-	sprintf(new_path, "proc/%d/task/%d%s", tid, tid, tid_end);
-	pr_info("Rewrote dead thread path: %s -> %s\n", rfi->path, new_path);
 	rfi->path = new_path;
 
 	return 0;
@@ -2700,7 +2723,7 @@ static int collect_one_regfile(void *o, ProtobufCMessage *base, struct cr_img *i
 	rfi->remap = NULL;
 	rfi->size_mode_checked = false;
 
-	if (fixup_dead_thread_path(rfi))
+	if (fixup_thread_proc_path(rfi))
 		return -1;
 
 	pr_info("Collected [%s] ID %#x\n", rfi->path, rfi->rfe->id);
