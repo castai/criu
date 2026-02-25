@@ -2552,7 +2552,27 @@ int collect_filemap(struct vma_area *vma)
 
 static int open_fe_fd(struct file_desc *fd, int *new_fd)
 {
+	struct reg_file_info *rfi;
 	int tmp;
+
+	rfi = container_of(fd, struct reg_file_info, d);
+
+	if (rfi->deferred_thread_fd) {
+		/*
+		 * This is a live-thread /proc/<pid>/task/<tid>/... fd.
+		 * The thread doesn't exist yet (created later by the
+		 * restorer via clone()), so open /dev/null as a
+		 * placeholder. The restorer will reopen the correct
+		 * path after threads are created.
+		 */
+		tmp = open("/dev/null", rfi->rfe->flags & O_ACCMODE);
+		if (tmp < 0) {
+			pr_perror("Can't open /dev/null for deferred proc fd");
+			return -1;
+		}
+		*new_fd = tmp;
+		return 0;
+	}
 
 	tmp = open_path(fd, do_open_reg, NULL);
 	if (tmp < 0)
@@ -2690,18 +2710,15 @@ static int fixup_thread_proc_path(struct reg_file_info *rfi)
 		/*
 		 * Live thread: the thread exists in the pstree but
 		 * won't be created until the restorer blob runs
-		 * clone(), which is after prepare_fds(). Rewrite the
-		 * path to use the thread-group leader's tid instead;
-		 * the leader is the only thread that exists at
-		 * prepare_fds() time.
+		 * clone(), which is after prepare_fds(). Mark this
+		 * file as deferred -- open_fe_fd() will open /dev/null
+		 * as a placeholder, and the restorer will reopen the
+		 * correct path after threads exist.
 		 */
-		new_path = xmalloc(5 + 20 + 6 + 20 + strlen(tid_end) + 1);
-		if (!new_path)
-			return -1;
-
-		sprintf(new_path, "proc/%d/task/%d%s", pid, pid, tid_end);
-		pr_info("Rewrote live thread path: %s -> %s\n",
-			rfi->path, new_path);
+		rfi->deferred_thread_fd = true;
+		rfi->orig_path = rfi->path;
+		pr_info("Deferred live thread proc path: %s\n", rfi->path);
+		return 0;
 	}
 
 	rfi->path = new_path;
@@ -2722,6 +2739,8 @@ static int collect_one_regfile(void *o, ProtobufCMessage *base, struct cr_img *i
 		rfi->path = rfi->rfe->name + 1;
 	rfi->remap = NULL;
 	rfi->size_mode_checked = false;
+	rfi->deferred_thread_fd = false;
+	rfi->orig_path = NULL;
 
 	if (fixup_thread_proc_path(rfi))
 		return -1;
