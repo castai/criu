@@ -28,6 +28,6 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
 
 COPY . /criu
 WORKDIR /criu
-RUN make mrproper && make -j $(nproc) && make -C test/zdtm -j $(nproc)
+RUN make mrproper && make -j $(nproc)
 
 ENTRYPOINT ["./test/zdtm.py"]
