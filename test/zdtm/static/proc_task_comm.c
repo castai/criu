@@ -154,8 +154,8 @@ int main(int argc, char **argv)
 	/* --- Verify dead thread fd: must be valid (F_GETFD check) --- */
 	ret = fcntl(dead_thread_fd, F_GETFD);
 	if (ret < 0) {
-		fail("Dead thread fd %d is not valid after restore: %s",
-		     dead_thread_fd, strerror(errno));
+		fail("Dead thread fd %d is not valid after restore",
+		     dead_thread_fd);
 		goto out;
 	}
 	test_msg("Dead thread fd %d is valid after restore\n", dead_thread_fd);
@@ -163,14 +163,13 @@ int main(int argc, char **argv)
 	/* --- Verify live thread fd: must read the correct tid --- */
 	ret = lseek(live_thread_fd, 0, SEEK_SET);
 	if (ret < 0) {
-		fail("lseek failed on live thread fd: %s", strerror(errno));
+		fail("lseek failed on live thread fd");
 		goto out;
 	}
 
 	ret = read(live_thread_fd, buf, sizeof(buf) - 1);
 	if (ret <= 0) {
-		fail("read failed on live thread fd: %d (%s)",
-		     ret, strerror(errno));
+		fail("read failed on live thread fd: %d", ret);
 		goto out;
 	}
 	buf[ret] = '\0';
