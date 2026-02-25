@@ -2138,8 +2138,9 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		}
 
 		if (dfd != df->target_fd) {
-			if (sys_dup2(dfd, df->target_fd) != df->target_fd) {
-				pr_err("Can't dup2 deferred proc fd %d -> %d\n",
+			sys_close(df->target_fd);
+			if (sys_fcntl(dfd, F_DUPFD, df->target_fd) != df->target_fd) {
+				pr_err("Can't dup deferred proc fd %d -> %d\n",
 				       dfd, df->target_fd);
 				sys_close(dfd);
 				goto core_restore_end;
