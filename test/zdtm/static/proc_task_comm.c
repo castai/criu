@@ -35,7 +35,11 @@ static pid_t dead_thread_tid;
 /* Live thread state */
 static int live_thread_fd = -1;
 static pid_t live_thread_tid;
-static volatile int live_thread_ready;
+
+/* Synchronization for live thread */
+static pthread_mutex_t live_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t live_cond = PTHREAD_COND_INITIALIZER;
+static int live_thread_state; /* 0=init, 1=ready, 2=exit */
 
 /*
  * Dead thread: opens /proc/self/task/<tid>/comm, then exits.
@@ -80,11 +84,14 @@ static void *live_thread_fn(void *arg)
 		 live_thread_tid, path, live_thread_fd);
 
 	/* Signal main thread that we're ready */
-	live_thread_ready = 1;
+	pthread_mutex_lock(&live_mutex);
+	live_thread_state = 1;
+	pthread_cond_signal(&live_cond);
 
-	/* Stay alive through C/R */
-	while (live_thread_ready != 2)
-		usleep(10000);
+	/* Wait for main thread to tell us to exit */
+	while (live_thread_state != 2)
+		pthread_cond_wait(&live_cond, &live_mutex);
+	pthread_mutex_unlock(&live_mutex);
 
 	return NULL;
 }
@@ -130,8 +137,10 @@ int main(int argc, char **argv)
 	}
 
 	/* Wait for live thread to be ready */
-	while (!live_thread_ready)
-		usleep(1000);
+	pthread_mutex_lock(&live_mutex);
+	while (live_thread_state != 1)
+		pthread_cond_wait(&live_cond, &live_mutex);
+	pthread_mutex_unlock(&live_mutex);
 
 	if (live_thread_fd < 0) {
 		fail("Live thread did not produce a valid fd");
@@ -193,14 +202,20 @@ int main(int argc, char **argv)
 	close(live_thread_fd);
 	pass();
 
-	live_thread_ready = 2;
+	pthread_mutex_lock(&live_mutex);
+	live_thread_state = 2;
+	pthread_cond_signal(&live_cond);
+	pthread_mutex_unlock(&live_mutex);
 	pthread_join(live_th, NULL);
 	return 0;
 
 out:
 	close(dead_thread_fd);
 	close(live_thread_fd);
-	live_thread_ready = 2;
+	pthread_mutex_lock(&live_mutex);
+	live_thread_state = 2;
+	pthread_cond_signal(&live_cond);
+	pthread_mutex_unlock(&live_mutex);
 	pthread_join(live_th, NULL);
 	return 1;
 }
