@@ -1661,7 +1661,7 @@ static int get_build_id(const int fd, const struct stat *fd_status, unsigned cha
 	 */
 	mapped_size = min_t(size_t, fd_status->st_size, BUILD_ID_MAP_SIZE);
 	start_addr = mmap(0, mapped_size, PROT_READ, MAP_PRIVATE | MAP_FILE, fd, 0);
-	if ((void *)start_addr == MAP_FAILED) {
+	if ((void*)start_addr == MAP_FAILED) {
 		pr_warn("Couldn't mmap file with fd %d\n", fd);
 		return -1;
 	}
@@ -2699,11 +2699,16 @@ static int fixup_thread_proc_path(struct reg_file_info *rfi)
 				pid, tid);
 		}
 
-		new_path = xmalloc(5 + 20 + 6 + 20 + strlen(tid_end) + 1);
+		/*
+		 * "proc/" + tid + "/task/" + tid + tid_end + '\0'
+		 * Use PATH_MAX as a safe upper bound.
+		 */
+		new_path = xmalloc(PATH_MAX);
 		if (!new_path)
 			return -1;
 
-		sprintf(new_path, "proc/%d/task/%d%s", tid, tid, tid_end);
+		snprintf(new_path, PATH_MAX, "proc/%d/task/%d%s",
+			 tid, tid, tid_end);
 		pr_info("Rewrote dead thread path: %s -> %s\n",
 			rfi->path, new_path);
 	} else {
