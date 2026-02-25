@@ -264,7 +264,7 @@ struct task_restore_args {
  * For arm64 stack needs to aligned to 16 bytes.
  * Hence align to 16 bytes for all
 */
-#define RESTORE_ALIGN_STACK(start, size) (ALIGN((start) + (size) - 16, 16))
+#define RESTORE_ALIGN_STACK(start, size) (ALIGN((start) + (size)-16, 16))
 
 static inline unsigned long restorer_stack(struct restore_mem_zone *mz)
 {
