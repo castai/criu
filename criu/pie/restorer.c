@@ -366,7 +366,6 @@ skip_xids:
 		}
 	}
 
-
 	if (lsm_type != LSMTYPE__SELINUX) {
 		/*
 		 * SELinux does not support setting the process context for
@@ -2196,6 +2195,36 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		mutex_unlock(&task_entries_local->last_pid_mutex);
 		if (fd >= 0)
 			sys_close(fd);
+	}
+
+	/*
+	 * Reopen deferred /proc/<pid>/task/<tid>/... fds now that
+	 * all threads have been created by clone() above. The fds
+	 * currently point to /dev/null placeholders.
+	 */
+	for (i = 0; i < args->deferred_fds_n; i++) {
+		struct deferred_proc_fd *df = &args->deferred_fds[i];
+		int dfd;
+
+		dfd = sys_openat(args->proc_fd, df->path, df->flags, 0);
+		if (dfd < 0) {
+			pr_err("Can't reopen deferred proc fd %d (%s): %ld\n",
+			       df->target_fd, df->path, (long)dfd);
+			goto core_restore_end;
+		}
+
+		if (dfd != df->target_fd) {
+			if (sys_dup2(dfd, df->target_fd) != df->target_fd) {
+				pr_err("Can't dup2 deferred proc fd %d -> %d\n",
+				       dfd, df->target_fd);
+				sys_close(dfd);
+				goto core_restore_end;
+			}
+			sys_close(dfd);
+		}
+
+		if (df->pos != 0 && df->pos != (off_t)-1)
+			sys_lseek(df->target_fd, df->pos, SEEK_SET);
 	}
 
 	restore_rlims(args);
