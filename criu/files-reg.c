@@ -2552,7 +2552,27 @@ int collect_filemap(struct vma_area *vma)
 
 static int open_fe_fd(struct file_desc *fd, int *new_fd)
 {
+	struct reg_file_info *rfi;
 	int tmp;
+
+	rfi = container_of(fd, struct reg_file_info, d);
+
+	if (rfi->deferred_thread_fd) {
+		/*
+		 * This is a live-thread /proc/<pid>/task/<tid>/... fd.
+		 * The thread doesn't exist yet (created later by the
+		 * restorer via clone()), so open /dev/null as a
+		 * placeholder. The restorer will reopen the correct
+		 * path after threads are created.
+		 */
+		tmp = open("/dev/null", rfi->rfe->flags & O_ACCMODE);
+		if (tmp < 0) {
+			pr_perror("Can't open /dev/null for deferred proc fd");
+			return -1;
+		}
+		*new_fd = tmp;
+		return 0;
+	}
 
 	tmp = open_path(fd, do_open_reg, NULL);
 	if (tmp < 0)
@@ -2596,6 +2616,121 @@ struct file_desc *try_collect_special_file(u32 id, int optional)
 	return fdesc;
 }
 
+/*
+ * On restore, fix up paths like proc/<pid>/task/<tid>/... where
+ * tid != pid. These paths can't be opened at prepare_fds() time
+ * because non-leader threads don't exist yet -- they are created
+ * later by the restorer blob via clone(). Two cases:
+ *
+ * 1) Dead thread (tid not in pstree): create a TASK_HELPER process
+ *    with vPID=tid and rewrite the path to proc/<tid>/task/<tid>/...
+ *    so it resolves through the helper's /proc entry.
+ *
+ * 2) Live thread (tid in pstree as TASK_THREAD): rewrite the path
+ *    to proc/<pid>/task/<pid>/... so it points to the thread-group
+ *    leader, which does exist at prepare_fds() time.
+ */
+static int fixup_thread_proc_path(struct reg_file_info *rfi)
+{
+	char *path = rfi->path;
+	char *task_str, *tid_str, *tid_end;
+	pid_t pid, tid;
+	char *new_path;
+	struct pid *tid_node;
+
+	/*
+	 * rfi->path looks like "proc/<pid>/task/<tid>/..." (leading
+	 * slash already stripped). We only care about procfs paths.
+	 */
+	if (strncmp(path, "proc/", 5))
+		return 0;
+
+	/* Parse the pid: "proc/<pid>/task/..." */
+	pid = strtol(path + 5, &task_str, 10);
+	if (pid == 0 || *task_str != '/')
+		return 0;
+
+	/* Check for "/task/<tid>" */
+	if (strncmp(task_str, "/task/", 6))
+		return 0;
+
+	tid_str = task_str + 6;
+	tid = strtol(tid_str, &tid_end, 10);
+	if (tid == 0 || (*tid_end != '/' && *tid_end != '\0'))
+		return 0;
+
+	/* If pid == tid the path already refers to the leader */
+	if (pid == tid)
+		return 0;
+
+	tid_node = pstree_pid_by_virt(tid);
+
+	/*
+	 * If the TID belongs to a process (not a thread), the path
+	 * will resolve on restore without any fixup.
+	 */
+	if (tid_node && tid_node->state != TASK_THREAD)
+		return 0;
+
+	if (!tid_node) {
+		/*
+		 * Dead thread: tid is not in the process tree.
+		 * Create a TASK_HELPER with vPID=tid so that
+		 * /proc/<tid>/task/<tid>/... resolves on restore.
+		 */
+		struct pstree_item *helper;
+
+		helper = lookup_create_item(tid);
+		if (!helper)
+			return -1;
+
+		if (helper->pid->state == TASK_UNDEF) {
+			helper->sid = root_item->sid;
+			helper->pgid = root_item->pgid;
+			helper->pid->ns[0].virt = tid;
+			helper->parent = root_item;
+			helper->ids = root_item->ids;
+			if (init_pstree_helper(helper)) {
+				pr_err("Can't init helper for dead thread %d\n", tid);
+				return -1;
+			}
+			list_add_tail(&helper->sibling, &root_item->children);
+			pr_info("Added a helper for restoring dead thread /proc/%d/task/%d\n",
+				pid, tid);
+		}
+
+		/*
+		 * "proc/" + tid + "/task/" + tid + tid_end + '\0'
+		 * Use PATH_MAX as a safe upper bound.
+		 */
+		new_path = xmalloc(PATH_MAX);
+		if (!new_path)
+			return -1;
+
+		snprintf(new_path, PATH_MAX, "proc/%d/task/%d%s",
+			 tid, tid, tid_end);
+		pr_info("Rewrote dead thread path: %s -> %s\n",
+			rfi->path, new_path);
+	} else {
+		/*
+		 * Live thread: the thread exists in the pstree but
+		 * won't be created until the restorer blob runs
+		 * clone(), which is after prepare_fds(). Mark this
+		 * file as deferred -- open_fe_fd() will open /dev/null
+		 * as a placeholder, and the restorer will reopen the
+		 * correct path after threads exist.
+		 */
+		rfi->deferred_thread_fd = true;
+		rfi->orig_path = rfi->path;
+		pr_info("Deferred live thread proc path: %s\n", rfi->path);
+		return 0;
+	}
+
+	rfi->path = new_path;
+
+	return 0;
+}
+
 static int collect_one_regfile(void *o, ProtobufCMessage *base, struct cr_img *i)
 {
 	struct reg_file_info *rfi = o;
@@ -2609,6 +2744,11 @@ static int collect_one_regfile(void *o, ProtobufCMessage *base, struct cr_img *i
 		rfi->path = rfi->rfe->name + 1;
 	rfi->remap = NULL;
 	rfi->size_mode_checked = false;
+	rfi->deferred_thread_fd = false;
+	rfi->orig_path = NULL;
+
+	if (fixup_thread_proc_path(rfi))
+		return -1;
 
 	pr_info("Collected [%s] ID %#x\n", rfi->path, rfi->rfe->id);
 	return file_desc_add(&rfi->d, rfi->rfe->id, &reg_desc_ops);
