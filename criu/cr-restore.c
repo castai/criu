@@ -272,19 +272,16 @@ static int crtools_prepare_shared(void)
  */
 
 static struct collect_image_info *cinfos[] = {
-	&file_locks_cinfo,
-	&pipe_data_cinfo,
-	&fifo_data_cinfo,
-	&sk_queues_cinfo,
+	&file_locks_cinfo,  &pipe_data_cinfo, &fifo_data_cinfo, &sk_queues_cinfo,
 #ifdef CONFIG_HAS_LIBBPF
 	&bpfmap_data_cinfo,
 #endif
 };
 
 static struct collect_image_info *cinfos_files[] = {
-	&unix_sk_cinfo, &fifo_cinfo, &pipe_cinfo, &nsfile_cinfo, &packet_sk_cinfo,
-	&netlink_sk_cinfo, &eventfd_cinfo, &epoll_cinfo, &epoll_tfd_cinfo, &signalfd_cinfo,
-	&tunfile_cinfo, &timerfd_cinfo, &inotify_cinfo, &inotify_mark_cinfo, &fanotify_cinfo,
+	&unix_sk_cinfo,	      &fifo_cinfo,     &pipe_cinfo,    &nsfile_cinfo,	    &packet_sk_cinfo,
+	&netlink_sk_cinfo,    &eventfd_cinfo,  &epoll_cinfo,   &epoll_tfd_cinfo,    &signalfd_cinfo,
+	&tunfile_cinfo,	      &timerfd_cinfo,  &inotify_cinfo, &inotify_mark_cinfo, &fanotify_cinfo,
 	&fanotify_mark_cinfo, &ext_file_cinfo, &memfd_cinfo, &pidfd_cinfo
 };
 
@@ -503,65 +500,6 @@ static int collect_inotify_fds(struct task_restore_args *ta)
 	return 0;
 }
 
-static int collect_deferred_proc_fds(struct task_restore_args *ta)
-{
-	struct list_head *list = &rsti(current)->fds;
-	struct fdt *fdt = rsti(current)->fdt;
-	struct fdinfo_list_entry *fle;
-
-	/* Only the fdt owner restores fds */
-	if (fdt && fdt->pid != vpid(current))
-		return 0;
-
-	ta->deferred_fds = (struct deferred_proc_fd *)rst_mem_align_cpos(RM_PRIVATE);
-	ta->deferred_fds_n = 0;
-
-	list_for_each_entry(fle, list, ps_list) {
-		struct file_desc *d = fle->desc;
-		struct reg_file_info *rfi;
-		struct deferred_proc_fd *df;
-		char *orig_path;
-
-		if (d->ops->type != FD_TYPES__REG)
-			continue;
-
-		rfi = container_of(d, struct reg_file_info, d);
-		if (!rfi->deferred_thread_fd)
-			continue;
-
-		df = rst_mem_alloc(sizeof(*df), RM_PRIVATE);
-		if (!df)
-			return -1;
-
-		orig_path = rfi->orig_path;
-
-		/*
-		 * orig_path is "proc/<pid>/task/<tid>/...", strip "proc/"
-		 * prefix to get a path relative to /proc for
-		 * sys_openat(proc_fd, ...).
-		 */
-		if (strncmp(orig_path, "proc/", 5) == 0)
-			orig_path += 5;
-
-		if (strlen(orig_path) >= sizeof(df->path)) {
-			pr_err("Deferred proc path too long: %s\n", orig_path);
-			return -1;
-		}
-
-		df->target_fd = fle->fe->fd;
-		df->flags = rfi->rfe->flags;
-		df->pos = rfi->rfe->pos;
-		strncpy(df->path, orig_path, sizeof(df->path) - 1);
-		df->path[sizeof(df->path) - 1] = '\0';
-
-		ta->deferred_fds_n++;
-		pr_info("Collected deferred proc fd %d -> %s\n",
-			df->target_fd, df->path);
-	}
-
-	return 0;
-}
-
 static int open_core(int pid, CoreEntry **pcore)
 {
 	int ret;
@@ -736,9 +674,6 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 		return -1;
 
 	if (collect_inotify_fds(ta) < 0)
-		return -1;
-
-	if (collect_deferred_proc_fds(ta) < 0)
 		return -1;
 
 	if (prepare_proc_misc(pid, core->tc, ta))
@@ -1774,10 +1709,7 @@ static int restore_task_with_children(void *_arg)
 }
 
 int __attribute((weak)) arch_ptrace_restore(int pid, struct pstree_item *item);
-int arch_ptrace_restore(int pid, struct pstree_item *item)
-{
-	return 0;
-}
+int arch_ptrace_restore(int pid, struct pstree_item *item) { return 0; }
 
 static int attach_to_tasks(bool root_seized)
 {
@@ -3201,9 +3133,7 @@ static void *restorer_munmap_addr(CoreEntry *core, void *restorer_blob)
 }
 
 void arch_rsti_init(struct pstree_item *p) __attribute__((weak));
-void arch_rsti_init(struct pstree_item *p)
-{
-}
+void arch_rsti_init(struct pstree_item *p) {}
 
 static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, unsigned long alen, CoreEntry *core)
 {
@@ -3399,7 +3329,6 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	RST_MEM_FIXUP_PPTR(task_args->zombies);
 	RST_MEM_FIXUP_PPTR(task_args->vma_ios);
 	RST_MEM_FIXUP_PPTR(task_args->inotify_fds);
-	RST_MEM_FIXUP_PPTR(task_args->deferred_fds);
 
 	task_args->compatible_mode = core_is_compat(core);
 	/*

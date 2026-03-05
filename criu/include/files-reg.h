@@ -24,9 +24,7 @@ struct reg_file_info {
 	struct file_remap *remap;
 	bool size_mode_checked;
 	bool is_dir;
-	bool deferred_thread_fd; /* placeholder for live thread proc fd */
 	char *path;
-	char *orig_path; /* original proc path for deferred reopen */
 };
 
 extern int open_reg_by_id(u32 id);

@@ -366,6 +366,7 @@ skip_xids:
 		}
 	}
 
+
 	if (lsm_type != LSMTYPE__SELINUX) {
 		/*
 		 * SELinux does not support setting the process context for
@@ -2195,60 +2196,6 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		mutex_unlock(&task_entries_local->last_pid_mutex);
 		if (fd >= 0)
 			sys_close(fd);
-	}
-
-	/*
-	 * Reopen deferred /proc/<pid>/task/<tid>/... fds now that
-	 * all threads have been created by clone() above. The fds
-	 * currently point to /dev/null placeholders.
-	 *
-	 * We must open /proc from the process's own filesystem
-	 * (already chroot'd into the container rootfs) rather than
-	 * using args->proc_fd, which points to CRIU's /proc mount.
-	 * Opening through CRIU's proc would give the fds a mount ID
-	 * from CRIU's mount namespace, which doesn't exist in the
-	 * container's mountinfo -- causing the next dump to fail at
-	 * lookup_mnt_id().
-	 */
-	if (args->deferred_fds_n > 0) {
-		int self_proc_fd;
-
-		self_proc_fd = sys_open("/proc", O_RDONLY | O_DIRECTORY, 0);
-		if (self_proc_fd < 0) {
-			pr_err("Can't open /proc for deferred fds: %ld\n",
-			       (long)self_proc_fd);
-			goto core_restore_end;
-		}
-
-		for (i = 0; i < args->deferred_fds_n; i++) {
-			struct deferred_proc_fd *df = &args->deferred_fds[i];
-			int dfd;
-
-			dfd = sys_openat(self_proc_fd, df->path, df->flags, 0);
-			if (dfd < 0) {
-				pr_err("Can't reopen deferred proc fd %d (%s): %ld\n",
-				       df->target_fd, df->path, (long)dfd);
-				sys_close(self_proc_fd);
-				goto core_restore_end;
-			}
-
-			if (dfd != df->target_fd) {
-				sys_close(df->target_fd);
-				if (sys_fcntl(dfd, F_DUPFD, df->target_fd) != df->target_fd) {
-					pr_err("Can't dup deferred proc fd %d -> %d\n",
-					       dfd, df->target_fd);
-					sys_close(dfd);
-					sys_close(self_proc_fd);
-					goto core_restore_end;
-				}
-				sys_close(dfd);
-			}
-
-			if (df->pos != 0 && df->pos != (off_t)-1)
-				sys_lseek(df->target_fd, df->pos, SEEK_SET);
-		}
-
-		sys_close(self_proc_fd);
 	}
 
 	restore_rlims(args);

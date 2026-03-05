@@ -141,13 +141,6 @@ struct restore_vma_io {
 
 #define RIO_SIZE(niovs) (sizeof(struct restore_vma_io) + (niovs) * sizeof(struct iovec))
 
-struct deferred_proc_fd {
-	int target_fd;	/* fd number to dup2 over */
-	int flags;	/* open flags (O_RDONLY etc) */
-	off_t pos;	/* file position to restore */
-	char path[128]; /* path relative to /proc, e.g. "1/task/7/stat" */
-};
-
 struct task_restore_args {
 	struct thread_restore_args *t; /* thread group leader */
 
@@ -202,9 +195,6 @@ struct task_restore_args {
 
 	int *inotify_fds; /* fds to cleanup inotify events at CR_STATE_RESTORE_SIGCHLD stage */
 	unsigned int inotify_fds_n;
-
-	struct deferred_proc_fd *deferred_fds; /* live-thread proc fds to reopen after clone() */
-	unsigned int deferred_fds_n;
 
 	/* * * * * * * * * * * * * * * * * * * * */
 
