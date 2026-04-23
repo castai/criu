@@ -199,6 +199,7 @@ TST_NOFILE	:=				\
 		session02			\
 		session03			\
 		socket-ext			\
+		sk-unix-ext-stream		\
 		unhashed_proc			\
 		cow00				\
 		cow02				\
