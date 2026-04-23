@@ -24,6 +24,7 @@
 #include "util-pie.h"
 #include "sockets.h"
 #include "sk-queue.h"
+#include "sk-unix-shared.h"
 #include "mount.h"
 #include "mount-v2.h"
 #include "cr-service.h"
@@ -949,46 +950,6 @@ static int dump_external_sockets(struct unix_sk_desc *peer)
 	return 0;
 }
 
-/*
- * For a stream/seqpacket external peer, the peer's own bound name is
- * usually empty (accepted fd on the server side, or connected fd on the
- * client side). The information we actually need on restore is the
- * listener's path. On the client-container dump, getpeername() on the
- * in-scope connected fd returns that path. On the server-container dump,
- * getpeername() on the in-scope accepted fd returns an anonymous address
- * and we fall back to leaving the stub nameless; restore will locate the
- * listener within the image by other means.
- *
- * inscope_fd is a dup of the live fd (see dump_one_unix_fd at ~:470),
- * valid while the process is frozen.
- */
-static char *recover_ext_stream_peer_path(int inscope_fd, size_t *out_len)
-{
-	struct sockaddr_un addr;
-	socklen_t len = sizeof(addr);
-	char *buf;
-	size_t path_len;
-
-	memset(&addr, 0, sizeof(addr));
-	if (getpeername(inscope_fd, (struct sockaddr *)&addr, &len) < 0) {
-		pr_debug("getpeername on ext stream fd %d: %m\n", inscope_fd);
-		return NULL;
-	}
-
-	if (len <= sizeof(addr.sun_family) || addr.sun_path[0] == '\0') {
-		/* Anonymous or abstract — nothing useful to record here. */
-		return NULL;
-	}
-
-	path_len = strnlen(addr.sun_path, sizeof(addr.sun_path));
-	buf = xmalloc(path_len);
-	if (!buf)
-		return NULL;
-	memcpy(buf, addr.sun_path, path_len);
-	*out_len = path_len;
-	return buf;
-}
-
 int fix_external_unix_sockets(void)
 {
 	struct unix_sk_desc *sk;
@@ -1017,7 +978,7 @@ int fix_external_unix_sockets(void)
 		 */
 		first_peer = list_first_entry(&sk->peer_list, struct unix_sk_desc, peer_node);
 		if ((sk->type == SOCK_STREAM || sk->type == SOCK_SEQPACKET) && !sk->name && first_peer->fd >= 0)
-			recovered_name = recover_ext_stream_peer_path(first_peer->fd, &recovered_len);
+			recovered_name = sk_shared_getpeername_path(first_peer->fd, &recovered_len);
 
 		fd_id_generate_special(NULL, &e.id);
 		e.ino = sk->sd.ino;
@@ -2033,76 +1994,31 @@ static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 		    (ui->ue->type == SOCK_STREAM || ui->ue->type == SOCK_SEQPACKET)) {
 			struct unix_sk_info *peer = ui->peer;
 
+			/*
+			 * Shared-socket external-peer restore. Actual
+			 * logic (connect-with-retry on the connector side,
+			 * dead socketpair on the acceptor side) lives in
+			 * sk-unix-shared.c so this file stays close to
+			 * upstream.
+			 */
 			if (peer->ue->name.len > 0) {
-				/* Connector: connect with retry. */
-				struct sockaddr_un caddr;
-				int i, max_tries;
-
 				sk = socket(PF_UNIX, ui->ue->type, 0);
 				if (sk < 0) {
 					pr_perror("Can't make unix socket");
 					return -1;
 				}
-
-				memset(&caddr, 0, sizeof(caddr));
-				caddr.sun_family = AF_UNIX;
-				if (peer->ue->name.len > UNIX_PATH_MAX) {
-					pr_err("External peer path too long (len %zu)\n",
-					       (size_t)peer->ue->name.len);
+				if (sk_shared_connect_with_retry(sk,
+						(const char *)peer->ue->name.data,
+						peer->ue->name.len,
+						opts.timeout) < 0) {
 					close(sk);
 					return -1;
 				}
-				memcpy(caddr.sun_path, peer->ue->name.data, peer->ue->name.len);
-
-				/*
-				 * Retry for at most max(opts.timeout, 60)
-				 * seconds in 100ms increments. Every
-				 * ECONNREFUSED / ENOENT means "peer listener
-				 * isn't up yet" — wait briefly and retry. The
-				 * 60s floor covers slow-restoring peers in
-				 * multi-container migrations where the
-				 * listener-side container may take well over
-				 * CRIU's default 10s to bind.
-				 */
-				{
-					int timeout_s = opts.timeout > 60 ? opts.timeout : 60;
-					max_tries = timeout_s * 10;
-				}
-				for (i = 0; i < max_tries; i++) {
-					if (connect(sk, (struct sockaddr *)&caddr,
-					            sizeof(caddr.sun_family) + peer->ue->name.len) == 0) {
-						break;
-					}
-					if (errno != ECONNREFUSED && errno != ENOENT) {
-						pr_perror("Can't connect external unix peer %s", caddr.sun_path);
-						close(sk);
-						return -1;
-					}
-					usleep(100 * 1000);
-				}
-				if (i == max_tries) {
-					pr_err("Timed out connecting to external unix peer %s\n",
-					       caddr.sun_path);
-					close(sk);
-					return -1;
-				}
-				ui->is_connected = true;
-				pr_info("External unix peer reconnected: %u -> %s after %d tries\n",
-				        ui->ue->ino, caddr.sun_path, i);
 			} else {
-				/* Acceptor: hand the app a dead fd. */
-				int sks[2];
-
-				if (socketpair(PF_UNIX, ui->ue->type, 0, sks) < 0) {
-					pr_perror("Can't make socketpair for extern acceptor");
+				if (sk_shared_dead_acceptor_fd(ui->ue->type, &sk) < 0)
 					return -1;
-				}
-				close(sks[1]);
-				sk = sks[0];
-				ui->is_connected = true;
-				pr_info("External unix acceptor %u restored as dead fd\n",
-				        ui->ue->ino);
 			}
+			ui->is_connected = true;
 			goto out;
 		}
 
