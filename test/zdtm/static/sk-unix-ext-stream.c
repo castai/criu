@@ -42,6 +42,8 @@ int main(int argc, char *argv[])
 	char *path;
 	pid_t pid;
 	int ret;
+	int ssk, asock;
+	char buf[64];
 
 	if (mkdtemp(dir) == NULL) {
 		pr_perror("mkdtemp(%s)", dir);
@@ -128,9 +130,6 @@ int main(int argc, char *argv[])
 	/*
 	 * Parent: the "server". This is the process CRIU dumps.
 	 */
-	int ssk, asock;
-	char buf[64];
-
 	test_init(argc, argv);
 
 	ssk = socket(AF_UNIX, SOCK_STREAM, 0);
