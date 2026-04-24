@@ -9,6 +9,7 @@
  */
 
 #include <errno.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -22,6 +23,11 @@
 
 #define UNIX_SHARED_RETRY_FLOOR_S	60
 #define UNIX_SHARED_RETRY_SLEEP_US	(100 * 1000)
+
+bool sk_shared_is_stream_ext_peer(int type)
+{
+	return type == SOCK_STREAM || type == SOCK_SEQPACKET;
+}
 
 char *sk_shared_getpeername_path(int inscope_fd, size_t *out_len)
 {

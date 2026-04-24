@@ -1,20 +1,27 @@
 #ifndef __CR_SK_UNIX_SHARED_H__
 #define __CR_SK_UNIX_SHARED_H__
 
+#include <stdbool.h>
 #include <stddef.h>
 
 /*
- * Support for AF_UNIX stream/seqpacket sockets that cross a
- * checkpoint-scope boundary (e.g., two containers in the same pod
- * sharing a unix socket via a volume).
+ * Primitive helpers for the shared-socket (multi-container AF_UNIX)
+ * support added in this fork.
  *
- * The logic lives in sk-unix-shared.c to keep the conflict surface in
- * sk-unix.c (which tracks upstream closely) as small as possible. The
- * functions here intentionally take only primitive types — no
- * dependency on unix_sk_desc / unix_sk_info / UnixSkEntry layout — so
- * the implementation can evolve independently of internal sk-unix
- * refactors.
+ * The helpers here take only primitive types. The sk-unix.c alternative
+ * code paths that glue these to the internal unix_sk_desc /
+ * unix_sk_info / UnixSkEntry layouts live alongside the upstream
+ * functions they supplement, as static sk_shared_* functions — this
+ * keeps upstream bodies untouched and confines layout dependencies to
+ * sk-unix.c, where struct definitions are anyway already private.
  */
+
+/*
+ * True if the external peer type warrants the shared-socket alternative
+ * path: SOCK_STREAM or SOCK_SEQPACKET. SOCK_DGRAM still uses the
+ * upstream --ext-unix-sk flow.
+ */
+bool sk_shared_is_stream_ext_peer(int type);
 
 /*
  * Recover the path of a connected unix socket's peer via getpeername().
@@ -24,13 +31,10 @@
  * external stub so restore can reconnect.
  *
  * On a server-side accepted fd, the peer is nameless and this returns
- * NULL (success) with *out_len left unchanged.
+ * NULL with *out_len untouched.
  *
- * Returns:
- *   malloc'd buffer + length via *out_len on success (caller must
- *     xfree), OR
- *   NULL if the peer is nameless/abstract/getpeername fails — the
- *     dump path keeps the stub nameless in that case.
+ * Returns a malloc'd buffer (caller xfree's) + length via *out_len on
+ * success, or NULL if the peer is nameless/abstract/getpeername fails.
  *
  * inscope_fd should be a dup of the live fd valid while the process
  * is frozen.
@@ -41,26 +45,19 @@ char *sk_shared_getpeername_path(int inscope_fd, size_t *out_len);
  * Connect a unix stream socket to the given path, retrying while the
  * peer listener is not yet up (ECONNREFUSED / ENOENT).
  *
- * Used at restore time on the connector-side to reach an external
- * listener that may belong to a sibling container whose restore is
- * still in progress.
- *
  * Retries for max(timeout_s, 60) seconds in 100ms increments. Errors
  * other than ECONNREFUSED / ENOENT fail immediately.
  *
- * Returns 0 on success, -1 on failure (caller owns the fd either way;
- * close on failure).
+ * Returns 0 on success, -1 on failure (caller owns fd either way).
  */
 int sk_shared_connect_with_retry(int fd, const char *path, size_t path_len, int timeout_s);
 
 /*
  * Allocate a "dead" unix fd: a socketpair with the far end closed.
- * The returned fd is a valid AF_UNIX stream/seqpacket fd; read() will
- * immediately return 0 (EOF), write() will raise EPIPE.
+ * Read on the returned fd returns 0 (EOF); write raises EPIPE.
  *
- * Used at restore time on the acceptor-side (server's originally
- * accept()'d fd for an external client). The application's accept
- * loop picks up fresh connections from the restored listener; the old
+ * Used at restore time on the acceptor-side: the application's accept
+ * loop picks up fresh connections from the restored listener, the old
  * connection is intentionally broken.
  *
  * type is SOCK_STREAM or SOCK_SEQPACKET.
