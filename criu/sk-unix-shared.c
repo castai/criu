@@ -32,7 +32,8 @@ char *sk_shared_getpeername_path(int inscope_fd, size_t *out_len)
 
 	memset(&addr, 0, sizeof(addr));
 	if (getpeername(inscope_fd, (struct sockaddr *)&addr, &len) < 0) {
-		pr_debug("sk-unix-shared: getpeername on fd %d: %m\n", inscope_fd);
+		pr_debug("sk-unix-shared: getpeername on fd %d failed, errno=%d\n",
+			 inscope_fd, errno);
 		return NULL;
 	}
 
