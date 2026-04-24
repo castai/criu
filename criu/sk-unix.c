@@ -902,25 +902,22 @@ static int __dump_external_socket(struct unix_sk_desc *sk, struct unix_sk_desc *
 		return 0;
 	}
 
-	/*
-	 * External peer — fork's sibling owns the other end of the
-	 * socket. We always treat this as an externally-managed
-	 * resource: the operator (or orchestrator) is responsible for
-	 * ensuring the peer exists when restore reconnects.
-	 *
-	 * Historically this required --ext-unix-sk as an explicit
-	 * consent flag; that gate has been removed so shared-socket
-	 * multi-container checkpoints Just Work.
-	 *
-	 * For SOCK_DGRAM we still need the peer's bound name to
-	 * reconnect on restore. For SOCK_STREAM/SEQPACKET the peer is
-	 * typically a nameless accepted-fd (server-side) or a nameless
-	 * connected-fd (client-side); the listener path is recovered
-	 * later via getpeername() in fix_external_unix_sockets().
-	 */
-	show_one_unix("External peer accepted", peer);
+	/* Legacy -x|--ext-unix-sk option handling */
+	if (!opts.ext_unix_sk) {
+		show_one_unix("Runaway socket", peer);
+		pr_err("External socket is used. "
+		       "Consider using --" USK_EXT_PARAM " option.\n");
+		return -1;
+	}
 
-	if (peer->type == SOCK_DGRAM && !peer->name) {
+	if (peer->type != SOCK_DGRAM) {
+		show_one_unix("Ext stream not supported", peer);
+		pr_err("Can't dump half of stream unix connection. name: %s; peer name: %s\n",
+		       sk->name, peer->name);
+		return -1;
+	}
+
+	if (!peer->name) {
 		show_one_unix("Ext dgram w/o name", peer);
 		pr_err("Can't dump name-less external socket.\n");
 		pr_err("%d\n", sk->fd);
@@ -937,7 +934,16 @@ static int dump_external_sockets(struct unix_sk_desc *peer)
 	while (!list_empty(&peer->peer_list)) {
 		sk = list_first_entry(&peer->peer_list, struct unix_sk_desc, peer_node);
 
-		if (__dump_external_socket(sk, peer))
+		/*
+		 * Alternative path for stream/seqpacket external peers
+		 * (shared sockets between containers): accept
+		 * unconditionally, bypassing upstream's reject. The
+		 * in-scope side's entry is still written below via
+		 * write_unix_entry(); the peer stub itself is emitted
+		 * in fix_external_unix_sockets.
+		 */
+		if (!sk_shared_is_stream_ext_peer(peer->type) &&
+		    __dump_external_socket(sk, peer))
 			return -1;
 
 		if (write_unix_entry(sk))
@@ -948,6 +954,63 @@ static int dump_external_sockets(struct unix_sk_desc *peer)
 	}
 
 	return 0;
+}
+
+/*
+ * Alternative external-stub writer for shared stream/seqpacket
+ * sockets (e.g., two containers in a pod sharing a listener path).
+ *
+ * The upstream stub body in fix_external_unix_sockets below writes a
+ * DGRAM-shaped placeholder; for streams we need the real type/state,
+ * a back-link to the in-scope side via peer_ino, and — on the
+ * connector side — the listener's path recovered via getpeername on
+ * the in-scope side's live fd.
+ *
+ * This duplicates the protobuf boilerplate from the upstream body
+ * intentionally: keeping it separate means upstream fix_external_unix_sockets
+ * stays byte-for-byte unchanged.
+ */
+static int sk_shared_write_stub(struct unix_sk_desc *sk)
+{
+	FileEntry fe = FILE_ENTRY__INIT;
+	UnixSkEntry e = UNIX_SK_ENTRY__INIT;
+	FownEntry fown = FOWN_ENTRY__INIT;
+	SkOptsEntry skopts = SK_OPTS_ENTRY__INIT;
+	struct unix_sk_desc *first_peer;
+	char *recovered_name = NULL;
+	size_t recovered_len = 0;
+	int ret;
+
+	first_peer = list_first_entry(&sk->peer_list, struct unix_sk_desc, peer_node);
+	if (!sk->name && first_peer->fd >= 0)
+		recovered_name = sk_shared_getpeername_path(first_peer->fd, &recovered_len);
+
+	fd_id_generate_special(NULL, &e.id);
+	e.ino = sk->sd.ino;
+	e.type = sk->type;
+	e.state = sk->state;
+	if (recovered_name) {
+		e.name.data = (void *)recovered_name;
+		e.name.len = recovered_len;
+	} else {
+		e.name.data = (void *)sk->name;
+		e.name.len = (size_t)sk->namelen;
+	}
+	e.uflags = USK_EXTERN;
+	e.peer = sk->peer_ino;
+	e.fown = &fown;
+	e.opts = &skopts;
+
+	fe.type = FD_TYPES__UNIXSK;
+	fe.id = e.id;
+	fe.usk = &e;
+
+	ret = pb_write_one(img_from_set(glob_imgset, CR_FD_FILES), &fe, PB_FILE);
+	if (ret == 0)
+		show_one_unix_img("Dumped extern (shared)", &e);
+
+	xfree(recovered_name);
+	return ret;
 }
 
 int fix_external_unix_sockets(void)
@@ -961,9 +1024,6 @@ int fix_external_unix_sockets(void)
 		UnixSkEntry e = UNIX_SK_ENTRY__INIT;
 		FownEntry fown = FOWN_ENTRY__INIT;
 		SkOptsEntry skopts = SK_OPTS_ENTRY__INIT;
-		char *recovered_name = NULL;
-		size_t recovered_len = 0;
-		struct unix_sk_desc *first_peer = NULL;
 
 		if (sk->sd.already_dumped || list_empty(&sk->peer_list))
 			continue;
@@ -971,28 +1031,28 @@ int fix_external_unix_sockets(void)
 		show_one_unix("Dumping extern", sk);
 
 		/*
-		 * For a stream/seqpacket external peer with no bound name,
-		 * try to recover the listener path from the in-scope side
-		 * via getpeername(). The in-scope side lives in sk->peer_list;
-		 * any entry will do — they all connect to the same peer.
+		 * Alternative path for stream/seqpacket external peers
+		 * (shared sockets between containers). Upstream below
+		 * writes a DGRAM-shaped stub; we need real type/state
+		 * and a back-link to the in-scope side, plus the
+		 * listener path recovered via getpeername.
 		 */
-		first_peer = list_first_entry(&sk->peer_list, struct unix_sk_desc, peer_node);
-		if ((sk->type == SOCK_STREAM || sk->type == SOCK_SEQPACKET) && !sk->name && first_peer->fd >= 0)
-			recovered_name = sk_shared_getpeername_path(first_peer->fd, &recovered_len);
+		if (sk_shared_is_stream_ext_peer(sk->type)) {
+			if (sk_shared_write_stub(sk))
+				goto err;
+			if (dump_external_sockets(sk))
+				goto err;
+			continue;
+		}
 
 		fd_id_generate_special(NULL, &e.id);
 		e.ino = sk->sd.ino;
-		e.type = sk->type;
-		e.state = sk->state;
-		if (recovered_name) {
-			e.name.data = (void *)recovered_name;
-			e.name.len = recovered_len;
-		} else {
-			e.name.data = (void *)sk->name;
-			e.name.len = (size_t)sk->namelen;
-		}
+		e.type = SOCK_DGRAM;
+		e.state = TCP_LISTEN;
+		e.name.data = (void *)sk->name;
+		e.name.len = (size_t)sk->namelen;
 		e.uflags = USK_EXTERN;
-		e.peer = sk->peer_ino;
+		e.peer = 0;
 		e.fown = &fown;
 		e.opts = &skopts;
 
@@ -1000,14 +1060,10 @@ int fix_external_unix_sockets(void)
 		fe.id = e.id;
 		fe.usk = &e;
 
-		if (pb_write_one(img_from_set(glob_imgset, CR_FD_FILES), &fe, PB_FILE)) {
-			xfree(recovered_name);
+		if (pb_write_one(img_from_set(glob_imgset, CR_FD_FILES), &fe, PB_FILE))
 			goto err;
-		}
 
 		show_one_unix_img("Dumped extern", &e);
-
-		xfree(recovered_name);
 
 		if (dump_external_sockets(sk))
 			goto err;
@@ -1852,6 +1908,57 @@ static int setup_second_end(int *sks, struct fdinfo_list_entry *second_end)
 	return 0;
 }
 
+/*
+ * Alternative restore path for stream/seqpacket sockets whose peer is
+ * an external stub (USK_EXTERN) — i.e. multi-container shared unix
+ * sockets.
+ *
+ * Split by whether the stub carries a path (recovered via getpeername
+ * at dump time):
+ *
+ *   - non-empty name: we are the "connector" side. Open a fresh
+ *     socket and connect() to the path, retrying while the peer
+ *     listener is not yet up.
+ *
+ *   - empty name: we are the "acceptor" side (originally an
+ *     accept()'d fd on the listener container). There's nothing to
+ *     reconnect to from our end; hand the application a dead
+ *     socketpair so it sees EOF. The accept loop of the server app
+ *     picks up fresh connections from the restored listener.
+ *
+ * Upstream's USK_EXTERN reject in open_unixsk_standalone is left
+ * intact — this function is called before it. Live-connection
+ * guarantees (queued bytes, SO_PEERCRED) are intentionally dropped
+ * across the external boundary; applications must handle reconnect.
+ */
+static int sk_shared_open_standalone(struct unix_sk_info *ui, int *sk_out)
+{
+	struct unix_sk_info *peer = ui->peer;
+	int sk;
+
+	if (peer->ue->name.len > 0) {
+		sk = socket(PF_UNIX, ui->ue->type, 0);
+		if (sk < 0) {
+			pr_perror("Can't make unix socket");
+			return -1;
+		}
+		if (sk_shared_connect_with_retry(sk,
+				(const char *)peer->ue->name.data,
+				peer->ue->name.len,
+				opts.timeout) < 0) {
+			close(sk);
+			return -1;
+		}
+	} else {
+		if (sk_shared_dead_acceptor_fd(ui->ue->type, &sk) < 0)
+			return -1;
+	}
+
+	ui->is_connected = true;
+	*sk_out = sk;
+	return 0;
+}
+
 static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 {
 	struct unix_sk_info *queuer = ui->queuer;
@@ -1964,62 +2071,28 @@ static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 		}
 
 		/*
-		 * External peer restore for stream/seqpacket.
-		 *
-		 * Asymmetric handling:
-		 *
-		 *  - "Connector" side (we issued the original connect):
-		 *    the stub carries the peer's listener path (recovered
-		 *    at dump time via getpeername). We recreate the
-		 *    connection by opening a fresh socket and connecting
-		 *    to that path, with retry+timeout so the peer's
-		 *    restore can race with ours.
-		 *
-		 *  - "Acceptor" side (we were accept()'ed from a listener):
-		 *    the stub has no name and there is nothing sensible
-		 *    to connect to. Create a dead socketpair and close
-		 *    the far end; the application sees EOF on the
-		 *    restored fd and its accept loop will pick up fresh
-		 *    connections from the listener (which is restored
-		 *    normally by the same CRIU invocation).
-		 *
-		 * Both paths give up live-connection-preservation
-		 * guarantees: queued bytes, SO_PEERCRED, etc. are not
-		 * preserved across the external boundary. Applications
-		 * that share a unix socket between containers must
-		 * handle EOF / reconnect — the same way they'd handle a
-		 * peer restart.
+		 * Alternative path for stream/seqpacket external peers
+		 * (shared sockets between containers). Handled by
+		 * sk_shared_open_standalone() above; on success we jump
+		 * straight to out. Upstream's --ext-unix-sk reject below
+		 * is untouched and still fires for dgram externals
+		 * without consent.
 		 */
 		if (ui->peer && (ui->peer->ue->uflags & USK_EXTERN) &&
-		    (ui->ue->type == SOCK_STREAM || ui->ue->type == SOCK_SEQPACKET)) {
-			struct unix_sk_info *peer = ui->peer;
-
-			/*
-			 * Shared-socket external-peer restore. Actual
-			 * logic (connect-with-retry on the connector side,
-			 * dead socketpair on the acceptor side) lives in
-			 * sk-unix-shared.c so this file stays close to
-			 * upstream.
-			 */
-			if (peer->ue->name.len > 0) {
-				sk = socket(PF_UNIX, ui->ue->type, 0);
-				if (sk < 0) {
-					pr_perror("Can't make unix socket");
-					return -1;
-				}
-				if (sk_shared_connect_with_retry(sk,
-						(const char *)peer->ue->name.data,
-						peer->ue->name.len,
-						opts.timeout) < 0) {
-					close(sk);
-					return -1;
-				}
-			} else {
-				if (sk_shared_dead_acceptor_fd(ui->ue->type, &sk) < 0)
-					return -1;
-			}
-			ui->is_connected = true;
+		    sk_shared_is_stream_ext_peer(ui->ue->type)) {
+			if (sk_shared_open_standalone(ui, &sk) < 0)
+				return -1;
 			goto out;
+		}
+
+		/*
+		 * Connect to external sockets requires
+		 * special option to be passed.
+		 */
+		if (ui->peer && (ui->peer->ue->uflags & USK_EXTERN) && !(opts.ext_unix_sk)) {
+			pr_err("External socket found in image. "
+			       "Consider using the --" USK_EXT_PARAM " option to allow restoring it.\n");
+			return -1;
 		}
 
 		sk = socket(PF_UNIX, ui->ue->type, 0);
