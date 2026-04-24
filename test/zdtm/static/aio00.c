@@ -8,6 +8,7 @@
 const char *test_doc = "Check that plain io_setup works";
 const char *test_author = "Pavel Emelianov <xemul@parallels.com>";
 
+// Trigger build to check kernel regression
 int main(int argc, char **argv)
 {
 	int ret;
