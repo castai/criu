@@ -22,6 +22,7 @@
 #include "sk-unix-shared.h"
 
 #define UNIX_SHARED_RETRY_FLOOR_S	60
+#define UNIX_SHARED_RETRY_CEILING_S	(24 * 60 * 60)
 #define UNIX_SHARED_RETRY_SLEEP_US	(100 * 1000)
 
 bool sk_shared_is_stream_ext_peer(int type)
@@ -49,11 +50,17 @@ char *sk_shared_getpeername_path(int inscope_fd, size_t *out_len)
 	}
 
 	path_len = strnlen(addr.sun_path, sizeof(addr.sun_path));
-	buf = xmalloc(path_len);
+	/*
+	 * Allocate one extra byte and NUL-terminate so the buffer is
+	 * also a valid C string. Callers currently use the length via
+	 * out_len, but the terminator keeps the contract robust.
+	 */
+	buf = xmalloc(path_len + 1);
 	if (!buf)
 		return NULL;
 
 	memcpy(buf, addr.sun_path, path_len);
+	buf[path_len] = '\0';
 	*out_len = path_len;
 	return buf;
 }
@@ -74,6 +81,8 @@ int sk_shared_connect_with_retry(int fd, const char *path, size_t path_len, int 
 
 	if (timeout_s < UNIX_SHARED_RETRY_FLOOR_S)
 		timeout_s = UNIX_SHARED_RETRY_FLOOR_S;
+	if (timeout_s > UNIX_SHARED_RETRY_CEILING_S)
+		timeout_s = UNIX_SHARED_RETRY_CEILING_S;
 	tries = timeout_s * (1000000 / UNIX_SHARED_RETRY_SLEEP_US);
 
 	for (i = 0; i < tries; i++) {
