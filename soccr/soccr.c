@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <unistd.h>
 #include "soccr.h"
 
 #ifndef SIOCOUTQNSD
@@ -525,9 +526,36 @@ static int libsoccr_set_sk_data_noq(struct libsoccr_sk *sk, struct libsoccr_sk_d
 	if (data->state == TCP_SYN_SENT && tcp_repair_off(sk->fd))
 		return -1;
 
-	if (connect(sk->fd, &sk->dst_addr->sa, addr_size) == -1 && errno != EINPROGRESS) {
-		logerr("Can't connect inet socket back");
-		return -1;
+	/*
+	 * During live container migration the destination node's network
+	 * interface (CNI/veth) may not be fully configured when CRIU begins
+	 * restoring TCP connections. In that case connect() fails with
+	 * EADDRNOTAVAIL because the source IP bound above is not yet routable.
+	 * Retry with exponential backoff to tolerate this transient race.
+	 */
+	{
+		int connect_ret;
+		unsigned int retry_usec = 10000; /* start at 10ms */
+		int i;
+
+		for (i = 0; i < 10; i++) {
+			connect_ret = connect(sk->fd, &sk->dst_addr->sa, addr_size);
+			if (connect_ret == 0 || errno == EINPROGRESS)
+				break;
+			if (errno != EADDRNOTAVAIL) {
+				logerr("Can't connect inet socket back");
+				return -1;
+			}
+			logd("connect() EADDRNOTAVAIL, retry %d/10 after %ums\n",
+			     i + 1, retry_usec / 1000);
+			usleep(retry_usec);
+			retry_usec = retry_usec * 2 < 1000000 ? retry_usec * 2 : 1000000;
+		}
+
+		if (connect_ret == -1 && errno != EINPROGRESS) {
+			logerr("Can't connect inet socket back after 10 retries");
+			return -1;
+		}
 	}
 
 	if (data->state == TCP_SYN_SENT && tcp_repair_on(sk->fd))
