@@ -532,9 +532,15 @@ static int libsoccr_set_sk_data_noq(struct libsoccr_sk *sk, struct libsoccr_sk_d
 	 * restoring TCP connections. In that case connect() fails with
 	 * EADDRNOTAVAIL because the source IP bound above is not yet routable.
 	 * Retry with exponential backoff to tolerate this transient race.
+	 *
+	 * EADDRNOTAVAIL is returned by the kernel before any socket state
+	 * change (inet_hash_connect() fails prior to tcp_set_state()), so
+	 * the socket remains clean and retrying is safe for all TCP states,
+	 * including TCP_SYN_SENT where repair mode has already been turned off.
 	 */
 	{
 		int connect_ret;
+		int saved_errno = 0;
 		unsigned int retry_usec = 10000; /* start at 10ms */
 		int i;
 
@@ -546,13 +552,15 @@ static int libsoccr_set_sk_data_noq(struct libsoccr_sk *sk, struct libsoccr_sk_d
 				logerr("Can't connect inet socket back");
 				return -1;
 			}
-			logd("connect() EADDRNOTAVAIL, retry %d/10 after %ums\n",
+			saved_errno = errno;
+			logd("connect() EADDRNOTAVAIL, retry %d/10 after %u ms\n",
 			     i + 1, retry_usec / 1000);
 			usleep(retry_usec);
 			retry_usec = retry_usec * 2 < 1000000 ? retry_usec * 2 : 1000000;
 		}
 
 		if (connect_ret == -1 && errno != EINPROGRESS) {
+			errno = saved_errno;
 			logerr("Can't connect inet socket back after 10 retries");
 			return -1;
 		}
