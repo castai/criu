@@ -7,11 +7,17 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 #include "soccr.h"
 
 #ifndef SIOCOUTQNSD
 /* MAO - Define SIOCOUTQNSD ioctl if we don't have it */
 #define SIOCOUTQNSD 0x894B
+#endif
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #endif
 
 enum {
@@ -463,6 +469,67 @@ static int set_queue_seq(struct libsoccr_sk *sk, int queue, __u32 seq)
 	return 0;
 }
 
+/* Exponential backoff parameters for connect() retries. */
+#define CONNECT_RETRY_COUNT	   10
+#define CONNECT_RETRY_INITIAL_USEC 10000   /* 10ms */
+#define CONNECT_RETRY_MAX_USEC	   1000000 /* 1s cap */
+
+/*
+ * Retry connect() with exponential backoff to tolerate transient network
+ * races during live migration (e.g. destination CNI/veth not yet routable
+ * when CRIU starts restoring TCP connections) and to gracefully skip
+ * stale destinations whose peer is gone.
+ *
+ * EADDRNOTAVAIL, ECONNREFUSED, ENETUNREACH, EHOSTUNREACH and ETIMEDOUT
+ * are all treated as transient/skip-eligible. For EADDRNOTAVAIL the
+ * kernel returns the error from inet_hash_connect() before tcp_set_state(),
+ * so the socket remains clean and retry is safe for all TCP states,
+ * including TCP_SYN_SENT where repair mode has already been turned off.
+ *
+ * On retry exhaustion we report the skip via *out_skipped; the caller
+ * will close the socket rather than fail the entire restore.
+ */
+static int connect_retry_and_maybe_skip(struct libsoccr_sk *sk, int addr_size, int *out_skipped)
+{
+	static const int retryable_errnos[] = {
+		EADDRNOTAVAIL, ECONNREFUSED, ENETUNREACH, EHOSTUNREACH, ETIMEDOUT
+	};
+	int saved_errno = 0;
+	unsigned int retry_usec = CONNECT_RETRY_INITIAL_USEC;
+	int i, j;
+	*out_skipped = 0;
+
+	for (i = 0; i < CONNECT_RETRY_COUNT; i++) {
+		if (connect(sk->fd, &sk->dst_addr->sa, addr_size) == 0 ||
+		    errno == EINPROGRESS)
+			return 0;
+
+		saved_errno = errno;
+		for (j = 0; j < ARRAY_SIZE(retryable_errnos); j++) {
+			if (saved_errno == retryable_errnos[j])
+				break;
+		}
+
+		if (j == ARRAY_SIZE(retryable_errnos)) {
+			logerr("Can't connect inet socket back");
+			return -1;
+		}
+
+		logd("connect() errno %d, retry %d/%d after %u ms\n",
+		     saved_errno, i + 1, CONNECT_RETRY_COUNT, retry_usec / 1000);
+		usleep(retry_usec);
+		/* Double the backoff (x << 1) and cap at CONNECT_RETRY_MAX_USEC. */
+		retry_usec = (retry_usec << 1) > CONNECT_RETRY_MAX_USEC ?
+				     CONNECT_RETRY_MAX_USEC :
+				     retry_usec << 1;
+	}
+
+	/* Preserve the last connect() errno for the caller; usleep/logd may clobber it. */
+	errno = saved_errno;
+	*out_skipped = 1;
+	return 0;
+}
+
 #ifndef TCPOPT_SACK_PERM
 #define TCPOPT_SACK_PERM TCPOPT_SACK_PERMITTED
 #endif
@@ -526,43 +593,35 @@ static int libsoccr_set_sk_data_noq(struct libsoccr_sk *sk, struct libsoccr_sk_d
 	if (data->state == TCP_SYN_SENT && tcp_repair_off(sk->fd))
 		return -1;
 
-	/*
-	 * During live container migration the destination node's network
-	 * interface (CNI/veth) may not be fully configured when CRIU begins
-	 * restoring TCP connections. In that case connect() fails with
-	 * EADDRNOTAVAIL because the source IP bound above is not yet routable.
-	 * Retry with exponential backoff to tolerate this transient race.
-	 *
-	 * EADDRNOTAVAIL is returned by the kernel before any socket state
-	 * change (inet_hash_connect() fails prior to tcp_set_state()), so
-	 * the socket remains clean and retrying is safe for all TCP states,
-	 * including TCP_SYN_SENT where repair mode has already been turned off.
-	 */
 	{
-		int connect_ret;
-		int saved_errno = 0;
-		unsigned int retry_usec = 10000; /* start at 10ms */
-		int i;
-
-		for (i = 0; i < 10; i++) {
-			connect_ret = connect(sk->fd, &sk->dst_addr->sa, addr_size);
-			if (connect_ret == 0 || errno == EINPROGRESS)
-				break;
-			if (errno != EADDRNOTAVAIL) {
-				logerr("Can't connect inet socket back");
-				return -1;
-			}
-			saved_errno = errno;
-			logd("connect() EADDRNOTAVAIL, retry %d/10 after %u ms\n",
-			     i + 1, retry_usec / 1000);
-			usleep(retry_usec);
-			retry_usec = retry_usec * 2 < 1000000 ? retry_usec * 2 : 1000000;
-		}
-
-		if (connect_ret == -1 && errno != EINPROGRESS) {
-			errno = saved_errno;
-			logerr("Can't connect inet socket back after 10 retries");
+		int skipped;
+		if (connect_retry_and_maybe_skip(sk, addr_size, &skipped))
 			return -1;
+		if (skipped) {
+			char src_str[INET6_ADDRSTRLEN] = "?";
+			char dst_str[INET6_ADDRSTRLEN] = "?";
+			uint16_t src_port = 0, dst_port = 0;
+			int saved_errno = errno;
+
+			if (sk->dst_addr->sa.sa_family == AF_INET) {
+				inet_ntop(AF_INET, &sk->src_addr->v4.sin_addr, src_str, sizeof(src_str));
+				inet_ntop(AF_INET, &sk->dst_addr->v4.sin_addr, dst_str, sizeof(dst_str));
+				src_port = ntohs(sk->src_addr->v4.sin_port);
+				dst_port = ntohs(sk->dst_addr->v4.sin_port);
+			} else {
+				inet_ntop(AF_INET6, &sk->src_addr->v6.sin6_addr, src_str, sizeof(src_str));
+				inet_ntop(AF_INET6, &sk->dst_addr->v6.sin6_addr, dst_str, sizeof(dst_str));
+				src_port = ntohs(sk->src_addr->v6.sin6_port);
+				dst_port = ntohs(sk->dst_addr->v6.sin6_port);
+			}
+
+			loge("Can't connect inet socket back %s:%u -> %s:%u after retries (errno %d), closing\n",
+			     src_str, src_port, dst_str, dst_port, saved_errno);
+			errno = saved_errno;
+			if (shutdown(sk->fd, SHUT_RDWR) && errno != ENOTCONN)
+				logerr("Unable to shutdown unreachable socket %s:%u -> %s:%u",
+				       src_str, src_port, dst_str, dst_port);
+			return 0;
 		}
 	}
 
