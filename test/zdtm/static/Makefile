@@ -129,6 +129,7 @@ TST_NOFILE	:=				\
 		socket-tcp-close2		\
 		socket-dump-tcp-close 		\
 		socket-tcp-localhost		\
+		socket-tcp-uid			\
 		socket-tcp-unconn		\
 		socket-tcp6-unconn		\
 		socket-tcp-syn-sent		\
