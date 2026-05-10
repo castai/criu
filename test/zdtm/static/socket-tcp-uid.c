@@ -19,32 +19,6 @@ const char *test_author = "Dmytro Bainak <dmytro.bainak@cast.ai>";
 
 static int port = 8880;
 
-static int read_data(int fd, unsigned char *buf, int size)
-{
-	int cur = 0, ret;
-
-	while (cur != size) {
-		ret = read(fd, buf + cur, size - cur);
-		if (ret <= 0)
-			return -1;
-		cur += ret;
-	}
-	return 0;
-}
-
-static int write_data(int fd, const unsigned char *buf, int size)
-{
-	int cur = 0, ret;
-
-	while (cur != size) {
-		ret = write(fd, buf + cur, size - cur);
-		if (ret <= 0)
-			return -1;
-		cur += ret;
-	}
-	return 0;
-}
-
 /*
  * Look up the uid column in /proc/net/tcp for the row whose inode
  * matches `ino`. Inode is unique across sockets, so this avoids
