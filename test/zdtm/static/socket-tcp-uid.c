@@ -141,10 +141,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* Pre-dump: confirm the kernel agrees the stamp took, so a
+	/* before dump: confirm the kernel agrees the stamp took, so a
 	 * failure after C/R is unambiguously a restore-side regression. */
 	if (fstat(fd, &st)) {
-		pr_perror("fstat pre-dump");
+		pr_perror("fstat failed BEFORE dump");
 		return 1;
 	}
 	got = sk_uid_for_inode(st.st_ino);

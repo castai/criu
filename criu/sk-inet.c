@@ -906,10 +906,10 @@ static int open_inet_sk(struct file_desc *d, int *new_fd)
 		old_fsuid = setfsuid(ie->uid);
 		if ((uid_t)setfsuid(-1) != ie->uid)
 			pr_warn("Couldn't set fsuid to %u for inet socket; "
-				"sk_uid will be %d. xt_owner rules may misbehave.\n",
+				"sk_uid will be %u. xt_owner rules may misbehave.\n",
 				ie->uid, old_fsuid);
 		else
-			pr_debug("Creating inet socket with fsuid %u (was %d)\n",
+			pr_debug("Creating inet socket with fsuid %u (was %u)\n",
 				 ie->uid, old_fsuid);
 		restore_fsuid = true;
 	}
