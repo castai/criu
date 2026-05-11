@@ -862,8 +862,6 @@ static int open_inet_sk(struct file_desc *d, int *new_fd)
 	struct inet_sk_info *ii;
 	InetSkEntry *ie;
 	int sk, yes = 1;
-	uid_t old_fsuid = 0;
-	bool restore_fsuid = false;
 
 	if (fle->stage >= FLE_OPEN)
 		return post_open_inet_sk(d, fle->fe->fd);
@@ -903,21 +901,21 @@ static int open_inet_sk(struct file_desc *d, int *new_fd)
 	 * userns and setfsuid will silently not take effect — we log a warning below so the symptom is visible.
 	 */
 	if (ie->has_uid) {
-		old_fsuid = setfsuid(ie->uid);
-		if ((uid_t)setfsuid(-1) != ie->uid)
-			pr_warn("Couldn't set fsuid to %u for inet socket; "
-				"sk_uid will be %u. xt_owner rules may misbehave.\n",
-				ie->uid, old_fsuid);
-		else
-			pr_debug("Creating inet socket with fsuid %u (was %u)\n",
-				 ie->uid, old_fsuid);
-		restore_fsuid = true;
+//		old_fsuid = setfsuid(ie->uid);
+//		if ((uid_t)setfsuid(-1) != ie->uid)
+//			pr_warn("Couldn't set fsuid to %u for inet socket; "
+//				"sk_uid will be %u. xt_owner rules may misbehave.\n",
+//				ie->uid, old_fsuid);
+//		else
+//			pr_debug("Creating inet socket with fsuid %u (was %u)\n",
+//				 ie->uid, old_fsuid);
+//		restore_fsuid = true;
 	}
 
 	sk = socket(ie->family, ie->type, ie->proto);
 
-	if (restore_fsuid)
-		setfsuid(old_fsuid);
+//	if (restore_fsuid)
+//		setfsuid(old_fsuid);
 
 	if (sk < 0) {
 		pr_perror("Can't create inet socket");
