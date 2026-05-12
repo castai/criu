@@ -17,7 +17,9 @@
 #include <linux/in.h>
 #include <linux/in6.h>
 
+// == CastAI Live patches ==
 #include <sys/fsuid.h>
+// == CastAI Live patches ==
 
 #include "../soccr/soccr.h"
 
@@ -273,7 +275,9 @@ static struct inet_sk_desc *gen_uncon_sk(int lfd, const struct fd_parms *p, int 
 
 	sk->sd.family = family;
 	sk->type = type;
+    // == CastAI Live patches ==
 	sk->uid = p->stat.st_uid;
+    // == CastAI Live patches ==
 
 	if (sk->sd.family == AF_INET)
 		aux = sizeof(struct sockaddr_in);
@@ -529,8 +533,10 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 	ie.dst_port = sk->dst_port;
 	ie.backlog = sk->wqlen;
 	ie.flags = p->flags;
+    // == CastAI Live patches ==
 	ie.uid = sk->uid;
 	ie.has_uid = true;
+    // == CastAI Live patches ==
 
 	ie.fown = (FownEntry *)&p->fown;
 	ie.opts = &skopts;
@@ -862,8 +868,10 @@ static int open_inet_sk(struct file_desc *d, int *new_fd)
 	struct inet_sk_info *ii;
 	InetSkEntry *ie;
 	int sk, yes = 1;
+    // == CastAI Live patches ==
 	uid_t old_fsuid = 0;
 	bool restore_fsuid = false;
+    // == CastAI Live patches ==
 
 	if (fle->stage >= FLE_OPEN)
 		return post_open_inet_sk(d, fle->fe->fd);
@@ -892,6 +900,7 @@ static int open_inet_sk(struct file_desc *d, int *new_fd)
 	if (run_setsockcreatecon(fle->fe))
 		return -1;
 
+    // == CastAI Live patches ==
 	/*
 	 * The kernel stamps sk->sk_uid from current_fsuid() at socket creation and exposes no interface to change it later.
 	 * To preserve the dumped uid (so xt_owner --uid-owner rules keep working after restore), switch fsuid around socket(2).
@@ -913,11 +922,14 @@ static int open_inet_sk(struct file_desc *d, int *new_fd)
 				 ie->uid, old_fsuid);
 		restore_fsuid = true;
 	}
+    // == CastAI Live patches ==
 
 	sk = socket(ie->family, ie->type, ie->proto);
 
+    // == CastAI Live patches ==
 	if (restore_fsuid)
 		setfsuid(old_fsuid);
+    // == CastAI Live patches ==
 
 	if (sk < 0) {
 		pr_perror("Can't create inet socket");

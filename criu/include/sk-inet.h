@@ -41,7 +41,9 @@ struct inet_sk_desc {
 	unsigned int dst_addr[4];
 	unsigned short shutdown;
 	bool cork;
+    // == CastAI Live patches ==
 	unsigned int uid;
+    // == CastAI Live patches ==
 
 	int rfd;
 	int cpt_reuseaddr;
