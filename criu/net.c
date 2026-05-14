@@ -46,6 +46,7 @@
 #include "external.h"
 #include "fdstore.h"
 #include "netfilter.h"
+#include "net-clm-conntrack.h"
 
 #include "protobuf.h"
 #include "images/netdev.pb-c.h"
@@ -948,10 +949,7 @@ static int dump_one_nf(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 	if (lazy_image(img) && open_image_lazy(img))
 		return -1;
 
-	if (write_img_buf(img, hdr, hdr->nlmsg_len))
-		return -1;
-
-	return 0;
+	return dump_nf_ct_msg(img, hdr);
 }
 
 static int ct_restore_callback(struct nlmsghdr *nlh)
@@ -1055,8 +1053,24 @@ static int restore_nf_ct(int pid, int type)
 
 		nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
 		ret = do_rtnl_req(sk, nlh, nlh->nlmsg_len, NULL, NULL, NULL, NULL);
-		if (ret)
+		if (ret) {
+			uint8_t *b = (uint8_t *)nlh;
+			uint32_t len = nlh->nlmsg_len;
+			uint32_t off;
+
+			pr_err("nf_ct restore failed (ret=%d), message len=%u, bytes:\n", ret, len);
+			for (off = 0; off < len; off += 16) {
+				uint32_t i, end = off + 16 < len ? off + 16 : len;
+				char line[3 * 16 + 1];
+				char *p = line;
+
+				for (i = off; i < end; i++)
+					p += sprintf(p, "%02x ", b[i]);
+				*p = '\0';
+				pr_err("  %04x: %s\n", off, line);
+			}
 			goto out;
+		}
 	}
 
 	exit_code = 0;

@@ -46,6 +46,7 @@ obj-y			+= filesystems.o
 obj-y			+= namespaces.o
 obj-y			+= netfilter.o
 obj-y			+= net.o
+obj-y			+= net-clm-conntrack.o
 obj-y			+= pagemap-cache.o
 obj-y			+= page-pipe.o
 obj-y			+= pagemap.o
