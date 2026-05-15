@@ -1,10 +1,12 @@
 #include <unistd.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <linux/netfilter/nfnetlink.h>
 #include <linux/netfilter/nfnetlink_conntrack.h>
 #include <linux/netfilter/nf_conntrack_tcp.h>
+#include <linux/netfilter/nf_conntrack_common.h>
 #include <string.h>
 #include <net/if_arp.h>
 #include <sys/wait.h>
@@ -941,12 +943,44 @@ static int dump_one_link(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 	return ret;
 }
 
+static int is_nf_dsnat(struct nlmsghdr *hdr)
+{
+    struct nfgenmsg *nfm;
+    struct nlattr *tb[CTA_MAX + 1];
+
+    if (hdr->nlmsg_len < NLMSG_LENGTH(sizeof(struct nfgenmsg)))
+        return 0;
+
+    nfm = NLMSG_DATA(hdr);
+    if (nfm->nfgen_family != AF_INET && nfm->nfgen_family != AF_INET6)
+        return 0;
+
+    if (nlmsg_parse(hdr, sizeof(struct nfgenmsg), tb, CTA_MAX, NULL) < 0)
+        return 0;
+
+    if (!tb[CTA_STATUS] || !tb[CTA_TUPLE_REPLY] || !tb[CTA_TUPLE_ORIG])
+        return 0;
+
+    // skip entries with NAT, we can't restore them properly
+    uint32_t status = ntohl(nla_get_u32(tb[CTA_STATUS]));
+    return status & (IPS_SRC_NAT | IPS_DST_NAT);
+}
+
 static int dump_one_nf(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 {
 	struct cr_img *img = arg;
 
 	if (lazy_image(img) && open_image_lazy(img))
 		return -1;
+
+	// == CastAI Live patches ==
+	// Skip conntrack entries with NAT. Kernel strips IPS_SRC_NAT|IPS_DST_NAT flags from such entries,
+	// they are restored as non-NAT entries, pretty much breaking such connections.
+    if (is_nf_dsnat(hdr)) {
+        pr_info("Skipping conntrack entry with NAT\n");
+        return 0;
+    }
+	// == CastAI Live patches ==
 
 	if (write_img_buf(img, hdr, hdr->nlmsg_len))
 		return -1;
