@@ -943,10 +943,12 @@ static int dump_one_link(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 	return ret;
 }
 
+// == CastAI Live patches ==
 static int is_nf_dsnat(struct nlmsghdr *hdr)
 {
     struct nfgenmsg *nfm;
     struct nlattr *tb[CTA_MAX + 1];
+	uint32_t status;
 
     if (hdr->nlmsg_len < NLMSG_LENGTH(sizeof(struct nfgenmsg)))
         return 0;
@@ -962,9 +964,10 @@ static int is_nf_dsnat(struct nlmsghdr *hdr)
         return 0;
 
     // skip entries with NAT, we can't restore them properly
-    uint32_t status = ntohl(nla_get_u32(tb[CTA_STATUS]));
+    status = ntohl(nla_get_u32(tb[CTA_STATUS]));
     return status & (IPS_SRC_NAT | IPS_DST_NAT);
 }
+// == CastAI Live patches ==
 
 static int dump_one_nf(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 {
@@ -977,7 +980,7 @@ static int dump_one_nf(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 	// Skip conntrack entries with NAT. Kernel strips IPS_SRC_NAT|IPS_DST_NAT flags from such entries,
 	// they are restored as non-NAT entries, pretty much breaking such connections.
     if (is_nf_dsnat(hdr)) {
-        pr_info("Skipping conntrack entry with NAT\n");
+        pr_warn("Skipping conntrack entry with NAT\n");
         return 0;
     }
 	// == CastAI Live patches ==
