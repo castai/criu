@@ -960,7 +960,7 @@ static int is_nf_dsnat(struct nlmsghdr *hdr)
     if (nlmsg_parse(hdr, sizeof(struct nfgenmsg), tb, CTA_MAX, NULL) < 0)
         return 0;
 
-    if (!tb[CTA_STATUS] || !tb[CTA_TUPLE_REPLY] || !tb[CTA_TUPLE_ORIG])
+    if (!tb[CTA_STATUS])
         return 0;
 
     // skip entries with NAT, we can't restore them properly
