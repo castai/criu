@@ -51,9 +51,10 @@ int main(int argc, char **argv)
 	unsigned char buf[BUF_SIZE];
 	int fd, fd_s;
 	pid_t extpid;
-	uint32_t crc;
+	uint32_t crc = 0;
 	int real_port = 8880;
 	char rule[256];
+    int ret = 0;
 
 	if (unshare(CLONE_NEWNET)) {
 		pr_perror("unshare");
@@ -102,13 +103,15 @@ int main(int argc, char **argv)
 			return 1;
 
         // Pre-migration round-trip: server -> client, client -> server.
-        if (int ret = read_write_data(fd, buf, BUF_SIZE, &crc); ret) {
+        ret = read_write_data(fd, buf, BUF_SIZE, &crc);
+        if (ret) {
             pr_err("pre-migration data exchange failed: %d\n", ret);
             return 1;
         }
 
         // Post-migration round-trip: server -> client, client -> server.
-        if (int ret = read_write_data(fd, buf, BUF_SIZE, &crc); ret) {
+        ret = read_write_data(fd, buf, BUF_SIZE, &crc);
+        if (ret) {
             pr_err("post-migration data exchange failed: %d\n", ret);
             return 1;
         }
@@ -122,7 +125,8 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (int ret = write_read_data(fd, buf, BUF_SIZE, &crc); ret) {
+    ret = write_read_data(fd, buf, BUF_SIZE, &crc);
+	if (ret) {
         pr_err("pre-migration data exchange failed: %d\n", ret);
         return 1;
     }
@@ -130,7 +134,8 @@ int main(int argc, char **argv)
 	test_daemon();
 	test_waitsig();
 
-    if (int ret = write_read_data(fd, buf, BUF_SIZE, &crc); ret) {
+    ret = write_read_data(fd, buf, BUF_SIZE, &crc);
+    if (ret) {
         pr_err("post-migration data exchange failed: %d\n", ret);
         return 1;
     }

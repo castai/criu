@@ -29,7 +29,6 @@
  * kernel's ctnetlink_setup_nat() and re-binds NAT (which in turn sets the
  * status bits naturally).
  */
-
 static int nat_nested_from_tuple_ip_port(uint8_t *out, int max, int nest_type,
 					  uint8_t family, const void *ip, uint16_t port_be)
 {
@@ -138,13 +137,13 @@ static int parse_reply_tuple(const struct nlattr *tuple_reply, uint8_t *family,
 }
 
 /*
- * In-place rewrite: make `reply_tuple`'s leaf IP/port fields the inverse of
- * `orig_tuple` (swap src<->dst). Sizes are identical to the originals, so no
- * realloc is needed. Used together with synthesized CTA_NAT_*: the kernel's
- * nf_nat_setup_info() only flips IPS_*_NAT when its computed new_tuple
- * differs from invert(reply). Sending invert(orig) as the reply (i.e. the
- * pre-NAT form) guarantees that difference, so the rewrite materializes and
- * the bits are set as a side effect.
+ * In-place rewrite: make `reply_tuple`'s leaf IP/port fields the inverse of `orig_tuple` (swap src<->dst).
+ * Sizes are identical to the originals, so no realloc is needed.
+ *
+ * Used together with synthesized CTA_NAT_*: the kernel's nf_nat_setup_info() only flips IPS_*_NAT
+ * when its computed new_tuple differs from invert(reply).
+ * Sending invert(orig) as the reply (i.e. the pre-NAT form) guarantees that difference,
+ * so the rewrite materializes and the bits are set as a side effect.
  */
 static int invert_orig_into_reply(struct nlattr *orig_tuple, struct nlattr *reply_tuple)
 {
@@ -273,12 +272,10 @@ int dump_one_nf_dsnat(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 	new_hdr->nlmsg_len = NLMSG_ALIGN(old_len) + appended_len;
 
 	/*
-	 * Replace the (post-NAT) reply tuple in the dumped message with
-	 * invert(orig). On replay, that gives ctnetlink_setup_nat() a
-	 * non-trivial range to apply, so the kernel re-derives the post-NAT
-	 * reply tuple from our CTA_NAT_* and sets IPS_*_NAT. Without this
-	 * rewrite, new_tuple == invert(reply) and the bit-flipping branch in
-	 * nf_nat_setup_info() is skipped.
+	 * Replace the (post-NAT) reply tuple in the dumped message with invert(orig).
+	 * On replay, that gives ctnetlink_setup_nat() a non-trivial range to apply,
+	 * so the kernel re-derives the post-NAT reply tuple from our CTA_NAT_* and sets IPS_*_NAT.
+	 * Without this rewrite, new_tuple == invert(reply) and the bit-flipping¸ the branch in nf_nat_setup_info() is skipped.
 	 */
 	{
 		struct nlattr *new_tb[CTA_MAX + 1];
