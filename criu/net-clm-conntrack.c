@@ -102,18 +102,26 @@ static int nat_nested_from_tuple_ip_port(uint8_t *out, int max, int nest_type,
 }
 
 /*
- * Parse a 'tuple-attrs' to pull out (family, src_ip, src_port, dst_ip, dst_port) in the on-wire form.
- * Returns 0 on success, -1 on malformed input.
+ * Raw decoded view of a CTA_TUPLE_{ORIG,REPLY}.
+ * Ports stay in network byte order — callers ntohs() if they want host order.
+ * IP pointers reference int the original netlink buffer.
  */
-static int parse_tuple_attrs(const struct nlattr *tuple_reply, uint8_t *family,
-			     const void **src_ip, uint16_t *src_port,
-			     const void **dst_ip, uint16_t *dst_port)
+struct ct_tuple_view {
+	uint8_t family;
+	uint8_t l4proto;
+	const void *src_ip;
+	const void *dst_ip;
+	uint16_t src_port_be;
+	uint16_t dst_port_be;
+};
+
+static int decode_ct_tuple(struct nlattr *tuple, struct ct_tuple_view *v)
 {
 	struct nlattr *tb[CTA_TUPLE_MAX + 1];
 	struct nlattr *tb_ip[CTA_IP_MAX + 1];
 	struct nlattr *tb_proto[CTA_PROTO_MAX + 1];
 
-	if (nla_parse_nested(tb, CTA_TUPLE_MAX, (struct nlattr *)tuple_reply, NULL) < 0)
+	if (nla_parse_nested(tb, CTA_TUPLE_MAX, tuple, NULL) < 0)
 		return -1;
 	if (!tb[CTA_TUPLE_IP] || !tb[CTA_TUPLE_PROTO])
 		return -1;
@@ -123,13 +131,13 @@ static int parse_tuple_attrs(const struct nlattr *tuple_reply, uint8_t *family,
 		return -1;
 
 	if (tb_ip[CTA_IP_V4_SRC] && tb_ip[CTA_IP_V4_DST]) {
-		*family = AF_INET;
-		*src_ip = nla_data(tb_ip[CTA_IP_V4_SRC]);
-		*dst_ip = nla_data(tb_ip[CTA_IP_V4_DST]);
+		v->family = AF_INET;
+		v->src_ip = nla_data(tb_ip[CTA_IP_V4_SRC]);
+		v->dst_ip = nla_data(tb_ip[CTA_IP_V4_DST]);
 	} else if (tb_ip[CTA_IP_V6_SRC] && tb_ip[CTA_IP_V6_DST]) {
-		*family = AF_INET6;
-		*src_ip = nla_data(tb_ip[CTA_IP_V6_SRC]);
-		*dst_ip = nla_data(tb_ip[CTA_IP_V6_DST]);
+		v->family = AF_INET6;
+		v->src_ip = nla_data(tb_ip[CTA_IP_V6_SRC]);
+		v->dst_ip = nla_data(tb_ip[CTA_IP_V6_DST]);
 	} else {
 		return -1;
 	}
@@ -137,8 +145,9 @@ static int parse_tuple_attrs(const struct nlattr *tuple_reply, uint8_t *family,
 	if (!tb_proto[CTA_PROTO_SRC_PORT] || !tb_proto[CTA_PROTO_DST_PORT])
 		return -1;
 
-	*src_port = *(uint16_t *)nla_data(tb_proto[CTA_PROTO_SRC_PORT]);
-	*dst_port = *(uint16_t *)nla_data(tb_proto[CTA_PROTO_DST_PORT]);
+	v->l4proto = tb_proto[CTA_PROTO_NUM] ? nla_get_u8(tb_proto[CTA_PROTO_NUM]) : 0;
+	v->src_port_be = *(uint16_t *)nla_data(tb_proto[CTA_PROTO_SRC_PORT]);
+	v->dst_port_be = *(uint16_t *)nla_data(tb_proto[CTA_PROTO_DST_PORT]);
 	return 0;
 }
 
@@ -219,9 +228,7 @@ int is_nf_dsnat(struct nlmsghdr *hdr)
 int dump_one_nf_dsnat(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 {
 	struct nlattr *tb[CTA_MAX + 1];
-	uint8_t family;
-	const void *rsrc_ip, *rdst_ip;
-	uint16_t rsrc_port, rdst_port;
+	struct ct_tuple_view reply;
 	struct nlmsghdr *new_hdr;
 	uint32_t old_len;
 	uint8_t appended[4096]; /* max 2 * CTA_NAT_* nestings, always fits */
@@ -238,14 +245,14 @@ int dump_one_nf_dsnat(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 
 	status = ntohl(nla_get_u32(tb[CTA_STATUS]));
 
-	if (parse_tuple_attrs(tb[CTA_TUPLE_REPLY], &family, &rsrc_ip, &rsrc_port, &rdst_ip, &rdst_port) < 0)
+	if (decode_ct_tuple(tb[CTA_TUPLE_REPLY], &reply) < 0)
 		return 1;
 
 	if (status & IPS_DST_NAT) {
 		/* orig.dst was rewritten; reply.src reveals the rewrite target */
 		n = nat_nested_from_tuple_ip_port(appended + appended_len,
 				sizeof(appended) - appended_len, CTA_NAT_DST,
-				family, rsrc_ip, rsrc_port);
+				reply.family, reply.src_ip, reply.src_port_be);
 		if (n < 0)
 			return 1;
 		appended_len += n;
@@ -254,7 +261,7 @@ int dump_one_nf_dsnat(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 		/* orig.src was rewritten; reply.dst reveals the rewrite target */
 		n = nat_nested_from_tuple_ip_port(appended + appended_len,
 				sizeof(appended) - appended_len, CTA_NAT_SRC,
-				family, rdst_ip, rdst_port);
+				reply.family, reply.dst_ip, reply.dst_port_be);
 		if (n < 0)
 			return 1;
 		appended_len += n;
@@ -300,49 +307,26 @@ int dump_one_nf_dsnat(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 ///
 
 /*
- * Decode a single conntrack tuple (CTA_TUPLE_ORIG or CTA_TUPLE_REPLY) into printable form.
- * src_ip/dst_ip get an INET6_ADDRSTRLEN-sized buffer; ports are returned in host order.
- * Returns 0 on success, -1 if the tuple is incomplete or malformed.
+ * Decode a tuple into printable form for logging. Family is inferred from the
+ * tuple itself (caller can cross-check against nfgen_family). Ports are
+ * returned in host order. Returns 0 on success, -1 on malformed input.
  */
-static int format_ct_tuple(struct nlattr *tuple, uint8_t family,
+static int format_ct_tuple(struct nlattr *tuple,
 			   char *src_ip, char *dst_ip, size_t ip_len,
 			   uint8_t *l4proto, uint16_t *src_port,
 			   uint16_t *dst_port)
 {
-	struct nlattr *tb[CTA_TUPLE_MAX + 1];
-	struct nlattr *tb_ip[CTA_IP_MAX + 1];
-	struct nlattr *tb_proto[CTA_PROTO_MAX + 1];
-	const void *src_raw, *dst_raw;
+	struct ct_tuple_view v;
 
-	if (nla_parse_nested(tb, CTA_TUPLE_MAX, tuple, NULL) < 0)
+	if (decode_ct_tuple(tuple, &v) < 0)
 		return -1;
-	if (!tb[CTA_TUPLE_IP] || !tb[CTA_TUPLE_PROTO])
-		return -1;
-	if (nla_parse_nested(tb_ip, CTA_IP_MAX, tb[CTA_TUPLE_IP], NULL) < 0)
-		return -1;
-	if (nla_parse_nested(tb_proto, CTA_PROTO_MAX, tb[CTA_TUPLE_PROTO], NULL) < 0)
+	if (!inet_ntop(v.family, v.src_ip, src_ip, ip_len) ||
+	    !inet_ntop(v.family, v.dst_ip, dst_ip, ip_len))
 		return -1;
 
-	if (family == AF_INET) {
-		if (!tb_ip[CTA_IP_V4_SRC] || !tb_ip[CTA_IP_V4_DST])
-			return -1;
-		src_raw = nla_data(tb_ip[CTA_IP_V4_SRC]);
-		dst_raw = nla_data(tb_ip[CTA_IP_V4_DST]);
-	} else {
-		if (!tb_ip[CTA_IP_V6_SRC] || !tb_ip[CTA_IP_V6_DST])
-			return -1;
-		src_raw = nla_data(tb_ip[CTA_IP_V6_SRC]);
-		dst_raw = nla_data(tb_ip[CTA_IP_V6_DST]);
-	}
-
-	if (!inet_ntop(family, src_raw, src_ip, ip_len))
-		return -1;
-	if (!inet_ntop(family, dst_raw, dst_ip, ip_len))
-		return -1;
-
-	*l4proto = tb_proto[CTA_PROTO_NUM] ? nla_get_u8(tb_proto[CTA_PROTO_NUM]) : 0;
-	*src_port = tb_proto[CTA_PROTO_SRC_PORT] ? ntohs(*(uint16_t *)nla_data(tb_proto[CTA_PROTO_SRC_PORT])) : 0;
-	*dst_port = tb_proto[CTA_PROTO_DST_PORT] ? ntohs(*(uint16_t *)nla_data(tb_proto[CTA_PROTO_DST_PORT])) : 0;
+	*l4proto = v.l4proto;
+	*src_port = ntohs(v.src_port_be);
+	*dst_port = ntohs(v.dst_port_be);
 	return 0;
 }
 
@@ -367,9 +351,9 @@ void log_ct_entry(struct nlmsghdr *nlh)
 	if (tb[CTA_STATUS])
 		status = ntohl(nla_get_u32(tb[CTA_STATUS]));
 	if (tb[CTA_TUPLE_ORIG])
-		format_ct_tuple(tb[CTA_TUPLE_ORIG], nfm->nfgen_family, o_src, o_dst, sizeof(o_src), &o_proto, &o_sp, &o_dp);
+		format_ct_tuple(tb[CTA_TUPLE_ORIG], o_src, o_dst, sizeof(o_src), &o_proto, &o_sp, &o_dp);
 	if (tb[CTA_TUPLE_REPLY])
-		format_ct_tuple(tb[CTA_TUPLE_REPLY], nfm->nfgen_family, r_src, r_dst, sizeof(r_src), &r_proto, &r_sp, &r_dp);
+		format_ct_tuple(tb[CTA_TUPLE_REPLY], r_src, r_dst, sizeof(r_src), &r_proto, &r_sp, &r_dp);
 
 	pr_err("CT restore: %s proto=%u orig=%s:%u->%s:%u reply=%s:%u->%s:%u "
 	       "status=0x%08x%s%s%s%s%s%s%s\n",
