@@ -10,25 +10,29 @@
 #include "net-clm-conntrack.h"
 
 /*
- * The kernel's conntrack dump path (IPCTNL_MSG_CT_GET, NLM_F_DUMP) never emits
- * CTA_NAT_SRC / CTA_NAT_DST — those attributes are input-only, consumed by
- * IPCTNL_MSG_CT_NEW to bind a NAT extension to the entry. And CTA_STATUS bits
- * IPS_{SRC,DST}_NAT{,_DONE} are in IPS_UNCHANGEABLE_MASK in the kernel, so
- * ctnetlink_change_status() silently strips them on replay.
+ * Modern Linux kernel source code includes a 'specs/conntrack.yaml' with a schema of conntrack netlink messages.
+ * E.g. https://docs.kernel.org/_sources/netlink/specs/conntrack.yaml.txt .
+ */
+
+/*
+ * The kernel's conntrack dump path (IPCTNL_MSG_CT_GET, NLM_F_DUMP) never emits CTA_NAT_SRC / CTA_NAT_DST.
+ * Those attributes are input-only, consumed by IPCTNL_MSG_CT_NEW to bind a NAT extension to the entry.
+ * CTA_STATUS bits IPS_{SRC,DST}_NAT{,_DONE} are in IPS_UNCHANGEABLE_MASK in the kernel,
+ * so ctnetlink_change_status() strips them on replay.
  *
- * Result: round-tripping conntrack via dump→restore loses NAT bindings — the
- * flow is re-tracked but reply packets are no longer reverse-translated,
- * breaking e.g. Istio's REDIRECT-based sidecar interception across migration.
+ * Result: round-tripping conntrack via dump→restore loses NAT bindings — the flow is re-tracked
+ * but reply packets are not reverse-translated, breaking Istio's REDIRECT-based sidecar interception across migration.
  *
  * The NAT rewrite is recoverable from the two tuples the kernel does emit:
  *   reply.src <=> post-DNAT form of orig.dst   (when IPS_DST_NAT set)
  *   reply.dst <=> post-SNAT form of orig.src   (when IPS_SRC_NAT set)
  *
- * Synthesize CTA_NAT_SRC/CTA_NAT_DST from this delta at dump time so that the
- * on-disk message, when replayed through IPCTNL_MSG_CT_NEW, triggers the
- * kernel's ctnetlink_setup_nat() and re-binds NAT (which in turn sets the
- * status bits naturally).
+ * Synthesize CTA_NAT_SRC/CTA_NAT_DST from this delta at dump time so that the on-disk message,
+ * when replayed through IPCTNL_MSG_CT_NEW,
+ * triggers the kernel's ctnetlink_setup_nat() and re-binds NAT (which sets the status bits naturally).
  */
+
+
 static int nat_nested_from_tuple_ip_port(uint8_t *out, int max, int nest_type,
 					  uint8_t family, const void *ip, uint16_t port_be)
 {
@@ -72,6 +76,7 @@ static int nat_nested_from_tuple_ip_port(uint8_t *out, int max, int nest_type,
 	proto_attr->nla_type = CTA_NAT_PROTO | NLA_F_NESTED;
 	p += NLA_HDRLEN;
 
+    // CTA_NAT_PROTO -> CTA_PROTONAT_PORT_MIN
 	len = NLA_HDRLEN + sizeof(uint16_t);
 	if ((p - out) + 2 * NLA_ALIGN(len) > max)
 		return -1;
@@ -82,6 +87,7 @@ static int nat_nested_from_tuple_ip_port(uint8_t *out, int max, int nest_type,
 	memset(p + NLA_HDRLEN + sizeof(uint16_t), 0, NLA_ALIGN(len) - len);
 	p += NLA_ALIGN(len);
 
+    // CTA_NAT_PROTO -> CTA_PROTONAT_PORT_MAX
 	ip_attr = (struct nlattr *)p;
 	ip_attr->nla_type = CTA_PROTONAT_PORT_MAX;
 	ip_attr->nla_len = len;
@@ -96,10 +102,10 @@ static int nat_nested_from_tuple_ip_port(uint8_t *out, int max, int nest_type,
 }
 
 /*
- * Parse the reply tuple to pull out (family, src_ip, src_port, dst_ip, dst_port)
- * in the on-wire form. Returns 0 on success, -1 on malformed input.
+ * Parse a 'tuple-attrs' to pull out (family, src_ip, src_port, dst_ip, dst_port) in the on-wire form.
+ * Returns 0 on success, -1 on malformed input.
  */
-static int parse_reply_tuple(const struct nlattr *tuple_reply, uint8_t *family,
+static int parse_tuple_attrs(const struct nlattr *tuple_reply, uint8_t *family,
 			     const void **src_ip, uint16_t *src_port,
 			     const void **dst_ip, uint16_t *dst_port)
 {
@@ -177,10 +183,8 @@ static int invert_orig_into_reply(struct nlattr *orig_tuple, struct nlattr *repl
 	if (!o_pr[CTA_PROTO_SRC_PORT] || !o_pr[CTA_PROTO_DST_PORT] ||
 	    !r_pr[CTA_PROTO_SRC_PORT] || !r_pr[CTA_PROTO_DST_PORT])
 		return -1;
-	memcpy(nla_data(r_pr[CTA_PROTO_SRC_PORT]),
-	       nla_data(o_pr[CTA_PROTO_DST_PORT]), sizeof(uint16_t));
-	memcpy(nla_data(r_pr[CTA_PROTO_DST_PORT]),
-	       nla_data(o_pr[CTA_PROTO_SRC_PORT]), sizeof(uint16_t));
+	memcpy(nla_data(r_pr[CTA_PROTO_SRC_PORT]), nla_data(o_pr[CTA_PROTO_DST_PORT]), sizeof(uint16_t));
+	memcpy(nla_data(r_pr[CTA_PROTO_DST_PORT]), nla_data(o_pr[CTA_PROTO_SRC_PORT]), sizeof(uint16_t));
 	return 0;
 }
 
@@ -234,7 +238,7 @@ int dump_one_nf_dsnat(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 
 	status = ntohl(nla_get_u32(tb[CTA_STATUS]));
 
-	if (parse_reply_tuple(tb[CTA_TUPLE_REPLY], &family, &rsrc_ip, &rsrc_port, &rdst_ip, &rdst_port) < 0)
+	if (parse_tuple_attrs(tb[CTA_TUPLE_REPLY], &family, &rsrc_ip, &rsrc_port, &rdst_ip, &rdst_port) < 0)
 		return 1;
 
 	if (status & IPS_DST_NAT) {
@@ -293,11 +297,12 @@ int dump_one_nf_dsnat(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 	return ret;
 }
 
+///
+
 /*
- * Decode a single conntrack tuple (CTA_TUPLE_ORIG or CTA_TUPLE_REPLY) into
- * printable form. src_ip/dst_ip get an INET6_ADDRSTRLEN-sized buffer; ports
- * are returned in host order. Returns 0 on success, -1 if the tuple is
- * incomplete or malformed.
+ * Decode a single conntrack tuple (CTA_TUPLE_ORIG or CTA_TUPLE_REPLY) into printable form.
+ * src_ip/dst_ip get an INET6_ADDRSTRLEN-sized buffer; ports are returned in host order.
+ * Returns 0 on success, -1 if the tuple is incomplete or malformed.
  */
 static int format_ct_tuple(struct nlattr *tuple, uint8_t family,
 			   char *src_ip, char *dst_ip, size_t ip_len,
@@ -308,7 +313,6 @@ static int format_ct_tuple(struct nlattr *tuple, uint8_t family,
 	struct nlattr *tb_ip[CTA_IP_MAX + 1];
 	struct nlattr *tb_proto[CTA_PROTO_MAX + 1];
 	const void *src_raw, *dst_raw;
-	int af = (family == AF_INET) ? AF_INET : AF_INET6;
 
 	if (nla_parse_nested(tb, CTA_TUPLE_MAX, tuple, NULL) < 0)
 		return -1;
@@ -331,16 +335,14 @@ static int format_ct_tuple(struct nlattr *tuple, uint8_t family,
 		dst_raw = nla_data(tb_ip[CTA_IP_V6_DST]);
 	}
 
-	if (!inet_ntop(af, src_raw, src_ip, ip_len))
+	if (!inet_ntop(family, src_raw, src_ip, ip_len))
 		return -1;
-	if (!inet_ntop(af, dst_raw, dst_ip, ip_len))
+	if (!inet_ntop(family, dst_raw, dst_ip, ip_len))
 		return -1;
 
 	*l4proto = tb_proto[CTA_PROTO_NUM] ? nla_get_u8(tb_proto[CTA_PROTO_NUM]) : 0;
-	*src_port = tb_proto[CTA_PROTO_SRC_PORT]
-				? ntohs(*(uint16_t *)nla_data(tb_proto[CTA_PROTO_SRC_PORT])) : 0;
-	*dst_port = tb_proto[CTA_PROTO_DST_PORT]
-				? ntohs(*(uint16_t *)nla_data(tb_proto[CTA_PROTO_DST_PORT])) : 0;
+	*src_port = tb_proto[CTA_PROTO_SRC_PORT] ? ntohs(*(uint16_t *)nla_data(tb_proto[CTA_PROTO_SRC_PORT])) : 0;
+	*dst_port = tb_proto[CTA_PROTO_DST_PORT] ? ntohs(*(uint16_t *)nla_data(tb_proto[CTA_PROTO_DST_PORT])) : 0;
 	return 0;
 }
 
@@ -365,13 +367,9 @@ void log_ct_entry(struct nlmsghdr *nlh)
 	if (tb[CTA_STATUS])
 		status = ntohl(nla_get_u32(tb[CTA_STATUS]));
 	if (tb[CTA_TUPLE_ORIG])
-		format_ct_tuple(tb[CTA_TUPLE_ORIG], nfm->nfgen_family,
-				o_src, o_dst, sizeof(o_src),
-				&o_proto, &o_sp, &o_dp);
+		format_ct_tuple(tb[CTA_TUPLE_ORIG], nfm->nfgen_family, o_src, o_dst, sizeof(o_src), &o_proto, &o_sp, &o_dp);
 	if (tb[CTA_TUPLE_REPLY])
-		format_ct_tuple(tb[CTA_TUPLE_REPLY], nfm->nfgen_family,
-				r_src, r_dst, sizeof(r_src),
-				&r_proto, &r_sp, &r_dp);
+		format_ct_tuple(tb[CTA_TUPLE_REPLY], nfm->nfgen_family, r_src, r_dst, sizeof(r_src), &r_proto, &r_sp, &r_dp);
 
 	pr_err("CT restore: %s proto=%u orig=%s:%u->%s:%u reply=%s:%u->%s:%u "
 	       "status=0x%08x%s%s%s%s%s%s%s\n",
