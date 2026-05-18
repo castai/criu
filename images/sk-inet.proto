@@ -58,4 +58,13 @@ message inet_sk_entry {
 	optional uint32			ns_id		= 18;
 	optional sk_shutdown		shutdown	= 19;
 	optional tcp_opts_entry		tcp_opts	= 20;
+
+  // == CastAI Live patches ==
+	/*
+	 * The fsuid that owned the socket at dump time (from inet_diag idiag_uid).
+	 * Restored via setfsuid() around socket(2) so
+	 * the kernel stamps sk->sk_uid correctly — xt_owner --uid-owner matches on it.
+	 */
+	optional uint32			uid		= 21;
+  // == CastAI Live patches ==
 }
