@@ -1,10 +1,12 @@
 #include <unistd.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <linux/netfilter/nfnetlink.h>
 #include <linux/netfilter/nfnetlink_conntrack.h>
 #include <linux/netfilter/nf_conntrack_tcp.h>
+#include <linux/netfilter/nf_conntrack_common.h>
 #include <string.h>
 #include <net/if_arp.h>
 #include <sys/wait.h>
@@ -30,6 +32,7 @@
 #include "imgset.h"
 #include "namespaces.h"
 #include "net.h"
+#include "net-clm-conntrack.h"
 #include "libnetlink.h"
 #include "cr_options.h"
 #include "sk-inet.h"
@@ -941,18 +944,30 @@ static int dump_one_link(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 	return ret;
 }
 
+
 static int dump_one_nf(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 {
 	struct cr_img *img = arg;
+	int ret;
 
 	if (lazy_image(img) && open_image_lazy(img))
 		return -1;
+
+	if (is_nf_dsnat(hdr)) {
+	    ret = dump_one_nf_dsnat(hdr, ns, arg);
+        if (ret < 0)
+            return -1;
+        else if (ret == 0)
+            return 0; /* skip this entry, already handled in dump_one_nf_dsnat */
+        // else ret == 1: not a DSNAT entry, fall back to normal dumping
+    }
 
 	if (write_img_buf(img, hdr, hdr->nlmsg_len))
 		return -1;
 
 	return 0;
 }
+
 
 static int ct_restore_callback(struct nlmsghdr *nlh)
 {
@@ -1055,8 +1070,13 @@ static int restore_nf_ct(int pid, int type)
 
 		nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
 		ret = do_rtnl_req(sk, nlh, nlh->nlmsg_len, NULL, NULL, NULL, NULL);
-		if (ret)
-			goto out;
+		if (ret) {
+			pr_err("nf_ct restore failed (ret=%d)\n", ret);
+            if (type == CR_FD_NETNF_CT) {
+                log_ct_entry(nlh);
+            }
+            goto out;
+		}
 	}
 
 	exit_code = 0;
@@ -1087,7 +1107,7 @@ static int dump_nf_ct(struct cr_imgset *fds, int type)
 
 	memset(&req, 0, sizeof(req));
 	req.nlh.nlmsg_len = sizeof(req);
-	req.nlh.nlmsg_type = (NFNL_SUBSYS_CTNETLINK << 8);
+	req.nlh.nlmsg_type = (type == CR_FD_NETNF_EXP ? NFNL_SUBSYS_CTNETLINK_EXP : NFNL_SUBSYS_CTNETLINK) << 8;
 
 	if (type == CR_FD_NETNF_CT)
 		req.nlh.nlmsg_type |= IPCTNL_MSG_CT_GET;
