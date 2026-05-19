@@ -108,6 +108,7 @@ TST_NOFILE	:=				\
 		socket-tcp-local		\
 		socket-tcp-reuseport		\
 		socket-tcp-ipt-nfconntrack	\
+		socket-tcp-ipt-redirect-conntrack	\
 		socket-tcp-nft-nfconntrack	\
 		socket-tcp6-local		\
 		socket-tcp4v6-local		\
