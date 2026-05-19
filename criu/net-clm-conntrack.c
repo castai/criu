@@ -240,7 +240,7 @@ int dump_one_nf_dsnat(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 	if (nlmsg_parse(hdr, sizeof(struct nfgenmsg), tb, CTA_MAX, NULL) < 0)
 		return 1;
 
-	if (!tb[CTA_STATUS])
+	if (!tb[CTA_STATUS] || !tb[CTA_TUPLE_REPLY] || !tb[CTA_TUPLE_ORIG])
 		return 1;
 
 	status = ntohl(nla_get_u32(tb[CTA_STATUS]));

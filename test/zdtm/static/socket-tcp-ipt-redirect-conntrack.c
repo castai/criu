@@ -16,29 +16,29 @@ const char *test_author = "Dmytro Bainak <dbaynak@protonmail.com>";
 #define BUF_SIZE   4096
 #define REDIR_PORT 12345
 
-int read_write_data(int fd, unsigned char *buf, size_t len, uint32_t* crc) {
+int read_write_data(int fd, unsigned char *buf, size_t len, uint32_t* crc, char* tag) {
     if (read_data(fd, buf, len)) {
-        pr_perror("read less than have to (pre)");
+        pr_perror("read less than have to (%s)", tag);
         return 1;
     }
     if (datachk(buf, len, crc))
         return 2;
     datagen(buf, BUF_SIZE, crc);
     if (write_data(fd, buf, BUF_SIZE)) {
-        pr_perror("can't write (pre)");
+        pr_perror("can't write (%s)", tag);
         return 1;
     }
     return 0;
 }
 
-int write_read_data(int fd, unsigned char *buf, size_t len, uint32_t* crc) {
+int write_read_data(int fd, unsigned char *buf, size_t len, uint32_t* crc, char* tag) {
     datagen(buf, len, crc);
     if (write_data(fd, buf, len)) {
-        pr_perror("can't write (pre)");
+        pr_perror("can't write (%s)", tag);
         return 1;
     }
     if (read_data(fd, buf, len)) {
-        pr_perror("read less than have to (pre)");
+        pr_perror("read less than have to (%s)", tag);
         return 1;
     }
     if (datachk(buf, len, crc))
@@ -103,14 +103,14 @@ int main(int argc, char **argv)
 			return 1;
 
         // Pre-migration round-trip: server -> client, client -> server.
-        ret = read_write_data(fd, buf, BUF_SIZE, &crc);
+        ret = read_write_data(fd, buf, BUF_SIZE, &crc, "pre");
         if (ret) {
             pr_err("pre-migration data exchange failed: %d\n", ret);
             return 1;
         }
 
         // Post-migration round-trip: server -> client, client -> server.
-        ret = read_write_data(fd, buf, BUF_SIZE, &crc);
+        ret = read_write_data(fd, buf, BUF_SIZE, &crc, "post");
         if (ret) {
             pr_err("post-migration data exchange failed: %d\n", ret);
             return 1;
@@ -125,7 +125,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-    ret = write_read_data(fd, buf, BUF_SIZE, &crc);
+    ret = write_read_data(fd, buf, BUF_SIZE, &crc, "pre");
 	if (ret) {
         pr_err("pre-migration data exchange failed: %d\n", ret);
         return 1;
@@ -134,7 +134,7 @@ int main(int argc, char **argv)
 	test_daemon();
 	test_waitsig();
 
-    ret = write_read_data(fd, buf, BUF_SIZE, &crc);
+    ret = write_read_data(fd, buf, BUF_SIZE, &crc, "post");
     if (ret) {
         pr_err("post-migration data exchange failed: %d\n", ret);
         return 1;
