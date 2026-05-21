@@ -13,7 +13,7 @@ static inline u32 pipe_id(const struct fd_parms *p)
 	return p->stat.st_ino;
 }
 
-#define NR_PIPES_WITH_DATA 1024
+#define NR_PIPES_WITH_DATA 2048
 
 struct pipe_data_dump {
 	int img_type;
