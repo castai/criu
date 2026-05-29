@@ -27,6 +27,7 @@
 #include "common/compiler.h"
 #include <compel/plugins/std/syscall.h>
 #include <compel/plugins/std/log.h>
+#include <compel/plugins/std/string.h>
 #include <compel/ksigset.h>
 #include "mman.h"
 #include "signal.h"
@@ -171,7 +172,6 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 	sys_kill(sys_getpid(), SIGSTOP);
 	sys_exit_group(1);
 }
-
 static int lsm_set_label(char *label, char *type, int procfd)
 {
 	int ret = -1, len, lsmfd;
@@ -202,6 +202,10 @@ static int lsm_set_label(char *label, char *type, int procfd)
 
 	return 0;
 }
+
+// == CastAI Live patches ==
+#include "lsm-pie.c"
+// == CastAI Live patches ==
 
 static int restore_creds(struct thread_creds_args *args, int procfd, int lsm_type, uid_t uid)
 {
@@ -373,13 +377,27 @@ skip_xids:
 		 * SELinux and instead the process context is set before the
 		 * threads are created.
 		 */
-		if (lsm_set_label(args->lsm_profile, "current", procfd) < 0)
-			return -1;
+		// == CastAI Live patches ==
+		if (lsm_type == LSMTYPE__APPARMOR) {
+			if (castai_apparmor_set_label(args->lsm_profile, "current", procfd) < 0)
+				return -1;
+		} else {
+			if (lsm_set_label(args->lsm_profile, "current", procfd) < 0)
+				return -1;
+		}
+		// == CastAI Live patches ==
 	}
 
 	/* Also set the sockcreate label for all threads */
-	if (lsm_set_label(args->lsm_sockcreate, "sockcreate", procfd) < 0)
-		return -1;
+	// == CastAI Live patches ==
+	if (lsm_type == LSMTYPE__APPARMOR) {
+		if (castai_apparmor_set_label(args->lsm_sockcreate, "sockcreate", procfd) < 0)
+			return -1;
+	} else {
+		if (lsm_set_label(args->lsm_sockcreate, "sockcreate", procfd) < 0)
+			return -1;
+	}
+	// == CastAI Live patches ==
 
 	if (ce->has_no_new_privs && ce->no_new_privs) {
 		ret = sys_prctl(PR_SET_NO_NEW_PRIVS, ce->no_new_privs, 0, 0, 0);
@@ -818,8 +836,17 @@ __visible long __export_restore_thread(struct thread_restore_args *args)
 	ret = restore_creds(args->creds_args, args->ta->proc_fd, args->ta->lsm_type, args->ta->uid);
 	ret = ret || restore_dumpable_flag(&args->ta->mm);
 	ret = ret || restore_pdeath_sig(args);
+	// == CastAI Live patches ==
+	/*
+	 * Upstream uses BUG() here, which raises SIGABRT and writes to a NULL
+	 * pointer, crashing the restorer stub and leaving all threads in
+	 * ptrace-stop with no way for the parent CRIU process to unblock.
+	 * Jump to core_restore_end instead so futex_abort_and_wake() runs and
+	 * the parent can detect the failure and clean up.
+	 */
 	if (ret)
-		BUG();
+		goto core_restore_end;
+	// == CastAI Live patches ==
 
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_CREDS);
 
@@ -2345,8 +2372,14 @@ __visible long __export_restore_task(struct task_restore_args *args)
 
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_CREDS);
 
+	// == CastAI Live patches ==
+	/*
+	 * Same as above: replace BUG() with a jump to core_restore_end so the
+	 * parent CRIU process is unblocked via futex_abort_and_wake().
+	 */
 	if (ret)
-		BUG();
+		goto core_restore_end;
+	// == CastAI Live patches ==
 
 	/* Wait until children stop to use args->task_entries */
 	futex_wait_while_gt(&thread_inprogress, 1);
