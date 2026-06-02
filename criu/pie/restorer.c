@@ -27,6 +27,7 @@
 #include "common/compiler.h"
 #include <compel/plugins/std/syscall.h>
 #include <compel/plugins/std/log.h>
+#include <compel/plugins/std/string.h>
 #include <compel/ksigset.h>
 #include "mman.h"
 #include "signal.h"
@@ -203,6 +204,10 @@ static int lsm_set_label(char *label, char *type, int procfd)
 	return 0;
 }
 
+// == CastAI Live patches ==
+#include "lsm-pie.c"
+// == CastAI Live patches ==
+
 static int restore_creds(struct thread_creds_args *args, int procfd, int lsm_type, uid_t uid)
 {
 	CredsEntry *ce = &args->creds;
@@ -373,13 +378,27 @@ skip_xids:
 		 * SELinux and instead the process context is set before the
 		 * threads are created.
 		 */
-		if (lsm_set_label(args->lsm_profile, "current", procfd) < 0)
-			return -1;
+		// == CastAI Live patches ==
+		if (lsm_type == LSMTYPE__APPARMOR) {
+			if (castai_apparmor_set_label(args->lsm_profile, "current", procfd) < 0)
+				return -1;
+		} else {
+			if (lsm_set_label(args->lsm_profile, "current", procfd) < 0)
+				return -1;
+		}
+		// == CastAI Live patches ==
 	}
 
 	/* Also set the sockcreate label for all threads */
-	if (lsm_set_label(args->lsm_sockcreate, "sockcreate", procfd) < 0)
-		return -1;
+	// == CastAI Live patches ==
+	if (lsm_type == LSMTYPE__APPARMOR) {
+		if (castai_apparmor_set_label(args->lsm_sockcreate, "sockcreate", procfd) < 0)
+			return -1;
+	} else {
+		if (lsm_set_label(args->lsm_sockcreate, "sockcreate", procfd) < 0)
+			return -1;
+	}
+	// == CastAI Live patches ==
 
 	if (ce->has_no_new_privs && ce->no_new_privs) {
 		ret = sys_prctl(PR_SET_NO_NEW_PRIVS, ce->no_new_privs, 0, 0, 0);

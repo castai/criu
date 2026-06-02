@@ -232,6 +232,7 @@ TST_NOFILE	:=				\
 		fd01				\
 		apparmor				\
 		apparmor_stacking				\
+		apparmor_stacking_lsm				\
 		seccomp_strict			\
 		seccomp_filter			\
 		seccomp_filter_tsync			\
