@@ -172,6 +172,7 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 	sys_kill(sys_getpid(), SIGSTOP);
 	sys_exit_group(1);
 }
+
 static int lsm_set_label(char *label, char *type, int procfd)
 {
 	int ret = -1, len, lsmfd;
@@ -836,17 +837,8 @@ __visible long __export_restore_thread(struct thread_restore_args *args)
 	ret = restore_creds(args->creds_args, args->ta->proc_fd, args->ta->lsm_type, args->ta->uid);
 	ret = ret || restore_dumpable_flag(&args->ta->mm);
 	ret = ret || restore_pdeath_sig(args);
-	// == CastAI Live patches ==
-	/*
-	 * Upstream uses BUG() here, which raises SIGABRT and writes to a NULL
-	 * pointer, crashing the restorer stub and leaving all threads in
-	 * ptrace-stop with no way for the parent CRIU process to unblock.
-	 * Jump to core_restore_end instead so futex_abort_and_wake() runs and
-	 * the parent can detect the failure and clean up.
-	 */
 	if (ret)
-		goto core_restore_end;
-	// == CastAI Live patches ==
+		BUG();
 
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_CREDS);
 
@@ -2372,14 +2364,8 @@ __visible long __export_restore_task(struct task_restore_args *args)
 
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_CREDS);
 
-	// == CastAI Live patches ==
-	/*
-	 * Same as above: replace BUG() with a jump to core_restore_end so the
-	 * parent CRIU process is unblocked via futex_abort_and_wake().
-	 */
 	if (ret)
-		goto core_restore_end;
-	// == CastAI Live patches ==
+		BUG();
 
 	/* Wait until children stop to use args->task_entries */
 	futex_wait_while_gt(&thread_inprogress, 1);
