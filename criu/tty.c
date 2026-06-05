@@ -1450,6 +1450,13 @@ shell_job:
 	}
 
 notask:
+	if (opts.shell_job) {
+		pr_info("No session leader for tty id %#x (sid %d), "
+			"ignoring because --shell-job is set\n",
+			info->tfe->id, info->tie->sid);
+		info->inherit = true;
+		return 0;
+	}
 	pr_err("No task found with sid %d\n", info->tie->sid);
 	return -1;
 }
@@ -1827,13 +1834,12 @@ int dump_verify_tty_sids(void)
 
 			if (!item || vpid(item) != dinfo->sid) {
 				if (!opts.shell_job) {
-					pr_info("Auto-detected shell-job from dangling tty "
-						"(sid %d pgid %d %s on peer fd %d)\n",
-						dinfo->sid, dinfo->pgrp,
-						dinfo->driver->name, dinfo->fd);
-					/* CAST AI: auto-detect shell-job so callers
-					 * (e.g. runc) don't need to pass --shell-job */
-					opts.shell_job = true;
+					pr_err("Found dangling tty with sid %d pgid %d (%s) on peer fd %d.\n",
+					       dinfo->sid, dinfo->pgrp, dinfo->driver->name, dinfo->fd);
+					pr_msg("Task attached to shell terminal. "
+					       "Consider using --" OPT_SHELL_JOB " option. "
+					       "More details on http://criu.org/Simple_loop\n");
+					ret = -1;
 				}
 			}
 		}
