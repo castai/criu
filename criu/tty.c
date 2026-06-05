@@ -1827,17 +1827,13 @@ int dump_verify_tty_sids(void)
 
 			if (!item || vpid(item) != dinfo->sid) {
 				if (!opts.shell_job) {
-					pr_err("Found dangling tty with sid %d pgid %d (%s) on peer fd %d.\n",
-					       dinfo->sid, dinfo->pgrp, dinfo->driver->name, dinfo->fd);
-					/*
-					 * First thing people do with criu is dump smth
-					 * run from shell. This is typical pitfall, warn
-					 * user about it explicitly.
-					 */
-					pr_msg("Task attached to shell terminal. "
-					       "Consider using --" OPT_SHELL_JOB " option. "
-					       "More details on http://criu.org/Simple_loop\n");
-					ret = -1;
+					pr_info("Auto-detected shell-job from dangling tty "
+						"(sid %d pgid %d %s on peer fd %d)\n",
+						dinfo->sid, dinfo->pgrp,
+						dinfo->driver->name, dinfo->fd);
+					/* CAST AI: auto-detect shell-job so callers
+					 * (e.g. runc) don't need to pass --shell-job */
+					opts.shell_job = true;
 				}
 			}
 		}
