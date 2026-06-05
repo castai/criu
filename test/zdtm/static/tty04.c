@@ -7,6 +7,13 @@
  *
  * This test runs as a plain process with no terminal.  The .desc file passes
  * --shell-job to both dump and restore.  A successful C/R cycle proves the fix.
+ *
+ * Coverage: This test exercises the tty_prep_fds() early-return path when
+ * stdin is not a tty.  It does NOT cover the pty_open_unpaired_slave() fake-
+ * master fallback path (triggered when a PTY slave exists but stdin is not a
+ * tty), nor the tty_find_restoring_task() notask path (triggered when a TTY's
+ * session leader is absent from the dump).  Those paths require a process tree
+ * with PTY file descriptors and are harder to construct in the zdtm framework.
  */
 
 #include "zdtmtst.h"
