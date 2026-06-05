@@ -1039,15 +1039,6 @@ int prepare_pstree(void)
 
 	pid = getpid();
 
-	/* CAST AI: auto-detect shell-job from image so callers
-	 * (e.g. runc) don't need to pass --shell-job on restore */
-	if (!opts.shell_job && vpid(root_item) != root_item->sid) {
-		pr_info("Auto-detected shell-job from pstree "
-			"(root %d is not session leader, sid %d)\n",
-			vpid(root_item), root_item->sid);
-		opts.shell_job = true;
-	}
-
 	if (!ret)
 		/*
 		 * Shell job may inherit sid/pgid from the current
