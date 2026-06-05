@@ -1007,10 +1007,19 @@ static int pty_open_unpaired_slave(struct file_desc *d, struct tty_info *slave)
 		}
 
 		if (!stdin_isatty) {
-			pr_err("Don't have tty to inherit session from, aborting\n");
-			return -1;
+			/*
+			 * --shell-job was set but the restoring side has no
+			 * controlling terminal (e.g. container with no tty).
+			 * Clear inherit so we fall through to the fake-master
+			 * path and restore proceeds without a real tty.
+			 */
+			pr_info("No tty to inherit for slave %#x, "
+				"using fake master instead\n", slave->tfe->id);
+			slave->inherit = false;
 		}
+	}
 
+	if (slave->inherit) {
 		fd = fdstore_get(self_stdin_fdid);
 		if (fd < 0) {
 			pr_err("Can't get self_stdin_fdid\n");
