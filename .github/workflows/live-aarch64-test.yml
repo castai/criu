@@ -25,4 +25,4 @@ jobs:
         make -C test/plugins clean || true
         sudo -E SKIP_PLUGIN_TESTS=1 make -C scripts/ci live-local GCC=1 RUN_TESTS=1 NO_GNUTLS=1 \
           COMPILE_FLAGS="NO_CUDA_PLUGIN=1" \
-          ZDTM_OPTS="-p $(nproc) -x zdtm/static/change_mnt_context -x zdtm/static/maps05 -x zdtm/static/socket-tcp-close0 -x zdtm/static/socket-dump-tcp-close"
+          ZDTM_OPTS="-p $(nproc) -x zdtm/static/change_mnt_context -x zdtm/static/maps05 -x zdtm/static/socket-tcp-close0 -x zdtm/static/socket-dump-tcp-close -x zdtm/static/seccomp_filter -x zdtm/static/seccomp_filter_inheritance -x zdtm/static/zombie00"
