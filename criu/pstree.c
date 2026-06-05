@@ -301,12 +301,10 @@ int dump_pstree(struct pstree_item *root_item)
 	 */
 	if (vpid(root_item) != root_item->sid) {
 		if (!opts.shell_job) {
-			pr_info("Auto-detected shell-job from pstree "
-				"(root %d is not session leader, sid %d)\n",
-				vpid(root_item), root_item->sid);
-			/* CAST AI: auto-detect shell-job so callers
-			 * (e.g. runc) don't need to pass --shell-job */
-			opts.shell_job = true;
+			pr_err("The root process %d is not a session leader. "
+			       "Consider using --" OPT_SHELL_JOB " option\n",
+			       vpid(root_item));
+			return -1;
 		}
 	}
 
