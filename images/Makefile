@@ -58,7 +58,6 @@ proto-obj-y	+= ext-file.o
 proto-obj-y	+= cgroup.o
 proto-obj-y	+= userns.o
 proto-obj-y	+= pidns.o
-proto-obj-y	+= google/protobuf/descriptor.o # To make protoc-c happy and compile opts.proto
 proto-obj-y	+= opts.o
 proto-obj-y	+= seccomp.o
 proto-obj-y	+= binfmt-misc.o
@@ -92,11 +91,26 @@ endef
 makefile-deps := Makefile $(obj)/Makefile
 
 #
+# Generate descriptor.pb-c.c and descriptor.pb-c.h to compile opts.proto.
+DESCRIPTOR_DIR := images/google/protobuf
+GOOGLE_INCLUDE=$(shell pkg-config protobuf --variable=includedir)/google/protobuf
+$(DESCRIPTOR_DIR)/descriptor.pb-c.c: $(GOOGLE_INCLUDE)/descriptor.proto
+	$(call msg-gen, $@)
+	$(Q) protoc --proto_path=/usr/include --proto_path=$(obj)/ --c_out=$(obj)/ $<
+
+cleanup-y += $(DESCRIPTOR_DIR)/descriptor.pb-c.d
+
+submrproper:
+	$(Q) rm -f $(DESCRIPTOR_DIR)/*
+.PHONY: submrproper
+mrproper: submrproper
+
+#
 # Generates rules needed to compile protobuf files.
 define gen-proto-rules
 $(obj)/$(1).pb-c.c $(obj)/$(1).pb-c.h: $(obj)/$(1).proto $(addsuffix .pb-c.c,$(addprefix $(obj)/,$(2))) $(makefile-deps)
 	$$(E) "  PBCC    " $$@
-	$$(Q) protoc-c --proto_path=$(obj)/ --c_out=$(obj)/ $$<
+	$$(Q) protoc --proto_path=$(obj)/ --c_out=$(obj)/ $$<
 ifeq ($(PROTOUFIX),y)
 	$$(Q) sed -i -e 's/4294967295/0xFFFFFFFF/g' $$@
 	$$(Q) sed -i -e 's/4294967295/0xFFFFFFFF/g' $$(patsubst %.c,%.h,$$@)

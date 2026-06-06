@@ -1392,6 +1392,14 @@ static int check_pagemap_scan(void)
 	return 0;
 }
 
+static int check_timer_cr_ids(void)
+{
+	if (!kdat.has_timer_cr_ids)
+		return -1;
+
+	return 0;
+}
+
 /* musl doesn't have a statx wrapper... */
 struct staty {
 	__u32 stx_dev_major;
@@ -1581,6 +1589,23 @@ static int check_overlayfs_maps(void)
 	return status == 0 ? 0 : -1;
 }
 
+static int check_breakpoints(void)
+{
+	if (!kdat.has_breakpoints) {
+		pr_warn("Hardware breakpoints don't seem to work\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int check_pagemap_scan_guard_pages(void)
+{
+	kerndat_warn_about_madv_guards();
+
+	return kdat.has_pagemap_scan_guard_pages ? 0 : -1;
+}
+
 static int (*chk_feature)(void);
 
 /*
@@ -1608,6 +1633,7 @@ static int (*chk_feature)(void);
 			return ret;                 \
 		}                                   \
 	} while (0)
+
 int cr_check(void)
 {
 	struct ns_id *ns;
@@ -1703,6 +1729,8 @@ int cr_check(void)
 		ret |= check_ipv6_freebind();
 		ret |= check_pagemap_scan();
 		ret |= check_overlayfs_maps();
+		ret |= check_timer_cr_ids();
+		ret |= check_pagemap_scan_guard_pages();
 
 		if (kdat.lsm == LSMTYPE__APPARMOR)
 			ret |= check_apparmor_stacking();
@@ -1715,6 +1743,10 @@ int cr_check(void)
 		ret |= check_autofs();
 		ret |= check_compat_cr();
 	}
+	/*
+	 * Category 4 - optional.
+	 */
+	check_breakpoints();
 
 	pr_msg("%s\n", ret ? CHECK_MAYBE : CHECK_GOOD);
 	return ret;
@@ -1825,7 +1857,10 @@ static struct feature_list feature_list[] = {
 	{ "get_rseq_conf", check_ptrace_get_rseq_conf },
 	{ "ipv6_freebind", check_ipv6_freebind },
 	{ "pagemap_scan", check_pagemap_scan },
+	{ "timer_cr_ids", check_timer_cr_ids },
 	{ "overlayfs_maps", check_overlayfs_maps },
+	{ "breakpoints", check_breakpoints },
+	{ "pagemap_scan_guard_pages", check_pagemap_scan_guard_pages },
 	{ NULL, NULL },
 };
 

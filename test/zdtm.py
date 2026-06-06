@@ -22,11 +22,11 @@ import sys
 import tempfile
 import time
 import uuid
+import site
 from builtins import input, int, open, range, str, zip
 
 import yaml
 
-import pycriu as crpc
 from zdtm.criu_config import criu_config
 
 # File to store content of streamed images
@@ -443,6 +443,7 @@ class zdtm_test:
         self._bins = [name]
         self._env = {'TMPDIR': os.environ.get('TMPDIR', '/tmp')}
         self._deps = desc.get('deps', [])
+        self._bind = desc.get('bind')
         self.auto_reap = True
 
     def __make_action(self, act, env=None, root=None):
@@ -513,6 +514,8 @@ class zdtm_test:
         if self.__flavor.ns:
             env['ZDTM_NEWNS'] = "1"
             env['ZDTM_ROOT'] = self.__flavor.root
+            if self._bind:
+                env['ZDTM_BIND'] = self._bind
             env['ZDTM_DEV'] = self.__flavor.devpath
             env['PATH'] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -1139,6 +1142,24 @@ class criu:
         self.__img_streamer_process = None
         self.__tls = self.__tls_options() if opts['tls'] else []
         self.__criu_bin = opts['criu_bin']
+
+        global crpc
+        pycriu_search_path = opts.get('pycriu_search_path')
+        if pycriu_search_path:
+            sys.path.insert(0, pycriu_search_path)
+
+        try:
+            import pycriu as crpc
+            if pycriu_search_path:
+                print(f"pycriu loaded from: {crpc.__file__}")
+        except ImportError:
+            if not pycriu_search_path:
+                print("Consider building CRIU or using '--pycriu-search-path' option.")
+            raise
+        finally:
+            if pycriu_search_path:
+                sys.path.pop(0)
+
         self.__crit_bin = opts['crit_bin']
         self.__pre_dump_mode = opts['pre_dump_mode']
         self.__preload_libfault = bool(opts['preload_libfault'])
@@ -1590,6 +1611,7 @@ class criu:
     def available():
         if not os.access(opts['criu_bin'], os.X_OK):
             print("CRIU binary not found at %s" % opts['criu_bin'])
+            print("Consider building CRIU or using '--criu-bin' option.")
             sys.exit(1)
 
     def kill(self):
@@ -2056,8 +2078,6 @@ class Launcher:
         self.__subs = {}
         self.__fail = False
         self.__file_report = None
-        self.__junit_file = None
-        self.__junit_test_cases = None
         self.__failed = []
         self.__nr_skip = 0
         if self.__max > 1 and self.__total > 1:
@@ -2069,21 +2089,13 @@ class Launcher:
 
         if opts['report'] and (opts['keep_going'] or self.__total == 1):
             global TestSuite, TestCase
-            from junit_xml import TestCase, TestSuite
             now = datetime.datetime.now()
             att = 0
             reportname = os.path.join(report_dir, "criu-testreport.tap")
-            junitreport = os.path.join(report_dir, "criu-testreport.xml")
-            while os.access(reportname, os.F_OK) or os.access(
-                    junitreport, os.F_OK):
+            while os.access(reportname, os.F_OK):
                 reportname = os.path.join(report_dir,
                                           "criu-testreport" + ".%d.tap" % att)
-                junitreport = os.path.join(report_dir,
-                                           "criu-testreport" + ".%d.xml" % att)
                 att += 1
-
-            self.__junit_file = open(junitreport, 'a')
-            self.__junit_test_cases = []
 
             self.__file_report = open(reportname, 'a')
             print(u"TAP version 13", file=self.__file_report)
@@ -2119,10 +2131,6 @@ class Launcher:
         self.__runtest += 1
         self.__nr_skip += 1
 
-        if self.__junit_test_cases is not None:
-            tc = TestCase(name)
-            tc.add_skipped_info(reason)
-            self.__junit_test_cases.append(tc)
         if self.__file_report:
             testline = u"ok %d - %s # SKIP %s" % (self.__runtest, name, reason)
             print(testline, file=self.__file_report)
@@ -2166,7 +2174,8 @@ class Launcher:
               'dedup', 'sbs', 'freezecg', 'user', 'dry_run', 'noauto_dedup',
               'remote_lazy_pages', 'show_stats', 'lazy_migrate', 'stream',
               'tls', 'criu_bin', 'crit_bin', 'pre_dump_mode', 'mntns_compat_mode',
-              'rootless', 'preload_libfault', 'mocked_cuda_checkpoint')
+              'rootless', 'preload_libfault', 'mocked_cuda_checkpoint',
+              'pycriu_search_path')
         arg = repr((name, desc, flavor, {d: self.__opts[d] for d in nd}))
 
         if self.__use_log:
@@ -2223,11 +2232,6 @@ class Launcher:
             # The following wait() is not useful for our domain logic.
             # It's useful for taming warnings in subprocess.Popen.__del__()
             sub['sub'].wait()
-            tc = None
-            if self.__junit_test_cases is not None:
-                tc = TestCase(sub['name'],
-                              elapsed_sec=time.time() - sub['start'])
-                self.__junit_test_cases.append(tc)
             if status != 0:
                 self.__fail = True
                 failed_flavor = decode_flav(os.WEXITSTATUS(status))
@@ -2238,7 +2242,6 @@ class Launcher:
                     with open(sub['log']) as sublog:
                         output = sublog.read()
                     details = {'output': output}
-                    tc.add_error_info(output=output)
                     print(testline, file=self.__file_report)
                     print("%s" % yaml.safe_dump(details,
                                                 explicit_start=True,
@@ -2284,10 +2287,6 @@ class Launcher:
         if not opts['fault'] and check_core_files():
             self.__fail = True
         if self.__file_report:
-            ts = TestSuite(opts['title'], self.__junit_test_cases,
-                           os.getenv("NODE_NAME"))
-            self.__junit_file.write(TestSuite.to_xml_string([ts]))
-            self.__junit_file.close()
             self.__file_report.close()
 
         if opts['keep_going']:
@@ -2857,6 +2856,9 @@ def get_cli_args():
     rp.add_argument("--criu-bin",
                     help="Path to criu binary",
                     default='../criu/criu')
+    rp.add_argument("--pycriu-search-path",
+                    help=f"Path to search for pycriu module first (e.g., {site.getsitepackages()[0]})",
+                    default=None)
     rp.add_argument("--crit-bin",
                     help="Path to crit binary",
                     default='../crit/crit')
@@ -2947,7 +2949,7 @@ if __name__ == '__main__':
     if opts['debug']:
         sys.settrace(traceit)
 
-    if opts['action'] == 'run':
+    if opts['action'] == run_tests:
         criu.available()
     for tst in test_classes.values():
         tst.available()

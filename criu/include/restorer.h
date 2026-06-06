@@ -170,6 +170,7 @@ struct task_restore_args {
 
 	struct restore_posix_timer *posix_timers;
 	unsigned int posix_timers_n;
+	bool posix_timer_cr_ids;
 
 	struct restore_timerfd *timerfd;
 	unsigned int timerfd_n;
@@ -354,6 +355,13 @@ static inline int arch_shstk_restore(struct rst_shstk_info *shstk)
 	return 0;
 }
 #define arch_shstk_restore arch_shstk_restore
+#endif
+
+#ifndef shstk_vma_restore
+static always_inline int shstk_vma_restore(VmaEntry *vma_entry)
+{
+	return -1;
+}
 #endif
 
 #endif /* __CR_RESTORER_H__ */

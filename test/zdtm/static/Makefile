@@ -37,6 +37,8 @@ TST_NOFILE	:=				\
 		socket_udp-corked		\
 		socket6_udp			\
 		socket_udp_shutdown		\
+		socket_icmp			\
+		socket6_icmp			\
 		sk-freebind			\
 		sk-freebind-false		\
 		socket_udplite			\
@@ -150,6 +152,7 @@ TST_NOFILE	:=				\
 		maps05				\
 		maps09				\
 		maps10				\
+		maps11				\
 		mlock_setuid			\
 		xids00				\
 		groups				\
@@ -287,6 +290,7 @@ TST_NOFILE	:=				\
 
 PKG_CONFIG ?= pkg-config
 pkg-config-check = $(shell sh -c '$(PKG_CONFIG) $(1) && echo y')
+pkg-config-atleast-version = $(shell sh -c '$(PKG_CONFIG) --atleast-version=$(2) $(1) && echo y')
 ifeq ($(call pkg-config-check,libbpf),y)
 TST_NOFILE	+=				\
 		bpf_hash			\
@@ -295,7 +299,10 @@ endif
 
 ifneq ($(ARCH),arm)
 ifneq ($(COMPAT_TEST),y)
-        TST_NOFILE += maps03
+	TST_NOFILE += maps03
+ifeq ($(call pkg-config-atleast-version,libtracefs,1.7),y)
+	TST_NOFILE += uprobes
+endif
 endif
 endif
 
@@ -312,6 +319,7 @@ TST_FILE	=				\
 		write_read02			\
 		write_read10			\
 		maps00				\
+		maps12				\
 		link10				\
 		file_attr			\
 		deleted_unix_sock		\
@@ -378,6 +386,8 @@ TST_FILE	=				\
 		sk-unix-listen02		\
 		sk-unix-listen03		\
 		sk-unix-listen04		\
+		sk-unix-restore-fs-share	\
+		mnt_ext_file_bind_auto		\
 
 TST_DIR		=				\
 		cwd00				\
@@ -423,6 +433,7 @@ TST_DIR		=				\
 		mntns_ghost			\
 		mntns_ghost01			\
 		mntns_ro_root			\
+		mnt_ro_root			\
 		mntns_link_ghost		\
 		mntns_shared_bind		\
 		mntns_shared_bind02		\
@@ -628,6 +639,7 @@ socket-tcp6-closed:	CFLAGS += -D ZDTM_IPV6
 socket-tcp6-closed:	CFLAGS += -D ZDTM_IPV4V6
 socket-tcp-closed-last-ack:	CFLAGS += -D ZDTM_TCP_LAST_ACK
 socket-tcp-skip-in-flight:	CFLAGS += -D ZDTM_IPV4V6
+socket6-icmp:		CFLAGS += -DZDTM_IPV6
 sock_ip_opts01:		CFLAGS += -DZDTM_VAL_ZERO
 sock_tcp_opts01:	CFLAGS += -DZDTM_VAL_ZERO
 tun_ns:			CFLAGS += -DTUN_NS
@@ -719,6 +731,9 @@ sk-unix-listen04: CFLAGS += -DSK_UNIX_LISTEN02 -DSK_UNIX_LISTEN03
 
 cgroupv2_01:		LDLIBS += -pthread
 
+uprobes:		CFLAGS += $(call pkg-cflags, libtracefs libtraceevent)
+uprobes:		LDLIBS += $(call pkg-libs, libtracefs libelf)
+
 $(LIB):	force
 	$(Q) $(MAKE) -C $(LIBDIR)
 
@@ -733,7 +748,7 @@ criu-rtc.pb-c.c: criu-rtc.proto
 	$(Q)echo $@ >> .gitignore
 	$(Q)echo $(@:%.c=%.h) >> .gitignore
 	$(E) " PBCC     " $@
-	$(Q)protoc-c --proto_path=. --c_out=. criu-rtc.proto
+	$(Q)protoc --proto_path=. --c_out=. criu-rtc.proto
 
 criu-rtc.so: criu-rtc.c criu-rtc.pb-c.c
 	$(E) " LD       " $@

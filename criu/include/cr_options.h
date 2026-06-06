@@ -125,7 +125,8 @@ enum criu_mode {
 	CR_SERVICE,
 	CR_SWRK,
 	CR_DEDUP,
-	CR_CPUINFO,
+	CR_CPUINFO_DUMP,
+	CR_CPUINFO_CHECK,
 	CR_EXEC_DEPRECATED,
 	CR_SHOW_DEPRECATED,
 };
@@ -195,6 +196,7 @@ struct cr_options {
 	char *work_dir;
 	int network_lock_method;
 	int skip_file_rwx_check;
+	int allow_uprobes;
 
 	/*
 	 * When we scheduler for removal some functionality we first

@@ -28,6 +28,7 @@
 #include <compel/plugins/std/syscall.h>
 #include <compel/plugins/std/log.h>
 #include <compel/ksigset.h>
+#include "mman.h"
 #include "signal.h"
 #include "prctl.h"
 #include "criu-log.h"
@@ -1111,6 +1112,23 @@ static int vma_remap(VmaEntry *vma_entry, int uffd)
 
 	pr_info("Remap %lx->%lx len %lx\n", src, dst, len);
 
+	/*
+	 * SHSTK VMAs are a bit special, in fact we create shstk vma right in the
+	 * shstk_vma_restore() and populate it with contents from a premapped VMA
+	 * (which in turns is just a normal anonymous VMA!). Then, we munmap() this
+	 * premapped VMA. After, we need to adjust vma_premmaped_start(vma_entry)
+	 * to point to a created shstk vma and treat it as a premmaped one in vma_remap().
+	 */
+	if (vma_entry_is(vma_entry, VMA_AREA_SHSTK)) {
+		if (shstk_vma_restore(vma_entry)) {
+			pr_err("Unable to prepare shadow stack vma for remap %lx -> %lx\n", src, dst);
+			return -1;
+		}
+
+		/* shstk_vma_restore() modifies vma premapped address */
+		src = vma_premmaped_start(vma_entry);
+	}
+
 	if (src - dst < len)
 		guard = dst;
 	else if (dst - src < len)
@@ -1235,9 +1253,23 @@ static int timerfd_arm(struct task_restore_args *args)
 
 static int create_posix_timers(struct task_restore_args *args)
 {
-	int ret, i;
+	int ret, i, exit_code = -1;
 	kernel_timer_t next_id = 0, timer_id;
 	struct sigevent sev;
+	bool create_restore_ids = false;
+
+	if (!args->posix_timers_n)
+		return 0;
+
+	/* prctl returns EINVAL if PR_TIMER_CREATE_RESTORE_IDS isn't supported. */
+	ret = sys_prctl(PR_TIMER_CREATE_RESTORE_IDS,
+			PR_TIMER_CREATE_RESTORE_IDS_ON, 0, 0, 0);
+	if (ret == 0) {
+		create_restore_ids = true;
+	} else if (ret != -EINVAL) {
+		pr_err("Can't enabled PR_TIMER_CREATE_RESTORE_IDS: %d\n", ret);
+		return -1;
+	}
 
 	for (i = 0; i < args->posix_timers_n; i++) {
 		sev.sigev_notify = args->posix_timers[i].spt.it_sigev_notify;
@@ -1249,16 +1281,36 @@ static int create_posix_timers(struct task_restore_args *args)
 #endif
 		sev.sigev_value.sival_ptr = args->posix_timers[i].spt.sival_ptr;
 
+		if (create_restore_ids) {
+			/*
+			 * With enabled PR_TIMER_CREATE_RESTORE_IDS, the
+			 * timer_create syscall creates a new timer with the
+			 * specified ID.
+			 */
+			timer_id = args->posix_timers[i].spt.it_id;
+			ret = sys_timer_create(args->posix_timers[i].spt.clock_id, &sev, &timer_id);
+			if (ret < 0) {
+				pr_err("Can't create posix timer - %d: %d\n", i, ret);
+				goto out;
+			}
+			if (timer_id != args->posix_timers[i].spt.it_id) {
+				pr_err("Unexpected timer id %u (expected %lu)\n",
+				       timer_id, args->posix_timers[i].spt.it_id);
+				goto out;
+			}
+			continue;
+		}
+
 		while (1) {
 			ret = sys_timer_create(args->posix_timers[i].spt.clock_id, &sev, &timer_id);
 			if (ret < 0) {
 				pr_err("Can't create posix timer - %d\n", i);
-				return ret;
+				goto out;
 			}
 
 			if (timer_id != next_id) {
 				pr_err("Can't create timers, kernel don't give them consequently\n");
-				return -1;
+				goto out;
 			}
 			next_id++;
 
@@ -1268,12 +1320,22 @@ static int create_posix_timers(struct task_restore_args *args)
 			ret = sys_timer_delete(timer_id);
 			if (ret < 0) {
 				pr_err("Can't remove temporaty posix timer 0x%x\n", timer_id);
-				return ret;
+				goto out;
 			}
 		}
 	}
 
-	return 0;
+	exit_code = 0;
+out:
+	if (create_restore_ids) {
+		ret = sys_prctl(PR_TIMER_CREATE_RESTORE_IDS,
+				PR_TIMER_CREATE_RESTORE_IDS_OFF, 0, 0, 0);
+		if (ret != 0) {
+			pr_err("Can't disable PR_TIMER_CREATE_RESTORE_IDS: %d\n", ret);
+			exit_code = -1;
+		}
+	}
+	return exit_code;
 }
 
 static void restore_posix_timers(struct task_restore_args *args)
@@ -1621,6 +1683,30 @@ static int restore_membarrier_registrations(int mask)
 	return ret;
 }
 
+static int restore_madv_guard_regions(struct task_restore_args *args)
+{
+	int i, ret;
+
+	for (i = 0; i < args->vmas_n; i++) {
+		VmaEntry *vma_entry = args->vmas + i;
+		size_t len;
+
+		if (!vma_entry_is(vma_entry, VMA_AREA_GUARD))
+			continue;
+
+		len = vma_entry->end - vma_entry->start;
+		ret = sys_madvise(vma_entry->start, len, MADV_GUARD_INSTALL);
+		if (ret) {
+			pr_err("madvise(%" PRIx64 ", %zu, MADV_GUARD_INSTALL) "
+			       "failed with %d\n",
+			       vma_entry->start, len, ret);
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
 /*
  * The main routine to restore task via sigreturn.
  * This one is very special, we never return there
@@ -1742,13 +1828,6 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		if (vma_entry->start > vma_entry->shmid)
 			break;
 
-		/*
-		 * shadow stack VMAs cannot be remapped, they must be
-		 * recreated with map_shadow_stack system call
-		 */
-		if (vma_entry_is(vma_entry, VMA_AREA_SHSTK))
-			continue;
-
 		if (vma_remap(vma_entry, args->uffd))
 			goto core_restore_end;
 	}
@@ -1765,13 +1844,6 @@ __visible long __export_restore_task(struct task_restore_args *args)
 
 		if (vma_entry->start < vma_entry->shmid)
 			break;
-
-		/*
-		 * shadow stack VMAs cannot be remapped, they must be
-		 * recreated with map_shadow_stack system call
-		 */
-		if (vma_entry_is(vma_entry, VMA_AREA_SHSTK))
-			continue;
 
 		if (vma_remap(vma_entry, args->uffd))
 			goto core_restore_end;
@@ -1927,6 +1999,13 @@ __visible long __export_restore_task(struct task_restore_args *args)
 			}
 		}
 	}
+
+	/*
+	 * Restore madvise(MADV_GUARD_INSTALL)
+	 */
+	ret = restore_madv_guard_regions(args);
+	if (ret)
+		goto core_restore_end;
 
 	/*
 	 * Tune up the task fields.

@@ -1820,6 +1820,7 @@ static int restore_rseq_cs(void)
 static int catch_tasks(bool root_seized)
 {
 	struct pstree_item *item;
+	bool nobp = fault_injected(FI_NO_BREAKPOINTS) || !kdat.has_breakpoints;
 
 	for_each_pstree_item(item) {
 		int status, i, ret;
@@ -1847,7 +1848,7 @@ static int catch_tasks(bool root_seized)
 				return -1;
 			}
 
-			ret = compel_stop_pie(pid, rsti(item)->breakpoint, fault_injected(FI_NO_BREAKPOINTS));
+			ret = compel_stop_pie(pid, rsti(item)->breakpoint, nobp);
 			if (ret < 0)
 				return -1;
 		}
@@ -2119,7 +2120,7 @@ static int restore_root_task(struct pstree_item *init)
 		 * the '--empty-ns net' mode no iptables C/R is done and we
 		 * need to return these rules by hands.
 		 */
-		ret = network_lock_internal();
+		ret = network_lock_internal(/* restore = */ true);
 		if (ret)
 			goto out_kill;
 	}
@@ -2131,6 +2132,9 @@ static int restore_root_task(struct pstree_item *init)
 	__restore_switch_stage(CR_STATE_FORKING);
 
 skip_ns_bouncing:
+	ret = run_plugins(POST_FORKING);
+	if (ret < 0 && ret != -ENOTSUP)
+		goto out_kill;
 
 	ret = restore_wait_inprogress_tasks();
 	if (ret < 0)
@@ -2258,7 +2262,7 @@ skip_ns_bouncing:
 		 * might actually be a true error code but that would be also
 		 * captured in the plugin so no need to print the error here.
 		 */
-		if (ret < 0)
+		if (ret < 0 && ret != -ENOTSUP)
 			pr_debug("restore late stage hook for external plugin failed\n");
 	}
 
@@ -2362,41 +2366,47 @@ int cr_restore_tasks(void)
 		return 1;
 
 	if (check_img_inventory(/* restore = */ true) < 0)
-		goto err;
-
-	if (cr_plugin_init(CR_PLUGIN_STAGE__RESTORE))
 		return -1;
 
 	if (init_stats(RESTORE_STATS))
-		goto err;
+		return -1;
 
 	if (lsm_check_opts())
-		goto err;
+		return -1;
 
 	timing_start(TIME_RESTORE);
 
 	if (cpu_init() < 0)
-		goto err;
+		return -1;
 
 	if (vdso_init_restore())
-		goto err;
+		return -1;
 
 	if (tty_init_restore())
-		goto err;
+		return -1;
 
 	if (opts.cpu_cap & CPU_CAP_IMAGE) {
 		if (cpu_validate_cpuinfo())
-			goto err;
+			return -1;
 	}
 
 	if (prepare_task_entries() < 0)
-		goto err;
+		return -1;
 
 	if (prepare_pstree() < 0)
-		goto err;
+		return -1;
 
 	if (fdstore_init())
-		goto err;
+		return -1;
+
+	/*
+	 * For the AMDGPU plugin, its parallel restore feature needs to use fdstore to store
+	 * its socket file descriptor. This allows the main process and the target process to
+	 * communicate with each other through this file descriptor. Therefore, cr_plugin_init
+	 * must be initialized after fdstore_init.
+	 */
+	if (cr_plugin_init(CR_PLUGIN_STAGE__RESTORE))
+		return -1;
 
 	if (inherit_fd_move_to_fdstore())
 		goto err;
@@ -2421,23 +2431,23 @@ err:
 	return ret;
 }
 
-static long restorer_get_vma_hint(struct list_head *tgt_vma_list, struct list_head *self_vma_list, long vma_len)
+static long restorer_get_vma_hint(struct list_head *tgt_vma_list, struct list_head *self_vma_list, long min_addr, long vma_len)
 {
 	struct vma_area *t_vma, *s_vma;
-	long prev_vma_end = 0;
+	long prev_vma_end = min_addr;
 	struct vma_area end_vma;
 	VmaEntry end_e;
 
 	end_vma.e = &end_e;
 	end_e.start = end_e.end = kdat.task_size;
-	prev_vma_end = kdat.mmap_min_addr;
 
 	s_vma = list_first_entry(self_vma_list, struct vma_area, list);
 	t_vma = list_first_entry(tgt_vma_list, struct vma_area, list);
 
 	while (1) {
 		if (prev_vma_end + vma_len > s_vma->e->start) {
-			if (s_vma->list.next == self_vma_list) {
+			if ((s_vma->list.next == self_vma_list) ||
+			    vma_area_is(vma_next(s_vma), VMA_AREA_GUARD)) {
 				s_vma = &end_vma;
 				continue;
 			}
@@ -2450,7 +2460,8 @@ static long restorer_get_vma_hint(struct list_head *tgt_vma_list, struct list_he
 		}
 
 		if (prev_vma_end + vma_len > t_vma->e->start) {
-			if (t_vma->list.next == tgt_vma_list) {
+			if ((t_vma->list.next == tgt_vma_list) ||
+			    vma_area_is(vma_next(t_vma), VMA_AREA_GUARD)) {
 				t_vma = &end_vma;
 				continue;
 			}
@@ -2558,6 +2569,17 @@ static int remap_restorer_blob(void *addr)
 	 */
 	restorer_setup_c_header_desc(&pbd, true);
 	compel_relocs_apply(addr, addr, &pbd);
+
+	/*
+	 * Ensure the infected thread sees the updated code.
+	 *
+	 * On architectures like ARM64, the Data Cache (D-cache) and
+	 * Instruction Cache (I-cache) are not automatically coherent.
+	 * Modifications land in the D-cache, so we must flush (clean) the
+	 * D-cache to push changes to RAM to ensure the CPU fetches the updated
+	 * instructions.
+	 */
+	__builtin___clear_cache(addr, addr + pbd.hdr.bsize);
 
 	return 0;
 }
@@ -3173,7 +3195,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 
 	rst_mem_size = rst_mem_lock();
 	memzone_size = round_up(sizeof(struct restore_mem_zone) * current->nr_threads, page_size());
-	task_args->bootstrap_len = restorer_len + memzone_size + alen + rst_mem_size;
+	task_args->bootstrap_len = restorer_len + memzone_size + alen + rst_mem_size + shstk_restorer_stack_size();
 	BUG_ON(task_args->bootstrap_len & (PAGE_SIZE - 1));
 	pr_info("%d threads require %ldK of memory\n", current->nr_threads, KBYTES(task_args->bootstrap_len));
 
@@ -3203,7 +3225,9 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	 * or inited from scratch).
 	 */
 
-	mem = (void *)restorer_get_vma_hint(&vmas->h, &self_vmas.h, task_args->bootstrap_len);
+	mem = (void *)restorer_get_vma_hint(&vmas->h, &self_vmas.h,
+					    shstk_min_mmap_addr(&task_args->shstk, kdat.mmap_min_addr),
+					    task_args->bootstrap_len);
 	if (mem == (void *)-1) {
 		pr_err("No suitable area for task_restore bootstrap (%ldK)\n", task_args->bootstrap_len);
 		goto err;
@@ -3442,6 +3466,10 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	 * self-vmas are unmaped.
 	 */
 	mem += rst_mem_size;
+
+	shstk_set_restorer_stack(&task_args->shstk, mem);
+	mem += shstk_restorer_stack_size();
+
 	task_args->vdso_rt_parked_at = (unsigned long)mem;
 	task_args->vdso_maps_rt = vdso_maps_rt;
 	task_args->vdso_rt_size = vdso_rt_size;

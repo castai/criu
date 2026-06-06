@@ -1008,7 +1008,7 @@ static int collect_task(struct pstree_item *item)
 	if (ret < 0)
 		goto err_close;
 
-	if ((item->pid->state == TASK_DEAD) && !list_empty(&item->children)) {
+	if ((item->pid->state == TASK_DEAD) && has_children(item)) {
 		pr_err("Zombie with children?! O_o Run, run, run!\n");
 		goto err_close;
 	}
@@ -1060,22 +1060,32 @@ int collect_pstree(void)
 	 */
 	alarm(opts.timeout);
 
-	ret = run_plugins(PAUSE_DEVICES, pid);
-	if (ret < 0 && ret != -ENOTSUP) {
-		goto err;
-	}
-
 	if (opts.freeze_cgroup && cgroup_version())
 		goto err;
 
 	pr_debug("Detected cgroup V%d freezer\n", cgroup_v2 ? 2 : 1);
 
 	if (opts.freeze_cgroup && !compel_interrupt_only_mode) {
+		ret = run_plugins(PAUSE_DEVICES, pid);
+		if (ret < 0 && ret != -ENOTSUP) {
+			goto err;
+		}
+
 		if (freeze_processes())
 			goto err;
 	} else {
 		if (opts.freeze_cgroup && prepare_freezer_for_interrupt_only_mode())
 			goto err;
+
+		/*
+		 * Call PAUSE_DEVICES after prepare_freezer_for_interrupt_only_mode()
+		 * to be able to checkpoint containers in a frozen state.
+		 */
+		ret = run_plugins(PAUSE_DEVICES, pid);
+		if (ret < 0 && ret != -ENOTSUP) {
+			goto err;
+		}
+
 		if (compel_interrupt_task(pid)) {
 			set_cr_errno(ESRCH);
 			goto err;

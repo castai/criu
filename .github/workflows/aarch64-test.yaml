@@ -1,43 +1,25 @@
-name: Actuated aarch64 test
+name: aarch64 test
 
 on: [push, pull_request]
 
 # Cancel any preceding run on the pull request.
 concurrency:
-  group: actuated-test-${{ github.event.pull_request.number || github.ref }}
+  group: aarch64-test-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/criu-dev' }}
 
 jobs:
   build:
-    # Actuated runners are not available in all repositories.
-    if: ${{ github.repository == 'checkpoint-restore/criu' }}
-    # The memory size and the number of CPUs can be freely selected.
-    # 3GB and 4 CPUs seems to be enough according to the result from 'vmmeter'.
-    runs-on: actuated-arm64-4cpu-3gb
     strategy:
       matrix:
+        os: [ubuntu-24.04-arm, ubuntu-22.04-arm]
         target: [GCC=1, CLANG=1]
 
+    runs-on: ${{ matrix.os }}
+
     steps:
-    # https://gist.github.com/alexellis/1f33e581c75e11e161fe613c46180771#file-metering-gha-md
-    # vmmeter start
-    - name: Prepare arkade
-      uses: alexellis/arkade-get@master
-      with:
-        crane: latest
-        print-summary: false
-
-    - name: Install vmmeter
-      run: |
-        crane export --platform linux/arm64 ghcr.io/openfaasltd/vmmeter:latest | sudo tar -xvf - -C /usr/local/bin
-
-    - name: Run vmmeter
-      uses: self-actuated/vmmeter-action@master
-    # vmmeter end
-
     - uses: actions/checkout@v4
-    - name: Run Tests ${{ matrix.target }}
-      # Following tests are failing on the actuated VMs:
+    - name: Run Tests ${{ matrix.target }} on ${{ matrix.os }}
+      # Following tests are failing on the VMs:
       #  ./change_mnt_context --pidfile=change_mnt_context.pid --outfile=change_mnt_context.out
       #   45: ERR: change_mnt_context.c:23: mount (errno = 22 (Invalid argument))
       #

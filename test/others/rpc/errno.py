@@ -40,7 +40,7 @@ class test:
         resp.ParseFromString(self.s.recv(self._MAX_MSG_SIZE))
         return resp
 
-    def check_resp(self, resp, typ, err):
+    def check_resp(self, resp, typ, err, errmsg = None):
         if resp.type != typ:
             raise Exception('Unexpected response type ' + str(resp.type))
 
@@ -49,6 +49,9 @@ class test:
 
         if err and resp.cr_errno != err:
             raise Exception('Unexpected cr_errno ' + str(resp.cr_errno))
+
+        if errmsg and errmsg not in str(resp.cr_errmsg):
+            raise Exception('Unexpected cr_msg \'' + str(resp.cr_errmsg) + '\'')
 
     def no_process(self):
         print('Try to dump unexisting process')
@@ -132,11 +135,27 @@ class test:
 
         print('Success')
 
+    def child_first_err(self):
+        print('Receive correct first error message')
+
+        req = self.get_base_req()
+        req.type = rpc.CHECK
+        # Log file must not have subdirectory
+        req.opts.log_file = "/foo/bar.log"
+
+        self.send_req(req)
+        resp = self.recv_resp()
+
+        self.check_resp(resp, rpc.CHECK, None, "No subdirs are allowed in log_file name")
+
+        print('Success')
+
     def run(self):
         self.no_process()
         self.process_exists()
         self.bad_options()
         self.bad_request()
+        self.child_first_err()
 
 
 t = test()

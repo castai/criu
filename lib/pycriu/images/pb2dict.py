@@ -83,6 +83,7 @@ mmap_prot_map = [
 mmap_flags_map = [
     ('MAP_SHARED', 0x1),
     ('MAP_PRIVATE', 0x2),
+    ('MAP_DROPPABLE', 0x08),
     ('MAP_ANON', 0x20),
     ('MAP_GROWSDOWN', 0x0100),
 ]
@@ -104,6 +105,7 @@ mmap_status_map = [
     ('VMA_AREA_AIORING', 1 << 13),
     ('VMA_AREA_MEMFD', 1 << 14),
     ('VMA_AREA_SHSTK', 1 << 15),
+    ('VMA_AREA_UPROBES', 1 << 17),
     ('VMA_UNSUPP', 1 << 31),
 ]
 
