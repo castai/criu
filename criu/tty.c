@@ -2294,10 +2294,22 @@ static int tty_verify_ctty(void)
 			       d->sid);
 			return -ENOENT;
 		} else if (n->pid_real != d->pid_real) {
-			pr_err("ctty inheritance detected sid/pgrp %d "
-			       "(ctty pid_real %d pty pid_real %d)\n",
-			       d->sid, d->pid_real, n->pid_real);
-			return -ENOENT;
+			if (opts.shell_job) {
+				/*
+				 * With --shell-job the PTY master may be held by
+				 * a process outside the dump tree (e.g. a container
+				 * runtime).  The mismatch is expected; CRIU will
+				 * inherit the terminal on restore.
+				 */
+				pr_info("ctty/pty pid_real mismatch sid/pgrp %d "
+					"(ctty %d pty %d), ignoring with --shell-job\n",
+					d->sid, d->pid_real, n->pid_real);
+			} else {
+				pr_err("ctty inheritance detected sid/pgrp %d "
+				       "(ctty pid_real %d pty pid_real %d)\n",
+				       d->sid, d->pid_real, n->pid_real);
+				return -ENOENT;
+			}
 		}
 	}
 
