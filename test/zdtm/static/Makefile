@@ -182,6 +182,7 @@ TST_NOFILE	:=				\
 		tty02				\
 		tty03				\
 		tty04				\
+		tty05				\
 		poll				\
 		mountpoints			\
 		netns				\
