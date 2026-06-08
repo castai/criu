@@ -303,7 +303,7 @@ int dump_pstree(struct pstree_item *root_item)
 		if (!opts.shell_job) {
 			pr_err("The root process %d is not a session leader. "
 			       "Consider using --" OPT_SHELL_JOB " option\n",
-			       vpid(item));
+			       vpid(root_item));
 			return -1;
 		}
 	}

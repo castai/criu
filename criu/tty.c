@@ -1007,10 +1007,19 @@ static int pty_open_unpaired_slave(struct file_desc *d, struct tty_info *slave)
 		}
 
 		if (!stdin_isatty) {
-			pr_err("Don't have tty to inherit session from, aborting\n");
-			return -1;
+			/*
+			 * --shell-job was set but the restoring side has no
+			 * controlling terminal (e.g. container with no tty).
+			 * Clear inherit so we fall through to the fake-master
+			 * path and restore proceeds without a real tty.
+			 */
+			pr_info("No tty to inherit for slave %#x, "
+				"using fake master instead\n", slave->tfe->id);
+			slave->inherit = false;
 		}
+	}
 
+	if (slave->inherit) {
 		fd = fdstore_get(self_stdin_fdid);
 		if (fd < 0) {
 			pr_err("Can't get self_stdin_fdid\n");
@@ -1450,6 +1459,13 @@ shell_job:
 	}
 
 notask:
+	if (opts.shell_job) {
+		pr_info("No session leader for tty id %#x (sid %d), "
+			"ignoring because --shell-job is set\n",
+			info->tfe->id, info->tie->sid);
+		info->inherit = true;
+		return 0;
+	}
 	pr_err("No task found with sid %d\n", info->tie->sid);
 	return -1;
 }
@@ -1829,11 +1845,6 @@ int dump_verify_tty_sids(void)
 				if (!opts.shell_job) {
 					pr_err("Found dangling tty with sid %d pgid %d (%s) on peer fd %d.\n",
 					       dinfo->sid, dinfo->pgrp, dinfo->driver->name, dinfo->fd);
-					/*
-					 * First thing people do with criu is dump smth
-					 * run from shell. This is typical pitfall, warn
-					 * user about it explicitly.
-					 */
 					pr_msg("Task attached to shell terminal. "
 					       "Consider using --" OPT_SHELL_JOB " option. "
 					       "More details on http://criu.org/Simple_loop\n");
@@ -2309,10 +2320,11 @@ int tty_prep_fds(void)
 	if (!opts.shell_job)
 		return 0;
 
-	if (!isatty(STDIN_FILENO))
-		pr_info("Standard stream is not a terminal, may fail later\n");
-	else
-		stdin_isatty = true;
+	if (!isatty(STDIN_FILENO)) {
+		pr_info("Standard stream is not a terminal, skipping shell-job tty setup\n");
+		return 0;
+	}
+	stdin_isatty = true;
 
 	self_stdin_fdid = fdstore_add(STDIN_FILENO);
 	if (self_stdin_fdid < 0) {
