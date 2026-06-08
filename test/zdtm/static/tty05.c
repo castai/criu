@@ -51,12 +51,13 @@ int main(int argc, char **argv)
 {
 	int fdm, fds, dev_tty_fd;
 	char *slavename;
-	task_waiter_t t;
+	task_waiter_t t, t2;
 	pid_t pid;
 	int status;
 
 	test_init(argc, argv);
 	task_waiter_init(&t);
+	task_waiter_init(&t2);
 
 	/* Step 1: parent opens the PTY master and keeps it open. */
 	fdm = open("/dev/ptmx", O_RDWR);
@@ -130,13 +131,13 @@ int main(int argc, char **argv)
 		task_waiter_complete(&t, 1);
 
 		/*
-		 * Block until the parent sends SIGTERM after the C/R cycle.
-		 * Using pause() so the child is a simple, dumpable process.
+		 * Wait for the parent to signal us to exit after the C/R
+		 * cycle.  task_waiter uses a shared futex so it survives
+		 * C/R and is not confused by the SIGTERM/SIGCHLD handlers
+		 * installed by test_init().
 		 */
-		while (1)
-			pause();
+		task_waiter_wait4(&t2, 2);
 
-		/* unreachable */
 		close(dev_tty_fd);
 		close(fds);
 		exit(0);
@@ -155,9 +156,9 @@ int main(int argc, char **argv)
 	test_waitsig();
 
 	/*
-	 * After restore: kill the child and reap it.
+	 * After restore: wake the child so it exits cleanly, then reap.
 	 */
-	kill(pid, SIGTERM);
+	task_waiter_complete(&t2, 2);
 
 	if (waitpid(pid, &status, 0) < 0) {
 		pr_perror("waitpid");
@@ -167,12 +168,8 @@ int main(int argc, char **argv)
 
 	close(fdm);
 
-	/*
-	 * The child exits via SIGTERM so it will be signal-terminated,
-	 * not a clean exit(0) — that is expected.
-	 */
-	if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGTERM) {
-		fail("child did not exit via SIGTERM (status %d)", status);
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		fail("child did not exit cleanly (status %d)", status);
 		return 1;
 	}
 
