@@ -1412,6 +1412,27 @@ static int check_path_remap(struct fd_link *link, const struct fd_parms *parms, 
 
 		if (errno == ENOENT) {
 			link_strip_deleted(link);
+			/*
+			 * On external tmpfs mounts (e.g. /dev/shm provided by
+			 * the container runtime), link_remap.N is created on
+			 * the source node's in-memory tmpfs but is not included
+			 * in the checkpoint since CRIU does not dump external
+			 * mount contents.  The destination node gets a fresh
+			 * empty tmpfs, so rfi_remap() fails with ENOENT on
+			 * restore.  Fall back to dump_ghost_remap() which
+			 * embeds the file content in the image.
+			 *
+			 * For CRIU-managed tmpfs mounts (dumped via tar),
+			 * link_remap.N is preserved in the archive, so the
+			 * normal dump_linked_remap() path works correctly.
+			 */
+			if (parms->fs_type == TMPFS_MAGIC) {
+				struct mount_info *mi;
+
+				mi = lookup_mnt_id(parms->mnt_id);
+				if (mi && (mi->external || mnt_is_external_bind(mi)))
+					return dump_ghost_remap(rpath + 1, ost, lfd, id, nsid);
+			}
 			ret = dump_linked_remap(rpath + 1, plen - 1, parms, lfd, id, nsid, &fallback);
 			if (ret < 0 && fallback) {
 				/* fallback is true only if following conditions are true:
