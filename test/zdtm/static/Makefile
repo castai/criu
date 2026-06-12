@@ -467,6 +467,7 @@ TST_DIR		=				\
 		mntns_remap			\
 		mntns_open			\
 		mntns_link_remap		\
+		tmpfs_link_remap		\
 		mntns_ghost			\
 		mntns_ghost01			\
 		mntns_ro_root			\
