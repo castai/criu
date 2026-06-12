@@ -294,7 +294,6 @@ TST_NOFILE	:=				\
 		sigtrap01			\
 		change_mnt_context		\
 		fd_offset			\
-		tmpfs_link_remap		\
 #		jobctl00			\
 
 PKG_CONFIG ?= pkg-config
@@ -439,6 +438,7 @@ TST_DIR		=				\
 		mntns_remap			\
 		mntns_open			\
 		mntns_link_remap		\
+		tmpfs_link_remap		\
 		mntns_ghost			\
 		mntns_ghost01			\
 		mntns_ro_root			\
