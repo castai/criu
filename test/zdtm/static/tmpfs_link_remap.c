@@ -3,8 +3,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <linux/limits.h>
 
 #include "zdtmtst.h"
 
@@ -20,18 +22,18 @@ const char *test_author = "Filipe Augusto Lima de Souza <filipe@cast.ai>";
  * keeps st_nlink=1.
  *
  * Without the fix, CRIU dump takes dump_linked_remap() (because st_nlink>=1
- * and fstatat ENOENT), creates link_remap.N on the source /dev/shm tmpfs,
- * but never stores the content.  On restore, link_remap.N does not exist on
- * the destination tmpfs -> ENOENT -> "Can't open vma".
+ * and fstatat ENOENT), creates link_remap.N on the source tmpfs, but never
+ * stores the content.  On restore, link_remap.N does not exist on the
+ * destination tmpfs -> ENOENT -> "Can't open vma".
  *
  * With the fix, CRIU detects TMPFS_MAGIC and falls back to dump_ghost_remap()
  * which embeds the content in the checkpoint image.
  */
 
-#define SHM_DIR		"/dev/shm"
-#define SEM_NAME	SHM_DIR "/sem.zdtm-link-remap-test"
-#define SEM_ANCHOR	SHM_DIR "/sem.zdtm-link-remap-anchor"
-#define SEM_SIZE	4096
+#define FILE_SIZE	4096
+
+char *dirname;
+TEST_OPTION(dirname, string, "directory name", 1);
 
 int main(int argc, char **argv)
 {
@@ -39,34 +41,41 @@ int main(int argc, char **argv)
 	void *map;
 	uint32_t crc_before, crc_after;
 	struct stat st;
+	char sempath[PATH_MAX];
+	char anchorpath[PATH_MAX];
 
 	test_init(argc, argv);
 
-	/* Clean up any leftovers. */
-	unlink(SEM_NAME);
-	unlink(SEM_ANCHOR);
-
-	/* Step 1: create the file on tmpfs. */
-	fd = open(SEM_NAME, O_RDWR | O_CREAT | O_EXCL, 0600);
-	if (fd < 0) {
-		pr_perror("open");
+	mkdir(dirname, 0700);
+	if (mount("none", dirname, "tmpfs", 0, "") < 0) {
+		pr_perror("mount tmpfs on %s", dirname);
 		return 1;
 	}
-	if (ftruncate(fd, SEM_SIZE) < 0) {
+
+	snprintf(sempath, sizeof(sempath), "%s/sem.zdtm-link-remap-test", dirname);
+	snprintf(anchorpath, sizeof(anchorpath), "%s/sem.zdtm-link-remap-anchor", dirname);
+
+	/* Step 1: create the file on tmpfs. */
+	fd = open(sempath, O_RDWR | O_CREAT | O_EXCL, 0600);
+	if (fd < 0) {
+		pr_perror("open %s", sempath);
+		goto umount;
+	}
+	if (ftruncate(fd, FILE_SIZE) < 0) {
 		pr_perror("ftruncate");
-		return 1;
+		goto umount;
 	}
 
 	/* Step 2: mmap it MAP_SHARED -- creates the file-backed VMA. */
-	map = mmap(NULL, SEM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	map = mmap(NULL, FILE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (map == MAP_FAILED) {
 		pr_perror("mmap");
-		return 1;
+		goto umount;
 	}
 
 	/* Write known data and compute CRC before C/R. */
 	crc_before = ~0;
-	datagen(map, SEM_SIZE, &crc_before);
+	datagen(map, FILE_SIZE, &crc_before);
 
 	/*
 	 * Step 3: create a hard link so st_nlink becomes 2.
@@ -74,32 +83,32 @@ int main(int argc, char **argv)
 	 * ensuring CRIU sees st_nlink=1 (not 0) and takes dump_linked_remap
 	 * instead of dump_ghost_remap -- which is the bug trigger.
 	 */
-	if (link(SEM_NAME, SEM_ANCHOR) < 0) {
+	if (link(sempath, anchorpath) < 0) {
 		pr_perror("link");
-		return 1;
+		goto umount;
 	}
 
 	/*
 	 * Step 4: unlink the mapped name.
 	 * st_nlink drops to 1 (anchor survives).
-	 * /proc/PID/maps now shows "sem.zdtm-link-remap-test (deleted)".
+	 * /proc/PID/maps now shows the file as "(deleted)".
 	 * fstatat on that path returns ENOENT.
-	 * CRIU without fix: st_nlink=1 + ENOENT -> dump_linked_remap -> restore fails.
-	 * CRIU with fix:    TMPFS_MAGIC detected -> dump_ghost_remap -> restore works.
+	 * CRIU without fix: st_nlink=1 + ENOENT -> dump_linked_remap -> fails.
+	 * CRIU with fix:    TMPFS_MAGIC detected -> dump_ghost_remap -> works.
 	 */
-	if (unlink(SEM_NAME) < 0) {
+	if (unlink(sempath) < 0) {
 		pr_perror("unlink");
-		return 1;
+		goto umount;
 	}
 
 	/* Verify the trigger state: st_nlink=1, mapped path gone. */
 	if (fstat(fd, &st) < 0) {
 		pr_perror("fstat");
-		return 1;
+		goto umount;
 	}
 	if (st.st_nlink != 1) {
 		fail("Expected st_nlink=1, got %lu", (unsigned long)st.st_nlink);
-		return 1;
+		goto umount;
 	}
 
 	test_daemon();
@@ -107,26 +116,28 @@ int main(int argc, char **argv)
 
 	/* After C/R: verify the mmap content is intact. */
 	crc_after = ~0;
-	if (datachk(map, SEM_SIZE, &crc_after)) {
+	if (datachk(map, FILE_SIZE, &crc_after)) {
 		fail("mmap content CRC mismatch after restore");
-		goto out;
+		goto cleanup;
 	}
 
 	/* Verify the fd is still usable. */
 	if (fstat(fd, &st) < 0) {
 		pr_perror("fstat after restore");
-		goto out;
+		goto cleanup;
 	}
-	if (st.st_size != SEM_SIZE) {
+	if (st.st_size != FILE_SIZE) {
 		fail("fd size changed: expected %d got %lld",
-		     SEM_SIZE, (long long)st.st_size);
-		goto out;
+		     FILE_SIZE, (long long)st.st_size);
+		goto cleanup;
 	}
 
 	pass();
-out:
-	munmap(map, SEM_SIZE);
+cleanup:
+	munmap(map, FILE_SIZE);
 	close(fd);
-	unlink(SEM_ANCHOR); /* clean up anchor */
+	unlink(anchorpath);
+umount:
+	umount2(dirname, MNT_DETACH);
 	return 0;
 }
