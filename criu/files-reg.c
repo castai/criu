@@ -1412,7 +1412,7 @@ static int check_path_remap(struct fd_link *link, const struct fd_parms *parms, 
 
 		if (errno == ENOENT) {
 			link_strip_deleted(link);
-			/*
+			/* CAST AI
 			 * On tmpfs (e.g. /dev/shm), link_remap.N is created on
 			 * the source node's in-memory tmpfs and is never included
 			 * in the checkpoint.  The destination node always starts
