@@ -1214,6 +1214,8 @@ int setup_tcp_server(char *type, char *addr, unsigned short *port)
 {
 	int sk = -1;
 	int sockopt = 1;
+	int sndbuf = 4 * 1024 * 1024; /* 4 MB */
+	int rcvbuf = 4 * 1024 * 1024; /* 4 MB */
 	struct sockaddr_storage saddr;
 	socklen_t slen = sizeof(saddr);
 
@@ -1233,6 +1235,20 @@ int setup_tcp_server(char *type, char *addr, unsigned short *port)
 	if (setsockopt(sk, SOL_SOCKET, SO_REUSEADDR, &sockopt, sizeof(sockopt)) == -1) {
 		pr_perror("Unable to set SO_REUSEADDR");
 		goto out;
+	}
+
+	/*
+	 * Set large socket buffers to improve network throughput for page transfer.
+	 * Default system buffers (often 128-256KB) severely limit throughput.
+	 * Using 4MB buffers significantly improves performance especially for
+	 * high-bandwidth networks.
+	 */
+	if (setsockopt(sk, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) == -1) {
+		pr_pwarn("Unable to set SO_SNDBUF, may affect performance");
+	}
+
+	if (setsockopt(sk, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) == -1) {
+		pr_pwarn("Unable to set SO_RCVBUF, may affect performance");
 	}
 
 	if (bind(sk, (struct sockaddr *)&saddr, slen)) {
@@ -1270,6 +1286,8 @@ out:
 int run_tcp_server(bool daemon_mode, int *ask, int cfd, int sk)
 {
 	int ret;
+	int sndbuf = 4 * 1024 * 1024; /* 4 MB */
+	int rcvbuf = 4 * 1024 * 1024; /* 4 MB */
 	struct sockaddr_storage caddr;
 	socklen_t clen = sizeof(caddr);
 
@@ -1312,6 +1330,19 @@ int run_tcp_server(bool daemon_mode, int *ask, int cfd, int sk)
 			goto err;
 		}
 		pr_info("Accepted connection from %s:%s\n", address, port);
+
+		/*
+		 * Set large socket buffers on accepted connection to improve
+		 * network throughput for page transfer.
+		 */
+		if (setsockopt(*ask, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) == -1) {
+			pr_pwarn("Unable to set SO_SNDBUF on accepted socket, may affect performance");
+		}
+
+		if (setsockopt(*ask, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) == -1) {
+			pr_pwarn("Unable to set SO_RCVBUF on accepted socket, may affect performance");
+		}
+
 		close(sk);
 	}
 
@@ -1327,6 +1358,8 @@ int setup_tcp_client(char *hostname)
 	struct addrinfo addr_criteria, *addr_list, *p;
 	char ipstr[INET6_ADDRSTRLEN];
 	int sk = -1;
+	int sndbuf = 4 * 1024 * 1024; /* 4 MB */
+	int rcvbuf = 4 * 1024 * 1024; /* 4 MB */
 	void *ip;
 
 	memset(&addr_criteria, 0, sizeof(addr_criteria));
@@ -1366,6 +1399,18 @@ int setup_tcp_client(char *hostname)
 		if (sk < 0) {
 			pr_perror("Can't create socket");
 			goto out;
+		}
+
+		/*
+		 * Set large socket buffers to improve network throughput for page transfer.
+		 * Default system buffers (often 128-256KB) severely limit throughput.
+		 */
+		if (setsockopt(sk, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) == -1) {
+			pr_pwarn("Unable to set SO_SNDBUF, may affect performance");
+		}
+
+		if (setsockopt(sk, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) == -1) {
+			pr_pwarn("Unable to set SO_RCVBUF, may affect performance");
 		}
 
 		if (connect(sk, (struct sockaddr *)&saddr, sizeof(saddr)) < 0) {
