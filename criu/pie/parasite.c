@@ -70,15 +70,54 @@ static int mprotect_vmas(struct parasite_dump_pages_args *args)
 
 static int dump_pages(struct parasite_dump_pages_args *args)
 {
-	int p, ret, tsock;
+	int p[2], ret, tsock;
 	struct iovec *iovs;
 	int off, nr_segs;
 	unsigned long spliced_bytes = 0;
 
 	tsock = parasite_get_rpc_sock();
-	p = recv_fd(tsock);
-	if (p < 0)
+
+	/*
+	 * Create the pipe here in the parasite context so it inherits the
+	 * container's SELinux label. This allows vmsplice to work when
+	 * SELinux is enforcing. We send the read-end to CRIU and keep
+	 * the write-end for vmsplice.
+	 */
+	ret = sys_pipe2(p, 0);
+	if (ret < 0) {
+		pr_err("Can't create pipe for page dumping (%d)\n", ret);
 		return -1;
+	}
+
+	/* Send read-end to CRIU */
+	ret = send_fd(tsock, NULL, 0, p[0]);
+	if (ret < 0) {
+		pr_err("Can't send pipe read-end to CRIU (%d)\n", ret);
+		sys_close(p[0]);
+		sys_close(p[1]);
+		return -1;
+	}
+	sys_close(p[0]); /* Parasite doesn't need the read-end */
+
+	/*
+	 * Wait for CRIU to resize the pipe and send ack.
+	 * CRIU has CAP_SYS_RESOURCE and can resize the pipe, whereas
+	 * the container context may lack this capability.
+	 */
+	{
+		char ack;
+		ret = sys_recvfrom(tsock, &ack, sizeof(ack), MSG_WAITALL, NULL, 0);
+		if (ret != sizeof(ack)) {
+			pr_err("Failed to receive pipe resize ack (%d)\n", ret);
+			sys_close(p[1]);
+			return -1;
+		}
+		if (ack != 0) {
+			pr_err("CRIU failed to resize pipe (ack=%d)\n", (int)ack);
+			sys_close(p[1]);
+			return -1;
+		}
+	}
 
 	iovs = pargs_iovs(args);
 	off = 0;
@@ -86,9 +125,9 @@ static int dump_pages(struct parasite_dump_pages_args *args)
 	if (nr_segs > UIO_MAXIOV)
 		nr_segs = UIO_MAXIOV;
 	while (1) {
-		ret = sys_vmsplice(p, &iovs[args->off + off], nr_segs, SPLICE_F_GIFT | SPLICE_F_NONBLOCK);
+		ret = sys_vmsplice(p[1], &iovs[args->off + off], nr_segs, SPLICE_F_GIFT | SPLICE_F_NONBLOCK);
 		if (ret < 0) {
-			sys_close(p);
+			sys_close(p[1]);
 			pr_err("Can't splice pages to pipe (%d/%d/%d)\n", ret, nr_segs, args->off + off);
 			return -1;
 		}
@@ -100,12 +139,12 @@ static int dump_pages(struct parasite_dump_pages_args *args)
 			nr_segs = args->nr_segs - off;
 	}
 	if (spliced_bytes != args->nr_pages * PAGE_SIZE) {
-		sys_close(p);
+		sys_close(p[1]);
 		pr_err("Can't splice all pages to pipe (%ld/%ld)\n", spliced_bytes, args->nr_pages);
 		return -1;
 	}
 
-	sys_close(p);
+	sys_close(p[1]);
 	return 0;
 }
 
@@ -664,6 +703,41 @@ static int parasite_get_proc_fd(void)
 	return ret;
 }
 
+/*
+ * Reset dirty memory tracking by writing "4" to /proc/self/clear_refs.
+ * This is done from the parasite context to have the correct SELinux
+ * context (container_t) for accessing the proc file.
+ */
+static int parasite_reset_dirty_track(void)
+{
+	int proc, fd, ret;
+	char cmd[] = "4";
+
+	proc = get_proc_fd();
+	if (proc < 0) {
+		pr_err("Can't get /proc fd for dirty track reset\n");
+		return -1;
+	}
+
+	fd = sys_openat(proc, "self/clear_refs", O_RDWR, 0);
+	sys_close(proc);
+	if (fd < 0) {
+		pr_err("Can't open /proc/self/clear_refs (%d)\n", fd);
+		return fd;
+	}
+
+	ret = sys_write(fd, cmd, sizeof(cmd));
+	sys_close(fd);
+
+	if (ret < 0) {
+		pr_err("Can't write to /proc/self/clear_refs (%d)\n", ret);
+		return ret;
+	}
+
+	pr_debug("Reset dirty tracking done\n");
+	return 0;
+}
+
 static inline int tty_ioctl(int fd, int cmd, int *arg)
 {
 	int ret;
@@ -905,6 +979,9 @@ int parasite_daemon_cmd(int cmd, void *args)
 		break;
 	case PARASITE_CMD_DUMP_CGROUP:
 		ret = parasite_dump_cgroup(args);
+		break;
+	case PARASITE_CMD_RESET_DIRTY_TRACK:
+		ret = parasite_reset_dirty_track();
 		break;
 	default:
 		pr_err("Unknown command in parasite daemon thread leader: %d\n", cmd);

@@ -50,6 +50,7 @@ int open_vmas(struct pstree_item *t);
 int prepare_vmas(struct pstree_item *t, struct task_restore_args *ta);
 int unmap_guard_pages(struct pstree_item *t);
 int prepare_mappings(struct pstree_item *t);
+int finalize_exec_mappings(struct pstree_item *t);
 
 struct page_info {
 	u64 next;

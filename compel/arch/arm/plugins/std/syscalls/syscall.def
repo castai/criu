@@ -92,6 +92,7 @@ get_robust_list			100	339	(int pid, struct robust_list_head **head_ptr, size_t *
 signalfd4			74	355	(int fd, k_rtsigset_t *mask, size_t sizemask, int flags)
 rt_tgsigqueueinfo		240	363	(pid_t tgid, pid_t pid, int sig, siginfo_t *info)
 vmsplice			75	343	(int fd, const struct iovec *iov, unsigned long nr_segs, unsigned int flags)
+pipe2				59	359	(int *fildes, int flags)
 timerfd_settime			86	353	(int ufd, int flags, const struct itimerspec *utmr, struct itimerspec *otmr)
 fanotify_init			262	367	(unsigned int flags, unsigned int event_f_flags)
 fanotify_mark			263	368	(int fanotify_fd, unsigned int flags, uint64_t mask, int dfd, const char *pathname)

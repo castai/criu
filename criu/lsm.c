@@ -168,6 +168,49 @@ int reset_setsockcreatecon(void)
 	return 0;
 }
 
+/*
+ * Set the SELinux fscreate context for pipe/file creation.
+ * This is needed for page pipes that will be written to by the
+ * parasite running in the container's context.
+ */
+int set_fscreatecon_for_pid(pid_t pid)
+{
+	char *ctx = NULL;
+	int ret;
+
+	/* Currently this only works for SELinux. */
+	if (kdat.lsm != LSMTYPE__SELINUX)
+		return 0;
+
+	ret = getpidcon_raw(pid, &ctx);
+	if (ret < 0) {
+		pr_perror("Getting SELinux context for PID %d failed", pid);
+		return -1;
+	}
+
+	ret = setfscreatecon_raw(ctx);
+	freecon(ctx);
+	if (ret < 0) {
+		pr_perror("Setting SELinux fscreate context for PID %d failed", pid);
+		return -1;
+	}
+
+	return 0;
+}
+
+int reset_fscreatecon(void)
+{
+	/* Currently this only works for SELinux. */
+	if (kdat.lsm != LSMTYPE__SELINUX)
+		return 0;
+
+	if (setfscreatecon_raw(NULL)) {
+		pr_perror("Unable to reset fscreate SELinux context");
+		return -1;
+	}
+	return 0;
+}
+
 int run_setsockcreatecon(FdinfoEntry *e)
 {
 	char *ctx = NULL;

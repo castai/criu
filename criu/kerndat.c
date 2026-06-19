@@ -1767,8 +1767,13 @@ static int kerndat_breakpoints(void)
 	}
 	if (pid == 0) {
 		if (ptrace(PTRACE_TRACEME, 0, 0, 0)) {
-			pr_perror("ptrace(PTRACE_TRACEME)");
-			exit(1);
+			/*
+			 * PTRACE_TRACEME can fail in certain container/VM
+			 * environments. This is not fatal - breakpoints are
+			 * optional. Exit with 0 to signal graceful skip.
+			 */
+			pr_warn("ptrace(PTRACE_TRACEME) failed, breakpoints disabled\n");
+			exit(0);
 		}
 		raise(SIGSTOP);
 		breakpoint_func();
@@ -1777,6 +1782,14 @@ static int kerndat_breakpoints(void)
 	if (waitpid(pid, &status, 0) == -1) {
 		pr_perror("waitpid for initial stop");
 		goto err;
+	}
+	/*
+	 * If child exited with 0, it means PTRACE_TRACEME failed and
+	 * we should gracefully disable breakpoints.
+	 */
+	if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+		pr_debug("Hardware breakpoints disabled (ptrace not available)\n");
+		return 0;
 	}
 	if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGSTOP) {
 		pr_err("Child didn't stop as expected: status=%x\n", status);

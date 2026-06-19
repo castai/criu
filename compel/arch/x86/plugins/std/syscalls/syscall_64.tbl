@@ -97,6 +97,7 @@ __NR_vmsplice			278		sys_vmsplice		(int fd, const struct iovec *iov, unsigned lo
 __NR_fallocate			285		sys_fallocate		(int fd, int mode, loff_t offset, loff_t len)
 __NR_timerfd_settime		286		sys_timerfd_settime	(int ufd, int flags, const struct itimerspec *utmr, struct itimerspec *otmr)
 __NR_signalfd4			289		sys_signalfd		(int fd, k_rtsigset_t *mask, size_t sizemask, int flags)
+__NR_pipe2			293		sys_pipe2		(int *fildes, int flags)
 __NR_preadv			295		sys_preadv_raw		(int fd, struct iovec *iov, unsigned long nr, unsigned long pos_l, unsigned long pos_h)
 __NR_rt_tgsigqueueinfo		297		sys_rt_tgsigqueueinfo	(pid_t tgid, pid_t pid, int sig, siginfo_t *info)
 __NR_fanotify_init		300		sys_fanotify_init	(unsigned int flags, unsigned int event_f_flags)

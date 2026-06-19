@@ -5,7 +5,9 @@
 #include <fcntl.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 
+#include "memfd.h"
 #include "types.h"
 #include "cr_options.h"
 #include "servicefd.h"
@@ -31,12 +33,19 @@
 #include "fault-injection.h"
 #include "prctl.h"
 #include "compel/infect-util.h"
+#include "compel/infect-rpc.h"
 #include "pidfd-store.h"
+#include "lsm.h"
 
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
 
-static int task_reset_dirty_track(int pid)
+/*
+ * Reset dirty memory tracking via parasite command. This is preferred
+ * when the parasite is available because it runs with the container's
+ * SELinux context, avoiding permission issues on systems like Bottlerocket.
+ */
+static int task_reset_dirty_track_parasite(struct parasite_ctl *ctl)
 {
 	int ret;
 
@@ -45,9 +54,15 @@ static int task_reset_dirty_track(int pid)
 
 	BUG_ON(!kdat.has_dirty_track);
 
-	ret = do_task_reset_dirty_track(pid);
-	BUG_ON(ret == 1);
-	return ret;
+	pr_info("Reset dirty tracking via parasite\n");
+	ret = compel_rpc_call_sync(PARASITE_CMD_RESET_DIRTY_TRACK, ctl);
+	if (ret < 0) {
+		pr_err("Parasite failed to reset dirty tracking\n");
+		return -1;
+	}
+
+	pr_info(" ... done\n");
+	return 0;
 }
 
 int do_task_reset_dirty_track(int pid)
@@ -342,9 +357,57 @@ static int drain_pages(struct page_pipe *pp, struct parasite_ctl *ctl, struct pa
 		ret = compel_rpc_call(PARASITE_CMD_DUMPPAGES, ctl);
 		if (ret < 0)
 			return -1;
-		ret = compel_util_send_fd(ctl, ppb->p[1]);
+
+		/*
+		 * The parasite creates the pipe (so it has the container's
+		 * SELinux context) and sends us the read-end.
+		 *
+		 * Close the CRIU-created pipes. Only close if this ppb owns
+		 * the pipe (pipe_off == 0 means it's not sharing with prev).
+		 */
+		if (ppb->pipe_off == 0) {
+			if (ppb->p[0] >= 0)
+				close(ppb->p[0]);
+			if (ppb->p[1] >= 0)
+				close(ppb->p[1]);
+		}
+		ppb->p[1] = -1; /* We don't have the write end */
+
+		ret = compel_util_recv_fd(ctl, &ppb->p[0]);
 		if (ret)
 			return -1;
+
+		/*
+		 * Resize the pipe from CRIU side (has CAP_SYS_RESOURCE).
+		 * The parasite (running in container context) may lack this
+		 * capability or hit pipe-user-pages-soft limit.
+		 */
+		{
+			unsigned long pipe_size_needed = args->nr_pages * PAGE_SIZE;
+			char ack = 0;
+			int sk = compel_rpc_sock(ctl);
+
+			if (pipe_size_needed > 0) {
+				int resize_ret = fcntl(ppb->p[0], F_SETPIPE_SZ, pipe_size_needed);
+				if (resize_ret < (long)pipe_size_needed) {
+					pr_err("Can't resize pipe to %lu bytes (got %d)\n",
+					       pipe_size_needed, resize_ret);
+					ack = 1;
+				} else {
+					ppb->pipe_size = resize_ret / PAGE_SIZE;
+					pr_debug("Resized pipe to %d bytes (%u pages)\n",
+						 resize_ret, ppb->pipe_size);
+				}
+			}
+
+			/* Send ack to parasite (0=success, non-zero=failure) */
+			if (send(sk, &ack, sizeof(ack), 0) != sizeof(ack)) {
+				pr_perror("Failed to send pipe resize ack");
+				return -1;
+			}
+			if (ack != 0)
+				return -1;
+		}
 
 		ret = compel_rpc_sync(PARASITE_CMD_DUMPPAGES, ctl);
 		if (ret < 0)
@@ -560,7 +623,20 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		 * use, i.e. on non-lazy non-predump.
 		 */
 		cpp_flags |= PP_CHUNK_MODE;
+
+	/*
+	 * Set SELinux fscreate context before creating page pipes.
+	 * The pipes will be written to by the parasite running in
+	 * the container's security context.
+	 */
+	if (set_fscreatecon_for_pid(item->pid->real))
+		goto out;
+
 	pp = create_page_pipe(vma_area_list->nr_priv_pages, mdc->lazy ? NULL : pargs_iovs(args), cpp_flags);
+
+	/* Reset fscreate context regardless of success/failure */
+	reset_fscreatecon();
+
 	if (!pp)
 		goto out;
 
@@ -630,10 +706,12 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	timing_stop(TIME_MEMDUMP);
 
 	/*
-	 * Step 4 -- clean up
+	 * Step 4 -- clean up: reset dirty tracking via parasite
+	 * Using the parasite ensures we have the correct SELinux context
+	 * (container_t) to access /proc/self/clear_refs.
 	 */
 
-	ret = task_reset_dirty_track(item->pid->real);
+	ret = task_reset_dirty_track_parasite(ctl);
 	if (ret)
 		goto out_xfer;
 	exit_code = 0;
@@ -956,9 +1034,21 @@ static int premap_private_vma(struct pstree_item *t, struct vma_area *vma, void 
 		 * mremap()-ed (branch below) so we MIGHT need to have WRITE
 		 * bits there. Ideally we'd check for the whole COW-chain
 		 * having any data in.
+		 *
+		 * Strip PROT_EXEC to avoid combining it with PROT_WRITE on
+		 * anonymous mappings, which triggers SELinux execmem checks.
+		 * The restorer will mprotect() back to the original
+		 * protections after the data has been written.
 		 */
-		addr = mmap(*tgt_addr, size, vma->e->prot | PROT_WRITE, vma->e->flags | MAP_FIXED | flag, vma->e->fd,
-			    vma->e->pgoff);
+		if ((vma->e->prot & PROT_EXEC) && (vma->e->flags & MAP_ANONYMOUS))
+			pr_warn("Premapping anon VMA %#016" PRIx64 "-%#016" PRIx64
+				" with PROT_EXEC (prot %#x flags %#x status %#x fd %" PRId64 ")\n",
+				vma->e->start, vma->e->end,
+				vma->e->prot, vma->e->flags,
+				vma->e->status, vma->e->fd);
+
+		addr = mmap(*tgt_addr, size, (vma->e->prot | PROT_WRITE) & ~PROT_EXEC,
+			    vma->e->flags | MAP_FIXED | flag, vma->e->fd, vma->e->pgoff);
 
 		if (addr == MAP_FAILED) {
 			pr_perror("Unable to map ANON_VMA");
@@ -1443,6 +1533,89 @@ int unmap_guard_pages(struct pstree_item *t)
 				return -1;
 			}
 		}
+	}
+
+	return 0;
+}
+
+/*
+ * Convert premapped PROT_EXEC VMAs from anonymous to memfd-backed
+ * MAP_PRIVATE mappings. This avoids SELinux execmem/execmod denials
+ * when the restorer's mprotect() adds PROT_EXEC back.
+ *
+ * During premapping we strip PROT_EXEC (to avoid PROT_WRITE+PROT_EXEC
+ * on anonymous/private memory, which requires process:execmem).
+ * Here we create a memfd with the final page content and re-mmap
+ * with the original prot. The kernel's file_map_prot_check() skips
+ * the execmem check for file-backed MAP_PRIVATE without PROT_WRITE:
+ *   (PROT_EXEC) && (!file || IS_PRIVATE(inode) || (!shared && PROT_WRITE))
+ * memfd is a file, not IS_PRIVATE, and we don't set PROT_WRITE => no execmem.
+ *
+ * Must be called after all children have finished premapping (after
+ * the CR_STATE_FORKING barrier) so no child will mremap from our
+ * premmaped_addr anymore.
+ */
+int finalize_exec_mappings(struct pstree_item *t)
+{
+	struct vma_area *vma;
+	struct list_head *vmas = &rsti(t)->vmas.h;
+
+	list_for_each_entry(vma, vmas, list) {
+		void *addr;
+		unsigned long size;
+		int fd;
+		ssize_t off, ret;
+
+		if (!(vma->e->prot & PROT_EXEC))
+			continue;
+		if (vma->e->prot & PROT_WRITE)
+			continue; /* RWX VMAs inherently need execmem */
+		if (!vma_area_is(vma, VMA_PREMMAPED))
+			continue;
+
+		addr = decode_pointer(vma->premmaped_addr);
+		size = vma_entry_len(vma->e);
+
+		fd = memfd_create("exec_vma", 0);
+		if (fd < 0) {
+			pr_perror("Can't create memfd for exec VMA "
+				  "%#016" PRIx64 "-%#016" PRIx64,
+				  vma->e->start, vma->e->end);
+			return -1;
+		}
+
+		if (ftruncate(fd, size)) {
+			pr_perror("Can't resize exec VMA memfd");
+			goto err;
+		}
+
+		for (off = 0; off < (ssize_t)size; ) {
+			ret = write(fd, addr + off, size - off);
+			if (ret <= 0) {
+				pr_perror("Can't write exec VMA to memfd");
+				goto err;
+			}
+			off += ret;
+		}
+
+		/*
+		 * Replace the anonymous RW mapping with a memfd-backed
+		 * MAP_PRIVATE mapping using the original prot (typically
+		 * PROT_READ|PROT_EXEC). The VMA gets VM_EXEC from the
+		 * start, so the restorer's later mprotect() won't enter
+		 * the selinux_file_mprotect exec check block.
+		 */
+		if (mmap(addr, size, vma->e->prot,
+			 MAP_PRIVATE | MAP_FIXED, fd, 0) != addr) {
+			pr_perror("Can't remap exec VMA from memfd");
+			goto err;
+		}
+
+		close(fd);
+		continue;
+err:
+		close(fd);
+		return -1;
 	}
 
 	return 0;
