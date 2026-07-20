@@ -449,6 +449,7 @@ usage:
 	       "     --" SK_INFLIGHT_PARAM "   skip (ignore) in-flight TCP connections\n"
 	       "     --" SK_CLOSE_PARAM "        don't dump the state of, or block, established tcp\n"
 	       "                        connections, and restore them in closed state.\n"
+	       "  --keep-network-lock   keep network locked after dump (live migration)\n"
 	       "  -r|--root PATH        change the root filesystem (when run in mount namespace)\n"
 	       "  --evasive-devices     use any path to a device file if the original one\n"
 	       "                        is inaccessible\n"

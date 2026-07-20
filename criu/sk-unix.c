@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <dlfcn.h>
 #include <libgen.h>
+#include <linux/openat2.h>
 
 #include "libnetlink.h"
 #include "cr_options.h"
@@ -23,7 +24,9 @@
 #include "util-pie.h"
 #include "sockets.h"
 #include "sk-queue.h"
+#include "sk-unix-shared.h"
 #include "mount.h"
+#include "mount-v2.h"
 #include "cr-service.h"
 #include "plugin.h"
 #include "namespaces.h"
@@ -255,6 +258,17 @@ static int get_mnt_id(int lfd, int *mnt_id)
 	return 0;
 }
 
+static int openat_resolve_in_root(int dirfd, const char *pathname, int flags)
+{
+	struct open_how how = {
+		.flags = flags,
+		.mode = 0,
+		.resolve = RESOLVE_IN_ROOT,
+	};
+
+	return sys_openat2(dirfd, pathname, &how, sizeof(how));
+}
+
 static int resolve_rel_name(uint32_t id, struct unix_sk_desc *sk, const struct fd_parms *p, char **pdir)
 {
 	const char *dirs[] = { "cwd", "root" };
@@ -285,7 +299,7 @@ static int resolve_rel_name(uint32_t id, struct unix_sk_desc *sk, const struct f
 	for (i = 0; i < ARRAY_SIZE(dirs); i++) {
 		char dir[PATH_MAX], path[PATH_MAX];
 		struct stat st;
-		int ret;
+		int ret, path_fd;
 
 		snprintf(path, sizeof(path), "/proc/%d/%s", p->pid, dirs[i]);
 		ret = readlink(path, dir, sizeof(dir));
@@ -299,9 +313,25 @@ static int resolve_rel_name(uint32_t id, struct unix_sk_desc *sk, const struct f
 			pr_err("The path .%s/%s is too long\n", dir, sk->name);
 			goto err;
 		}
-		if (fstatat(mntns_root, path, &st, 0)) {
-			if (errno == ENOENT)
+
+		/*
+		 * Use openat2 with RESOLVE_IN_ROOT to properly handle absolute
+		 * symlinks within the mount namespace. This prevents symlinks like
+		 * /var/run -> /run from escaping to the host's namespace.
+		 */
+		path_fd = openat_resolve_in_root(mntns_root, path, O_PATH | O_NOFOLLOW);
+		if (path_fd < 0) {
+			if (errno == ENOENT) {
+				pr_debug("Socket path %s does not exist\n", path);
 				continue;
+			}
+			goto err;
+		}
+
+		ret = fstat(path_fd, &st);
+		close(path_fd);
+		if (ret < 0) {
+			pr_perror("Can't fstat socket path %s", path);
 			goto err;
 		}
 
@@ -696,12 +726,16 @@ static int unix_resolve_name(int lfd, uint32_t id, struct unix_sk_desc *d, UnixS
 	if (name[0] != '/') {
 		if (cut_path_ending(path, name)) {
 			pr_err("Unable too cut %s from %s\n", name, path);
-			goto out;
+			if (unix_resolve_name_old(lfd, id, d, ue, p)) {
+				pr_err("unix_resolve_name: unix_resolve_name_old failed\n");
+				goto out;
+			}
+            pr_debug("unix_resolve_name: unix_resolve_name_old fallback succeeded\n");
+		} else {
+            ue->name_dir = xstrdup(path);
+            if (!ue->name_dir)
+                goto out;
 		}
-
-		ue->name_dir = xstrdup(path);
-		if (!ue->name_dir)
-			goto out;
 
 		pr_debug("Resolved socket relative name %s to %s/%s\n", name, ue->name_dir, name);
 	}
@@ -900,7 +934,16 @@ static int dump_external_sockets(struct unix_sk_desc *peer)
 	while (!list_empty(&peer->peer_list)) {
 		sk = list_first_entry(&peer->peer_list, struct unix_sk_desc, peer_node);
 
-		if (__dump_external_socket(sk, peer))
+		/*
+		 * Alternative path for stream/seqpacket external peers
+		 * (shared sockets between containers): accept
+		 * unconditionally, bypassing upstream's reject. The
+		 * in-scope side's entry is still written below via
+		 * write_unix_entry(); the peer stub itself is emitted
+		 * in fix_external_unix_sockets.
+		 */
+		if (!sk_shared_is_stream_ext_peer(peer->type) &&
+		    __dump_external_socket(sk, peer))
 			return -1;
 
 		if (write_unix_entry(sk))
@@ -911,6 +954,63 @@ static int dump_external_sockets(struct unix_sk_desc *peer)
 	}
 
 	return 0;
+}
+
+/*
+ * Alternative external-stub writer for shared stream/seqpacket
+ * sockets (e.g., two containers in a pod sharing a listener path).
+ *
+ * The upstream stub body in fix_external_unix_sockets below writes a
+ * DGRAM-shaped placeholder; for streams we need the real type/state,
+ * a back-link to the in-scope side via peer_ino, and — on the
+ * connector side — the listener's path recovered via getpeername on
+ * the in-scope side's live fd.
+ *
+ * This duplicates the protobuf boilerplate from the upstream body
+ * intentionally: keeping it separate means upstream fix_external_unix_sockets
+ * stays byte-for-byte unchanged.
+ */
+static int sk_shared_write_stub(struct unix_sk_desc *sk)
+{
+	FileEntry fe = FILE_ENTRY__INIT;
+	UnixSkEntry e = UNIX_SK_ENTRY__INIT;
+	FownEntry fown = FOWN_ENTRY__INIT;
+	SkOptsEntry skopts = SK_OPTS_ENTRY__INIT;
+	struct unix_sk_desc *first_peer;
+	char *recovered_name = NULL;
+	size_t recovered_len = 0;
+	int ret;
+
+	first_peer = list_first_entry(&sk->peer_list, struct unix_sk_desc, peer_node);
+	if (!sk->name && first_peer->fd >= 0)
+		recovered_name = sk_shared_getpeername_path(first_peer->fd, &recovered_len);
+
+	fd_id_generate_special(NULL, &e.id);
+	e.ino = sk->sd.ino;
+	e.type = sk->type;
+	e.state = sk->state;
+	if (recovered_name) {
+		e.name.data = (void *)recovered_name;
+		e.name.len = recovered_len;
+	} else {
+		e.name.data = (void *)sk->name;
+		e.name.len = (size_t)sk->namelen;
+	}
+	e.uflags = USK_EXTERN;
+	e.peer = sk->peer_ino;
+	e.fown = &fown;
+	e.opts = &skopts;
+
+	fe.type = FD_TYPES__UNIXSK;
+	fe.id = e.id;
+	fe.usk = &e;
+
+	ret = pb_write_one(img_from_set(glob_imgset, CR_FD_FILES), &fe, PB_FILE);
+	if (ret == 0)
+		show_one_unix_img("Dumped extern (shared)", &e);
+
+	xfree(recovered_name);
+	return ret;
 }
 
 int fix_external_unix_sockets(void)
@@ -929,6 +1029,21 @@ int fix_external_unix_sockets(void)
 			continue;
 
 		show_one_unix("Dumping extern", sk);
+
+		/*
+		 * Alternative path for stream/seqpacket external peers
+		 * (shared sockets between containers). Upstream below
+		 * writes a DGRAM-shaped stub; we need real type/state
+		 * and a back-link to the in-scope side, plus the
+		 * listener path recovered via getpeername.
+		 */
+		if (sk_shared_is_stream_ext_peer(sk->type)) {
+			if (sk_shared_write_stub(sk))
+				goto err;
+			if (dump_external_sockets(sk))
+				goto err;
+			continue;
+		}
 
 		fd_id_generate_special(NULL, &e.id);
 		e.ino = sk->sd.ino;
@@ -1793,6 +1908,57 @@ static int setup_second_end(int *sks, struct fdinfo_list_entry *second_end)
 	return 0;
 }
 
+/*
+ * Alternative restore path for stream/seqpacket sockets whose peer is
+ * an external stub (USK_EXTERN) — i.e. multi-container shared unix
+ * sockets.
+ *
+ * Split by whether the stub carries a path (recovered via getpeername
+ * at dump time):
+ *
+ *   - non-empty name: we are the "connector" side. Open a fresh
+ *     socket and connect() to the path, retrying while the peer
+ *     listener is not yet up.
+ *
+ *   - empty name: we are the "acceptor" side (originally an
+ *     accept()'d fd on the listener container). There's nothing to
+ *     reconnect to from our end; hand the application a dead
+ *     socketpair so it sees EOF. The accept loop of the server app
+ *     picks up fresh connections from the restored listener.
+ *
+ * Upstream's USK_EXTERN reject in open_unixsk_standalone is left
+ * intact — this function is called before it. Live-connection
+ * guarantees (queued bytes, SO_PEERCRED) are intentionally dropped
+ * across the external boundary; applications must handle reconnect.
+ */
+static int sk_shared_open_standalone(struct unix_sk_info *ui, int *sk_out)
+{
+	struct unix_sk_info *peer = ui->peer;
+	int sk;
+
+	if (peer->ue->name.len > 0) {
+		sk = socket(PF_UNIX, ui->ue->type, 0);
+		if (sk < 0) {
+			pr_perror("Can't make unix socket");
+			return -1;
+		}
+		if (sk_shared_connect_with_retry(sk,
+				(const char *)peer->ue->name.data,
+				peer->ue->name.len,
+				opts.timeout) < 0) {
+			close(sk);
+			return -1;
+		}
+	} else {
+		if (sk_shared_dead_acceptor_fd(ui->ue->type, &sk) < 0)
+			return -1;
+	}
+
+	ui->is_connected = true;
+	*sk_out = sk;
+	return 0;
+}
+
 static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 {
 	struct unix_sk_info *queuer = ui->queuer;
@@ -1902,6 +2068,21 @@ static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 			sk = run_plugins(RESTORE_UNIX_SK, ui->ue->ino);
 			if (sk >= 0)
 				goto out;
+		}
+
+		/*
+		 * Alternative path for stream/seqpacket external peers
+		 * (shared sockets between containers). Handled by
+		 * sk_shared_open_standalone() above; on success we jump
+		 * straight to out. Upstream's --ext-unix-sk reject below
+		 * is untouched and still fires for dgram externals
+		 * without consent.
+		 */
+		if (ui->peer && (ui->peer->ue->uflags & USK_EXTERN) &&
+		    sk_shared_is_stream_ext_peer(ui->ue->type)) {
+			if (sk_shared_open_standalone(ui, &sk) < 0)
+				return -1;
+			goto out;
 		}
 
 		/*
@@ -2288,6 +2469,15 @@ static int fixup_unix_peer(struct unix_sk_info *ui)
 
 	if (peer != ui && peer->peer == ui && !(ui->flags & (USK_PAIR_MASTER | USK_PAIR_SLAVE))) {
 		pr_info("Connected %d -> %d (%d) flags %#x\n", ui->ue->ino, ui->ue->peer, peer->ue->ino, ui->flags);
+		/*
+		 * External stubs have no fd owners in this image.
+		 * interconnected_pair() would BUG inside file_master().
+		 * Skip when either side is USK_EXTERN — these pairs are
+		 * restored via the dedicated external path, not
+		 * socketpair master/slave.
+		 */
+		if ((ui->ue->uflags & USK_EXTERN) || (peer->ue->uflags & USK_EXTERN))
+			return 0;
 		/* socketpair or interconnected sockets */
 		if (interconnected_pair(ui, peer))
 			return -1;

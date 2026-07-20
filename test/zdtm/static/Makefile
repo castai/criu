@@ -98,6 +98,7 @@ TST_NOFILE	:=				\
 		socket-tcp-local		\
 		socket-tcp-reuseport		\
 		socket-tcp-ipt-nfconntrack	\
+		socket-tcp-ipt-redirect-conntrack	\
 		socket-tcp-nft-nfconntrack	\
 		socket-tcp6-local		\
 		socket-tcp4v6-local		\
@@ -128,6 +129,8 @@ TST_NOFILE	:=				\
 		socket-tcp-close1 		\
 		socket-tcp-close2		\
 		socket-dump-tcp-close 		\
+		socket-tcp-localhost		\
+		socket-tcp-uid			\
 		socket-tcp-unconn		\
 		socket-tcp6-unconn		\
 		socket-tcp-syn-sent		\
@@ -178,6 +181,8 @@ TST_NOFILE	:=				\
 		tty00				\
 		tty02				\
 		tty03				\
+		tty04				\
+		tty05				\
 		poll				\
 		mountpoints			\
 		netns				\
@@ -186,9 +191,11 @@ TST_NOFILE	:=				\
 		session02			\
 		session03			\
 		socket-ext			\
+		sk-unix-ext-stream		\
 		unhashed_proc			\
 		cow00				\
 		child_opened_proc		\
+		proc_task_comm			\
 		posix_timers			\
 		sigpending			\
 		sigaltstack			\
@@ -227,6 +234,7 @@ TST_NOFILE	:=				\
 		fd01				\
 		apparmor				\
 		apparmor_stacking				\
+		apparmor_stacking_lsm				\
 		seccomp_strict			\
 		seccomp_filter			\
 		seccomp_filter_tsync			\
@@ -430,6 +438,7 @@ TST_DIR		=				\
 		mntns_remap			\
 		mntns_open			\
 		mntns_link_remap		\
+		tmpfs_link_remap		\
 		mntns_ghost			\
 		mntns_ghost01			\
 		mntns_ro_root			\
@@ -605,6 +614,7 @@ socket_aio:		LDLIBS += -lrt -pthread
 uptime_grow:		LDLIBS += -lrt -pthread
 unlink_largefile:	CFLAGS += -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE
 inotify_system_nodel:	CFLAGS += -DNO_DEL
+proc_task_comm:		LDLIBS += -pthread
 pthread00:		LDLIBS += -pthread
 pthread00-pac:		CFLAGS += ${PAC_CFLAGS}
 pthread00-pac:		LDLIBS += -pthread

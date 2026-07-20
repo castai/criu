@@ -2,6 +2,10 @@ local:
 	./run-ci-tests.sh
 .PHONY: local
 
+live-local:
+	./live-run-ci-tests.sh
+.PHONY: local
+
 after_success:
 	./ci-after-success.sh
 .PHONY: after_success

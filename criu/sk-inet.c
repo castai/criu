@@ -17,6 +17,10 @@
 #include <linux/in.h>
 #include <linux/in6.h>
 
+// == CastAI Live patches ==
+#include <sys/fsuid.h>
+// == CastAI Live patches ==
+
 #include "../soccr/soccr.h"
 
 #include "libnetlink.h"
@@ -271,6 +275,9 @@ static struct inet_sk_desc *gen_uncon_sk(int lfd, const struct fd_parms *p, int 
 
 	sk->sd.family = family;
 	sk->type = type;
+    // == CastAI Live patches ==
+	sk->uid = p->stat.st_uid;
+    // == CastAI Live patches ==
 
 	if (sk->sd.family == AF_INET)
 		aux = sizeof(struct sockaddr_in);
@@ -526,6 +533,10 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 	ie.dst_port = sk->dst_port;
 	ie.backlog = sk->wqlen;
 	ie.flags = p->flags;
+    // == CastAI Live patches ==
+	ie.uid = sk->uid;
+	ie.has_uid = true;
+    // == CastAI Live patches ==
 
 	ie.fown = (FownEntry *)&p->fown;
 	ie.opts = &skopts;
@@ -676,6 +687,7 @@ int inet_collect_one(struct nlmsghdr *h, int family, int type, struct ns_id *ns)
 	d->state = m->idiag_state;
 	d->rqlen = m->idiag_rqueue;
 	d->wqlen = m->idiag_wqueue;
+	d->uid = m->idiag_uid;
 	memcpy(d->src_addr, m->id.idiag_src, sizeof(u32) * 4);
 	memcpy(d->dst_addr, m->id.idiag_dst, sizeof(u32) * 4);
 
@@ -856,6 +868,10 @@ static int open_inet_sk(struct file_desc *d, int *new_fd)
 	struct inet_sk_info *ii;
 	InetSkEntry *ie;
 	int sk, yes = 1;
+    // == CastAI Live patches ==
+	uid_t old_fsuid = 0;
+	bool restore_fsuid = false;
+    // == CastAI Live patches ==
 
 	if (fle->stage >= FLE_OPEN)
 		return post_open_inet_sk(d, fle->fe->fd);
@@ -884,7 +900,37 @@ static int open_inet_sk(struct file_desc *d, int *new_fd)
 	if (run_setsockcreatecon(fle->fe))
 		return -1;
 
+    // == CastAI Live patches ==
+	/*
+	 * The kernel stamps sk->sk_uid from current_fsuid() at socket creation and exposes no interface to change it later.
+	 * To preserve the dumped uid (so xt_owner --uid-owner rules keep working after restore), switch fsuid around socket(2).
+	 * setfsuid needs only ns-level CAP_SETUID, which we already have.
+	 *
+	 * Caveat: ie->uid is the uid as seen from the userns in which CRIU dumped inet_diag.
+	 * For non-userns containers (the common k8s case) that equals the container-local uid and everything lines up.
+	 * For userns containers where CRIU dumps from the host ns, ie->uid is an unmapped host uid inside the container's
+	 * userns and setfsuid will silently not take effect — we log a warning below so the symptom is visible.
+	 */
+	if (ie->has_uid) {
+		old_fsuid = setfsuid(ie->uid);
+		if ((uid_t)setfsuid(-1) != ie->uid)
+			pr_warn("Couldn't set fsuid to %u for inet socket; "
+				"sk_uid will be %u. xt_owner rules may misbehave.\n",
+				ie->uid, old_fsuid);
+		else
+			pr_debug("Creating inet socket with fsuid %u (was %u)\n",
+				 ie->uid, old_fsuid);
+		restore_fsuid = true;
+	}
+    // == CastAI Live patches ==
+
 	sk = socket(ie->family, ie->type, ie->proto);
+
+    // == CastAI Live patches ==
+	if (restore_fsuid)
+		setfsuid(old_fsuid);
+    // == CastAI Live patches ==
+
 	if (sk < 0) {
 		pr_perror("Can't create inet socket");
 		return -1;

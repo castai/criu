@@ -3,7 +3,7 @@ name: Publish GitHub Release
 on:
   push:
     tags:
-      - '*'
+      - "*"
   workflow_dispatch:
 
 permissions:
@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Create multi architecture builder
         run: |
@@ -35,8 +35,8 @@ jobs:
 
       - name: Create tar
         run: |
-          tar -czf criu-${{ github.ref_name}}-linux-amd64.tar.gz -C amd64-bins criu
-          tar -czf criu-${{ github.ref_name}}-linux-arm64.tar.gz -C arm64-bins criu
+          tar -czf criu-${{ github.ref_name}}-linux-amd64.tar.gz -C amd64-bins .
+          tar -czf criu-${{ github.ref_name}}-linux-arm64.tar.gz -C arm64-bins .
           sha256sum criu-${{ github.ref_name}}-linux-amd64.tar.gz >> SHA256SUMS
           sha256sum criu-${{ github.ref_name}}-linux-arm64.tar.gz >> SHA256SUMS
 
@@ -46,5 +46,3 @@ jobs:
           artifacts: "criu-${{ github.ref_name}}-linux-amd64.tar.gz,criu-${{ github.ref_name}}-linux-arm64.tar.gz,SHA256SUMS"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-

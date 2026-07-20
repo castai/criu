@@ -1,4 +1,4 @@
-FROM ubuntu:24.04 AS build
+FROM ubuntu:24.04
 
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
 	libnet-dev \
@@ -26,10 +26,8 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
 	uuid-dev \
 	python3-yaml
 
-COPY . /work
-WORKDIR /work
-RUN make -j $(nproc) criu cuda_plugin
+COPY . /criu
+WORKDIR /criu
+RUN make mrproper && make -j $(nproc)
 
-FROM scratch
-COPY --from=build /work/criu/criu .
-COPY --from=build /work/plugins/cuda/cuda_plugin.so .
+ENTRYPOINT ["./test/zdtm.py"]

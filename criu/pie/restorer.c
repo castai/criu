@@ -27,6 +27,7 @@
 #include "common/compiler.h"
 #include <compel/plugins/std/syscall.h>
 #include <compel/plugins/std/log.h>
+#include <compel/plugins/std/string.h>
 #include <compel/ksigset.h>
 #include "mman.h"
 #include "signal.h"
@@ -50,6 +51,9 @@
 #include "images/inventory.pb-c.h"
 
 #include "shmem.h"
+
+/* AIO restoration with relocation support for live migration */
+#include "live_restore_aio.c"
 
 /*
  * sys_getgroups() buffer size. Not too much, to avoid stack overflow.
@@ -199,6 +203,10 @@ static int lsm_set_label(char *label, char *type, int procfd)
 
 	return 0;
 }
+
+// == CastAI Live patches ==
+#include "lsm-pie.c"
+// == CastAI Live patches ==
 
 static int restore_creds(struct thread_creds_args *args, int procfd, int lsm_type, uid_t uid)
 {
@@ -363,7 +371,6 @@ skip_xids:
 		}
 	}
 
-
 	if (lsm_type != LSMTYPE__SELINUX) {
 		/*
 		 * SELinux does not support setting the process context for
@@ -371,13 +378,27 @@ skip_xids:
 		 * SELinux and instead the process context is set before the
 		 * threads are created.
 		 */
-		if (lsm_set_label(args->lsm_profile, "current", procfd) < 0)
-			return -1;
+		// == CastAI Live patches ==
+		if (lsm_type == LSMTYPE__APPARMOR) {
+			if (castai_apparmor_set_label(args->lsm_profile, "current", procfd) < 0)
+				return -1;
+		} else {
+			if (lsm_set_label(args->lsm_profile, "current", procfd) < 0)
+				return -1;
+		}
+		// == CastAI Live patches ==
 	}
 
 	/* Also set the sockcreate label for all threads */
-	if (lsm_set_label(args->lsm_sockcreate, "sockcreate", procfd) < 0)
-		return -1;
+	// == CastAI Live patches ==
+	if (lsm_type == LSMTYPE__APPARMOR) {
+		if (castai_apparmor_set_label(args->lsm_sockcreate, "sockcreate", procfd) < 0)
+			return -1;
+	} else {
+		if (lsm_set_label(args->lsm_sockcreate, "sockcreate", procfd) < 0)
+			return -1;
+	}
+	// == CastAI Live patches ==
 
 	if (ce->has_no_new_privs && ce->no_new_privs) {
 		ret = sys_prctl(PR_SET_NO_NEW_PRIVS, ce->no_new_privs, 0, 0, 0);
@@ -936,6 +957,7 @@ static int restore_aio_ring(struct rst_aio_ring *raio)
 	unsigned tail = ring->tail;
 	struct iocb *iocb, **iocbp;
 	unsigned long ctx = 0;
+	unsigned long ring_len;
 	unsigned size;
 	char buf[1];
 
@@ -947,11 +969,21 @@ static int restore_aio_ring(struct rst_aio_ring *raio)
 
 	new = (struct aio_ring *)ctx;
 	i = (raio->len - sizeof(struct aio_ring)) / sizeof(struct io_event);
-	if (tail >= ring->nr || head >= ring->nr || ring->nr != i || new->nr != ring->nr) {
+	if (tail >= ring->nr || head >= ring->nr || ring->nr != i || new->nr < ring->nr) {
 		pr_err("wrong aio: tail=%x head=%x req=%x old_nr=%x new_nr=%x expect=%x\n", tail, head, raio->nr_req,
 		       ring->nr, new->nr, i);
 
 		return -1;
+	}
+
+	ring_len = raio->len;
+
+	/* Handle ring expansion for live migration (more CPUs on restore) */
+	if (new->nr > ring->nr) {
+		pr_info("AIO ring expanded: old_nr=%x new_nr=%x\n", ring->nr, new->nr);
+		ring_len = live_handle_aio_expansion(raio, new, ctx);
+		if (!ring_len)
+			return -1;
 	}
 
 	if (tail == 0 && head == 0)
@@ -1028,24 +1060,7 @@ populate:
 	i = offsetof(struct aio_ring, io_events);
 	memcpy((void *)ctx + i, (void *)ring + i, raio->len - i);
 
-	/*
-	 * If we failed to get the proper nr_req right and
-	 * created smaller or larger ring, then this remap
-	 * will (should) fail, since AIO rings has immutable
-	 * size.
-	 *
-	 * This is not great, but anyway better than putting
-	 * a ring of wrong size into correct place.
-	 *
-	 * Also, this unmaps temporary anonymous area on raio->addr.
-	 */
-
-	ctx = sys_mremap(ctx, raio->len, raio->len, MREMAP_FIXED | MREMAP_MAYMOVE, raio->addr);
-	if (ctx != raio->addr) {
-		pr_err("Ring remap failed with %ld\n", ctx);
-		return -1;
-	}
-	return 0;
+	return live_finalize_aio_ring(raio, ctx, ring_len);
 }
 
 static void rst_tcp_repair_off(struct rst_tcp_sock *rts)
@@ -1969,13 +1984,20 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	}
 
 	/*
-	 * Now when all VMAs are in their places time to set
-	 * up AIO rings.
+	 * Now when all VMAs are in their places time to set up AIO rings.
 	 */
+	for (i = 0; i < args->rings_n; i++) {
+		struct rst_aio_ring *raio = &args->rings[i];
 
-	for (i = 0; i < args->rings_n; i++)
-		if (restore_aio_ring(&args->rings[i]) < 0)
+		if (restore_aio_ring(raio) < 0)
 			goto core_restore_end;
+
+		/* If ring was relocated, patch memory references */
+		if (raio->new_addr) {
+			if (live_patch_aio_context_refs(args, raio->addr, raio->new_addr) < 0)
+				goto core_restore_end;
+		}
+	}
 
 	/*
 	 * Finally restore madivse() bits
@@ -2192,6 +2214,60 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		mutex_unlock(&task_entries_local->last_pid_mutex);
 		if (fd >= 0)
 			sys_close(fd);
+	}
+
+	/*
+	 * Reopen deferred /proc/<pid>/task/<tid>/... fds now that
+	 * all threads have been created by clone() above. The fds
+	 * currently point to /dev/null placeholders.
+	 *
+	 * We must open /proc from the process's own filesystem
+	 * (already chroot'd into the container rootfs) rather than
+	 * using args->proc_fd, which points to CRIU's /proc mount.
+	 * Opening through CRIU's proc would give the fds a mount ID
+	 * from CRIU's mount namespace, which doesn't exist in the
+	 * container's mountinfo -- causing the next dump to fail at
+	 * lookup_mnt_id().
+	 */
+	if (args->deferred_fds_n > 0) {
+		int self_proc_fd;
+
+		self_proc_fd = sys_open("/proc", O_RDONLY | O_DIRECTORY, 0);
+		if (self_proc_fd < 0) {
+			pr_err("Can't open /proc for deferred fds: %ld\n",
+			       (long)self_proc_fd);
+			goto core_restore_end;
+		}
+
+		for (i = 0; i < args->deferred_fds_n; i++) {
+			struct deferred_proc_fd *df = &args->deferred_fds[i];
+			int dfd;
+
+			dfd = sys_openat(self_proc_fd, df->path, df->flags, 0);
+			if (dfd < 0) {
+				pr_err("Can't reopen deferred proc fd %d (%s): %ld\n",
+				       df->target_fd, df->path, (long)dfd);
+				sys_close(self_proc_fd);
+				goto core_restore_end;
+			}
+
+			if (dfd != df->target_fd) {
+				sys_close(df->target_fd);
+				if (sys_fcntl(dfd, F_DUPFD, df->target_fd) != df->target_fd) {
+					pr_err("Can't dup deferred proc fd %d -> %d\n",
+					       dfd, df->target_fd);
+					sys_close(dfd);
+					sys_close(self_proc_fd);
+					goto core_restore_end;
+				}
+				sys_close(dfd);
+			}
+
+			if (df->pos != 0 && df->pos != (off_t)-1)
+				sys_lseek(df->target_fd, df->pos, SEEK_SET);
+		}
+
+		sys_close(self_proc_fd);
 	}
 
 	restore_rlims(args);
