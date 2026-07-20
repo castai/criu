@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 
 #include <linux/securebits.h>
 #include <linux/capability.h>
@@ -70,6 +71,10 @@
 #define PR_SET_PDEATHSIG 1
 #endif
 
+#ifndef PR_SET_TIMERSLACK
+#define PR_SET_TIMERSLACK 29
+#endif
+
 #ifndef PR_SET_CHILD_SUBREAPER
 #define PR_SET_CHILD_SUBREAPER 36
 #endif
@@ -94,12 +99,20 @@
 		__ret;                                                          \
 	})
 
+/* Native AIO restore in-flight window size (used by restore_vma_aio path). */
+#define AIO_BATCH 128
+
 static struct task_entries *task_entries_local;
-static futex_t thread_inprogress;
+
+static atomic_t thread_inprogress;
+static void *rst_mem;
+static long rst_mem_size;
+
 static pid_t *helpers;
 static int n_helpers;
 static pid_t *zombies;
 static int n_zombies;
+
 static enum faults fi_strategy;
 bool fault_injected(enum faults f)
 {
@@ -433,6 +446,22 @@ static inline int restore_pdeath_sig(struct thread_restore_args *ta)
 	return 0;
 }
 
+static inline int restore_timerslack(struct thread_restore_args *ta)
+{
+	int ret;
+
+	if (!ta->has_timerslack_ns)
+		return 0;
+
+	ret = sys_prctl(PR_SET_TIMERSLACK, ta->timerslack_ns, 0, 0, 0);
+	if (ret) {
+		pr_err("Unable to set PR_SET_TIMERSLACK(%lu): %d\n", ta->timerslack_ns, ret);
+		return -1;
+	}
+
+	return 0;
+}
+
 static int restore_dumpable_flag(MmEntry *mme)
 {
 	int current_dumpable;
@@ -760,6 +789,15 @@ static int recv_cg_set_restore_ack(int sk)
 	return 0;
 }
 
+static void thread_fini(void)
+{
+	if (!atomic_dec_and_test(&thread_inprogress))
+		return;
+
+	std_log_set_fd(-1);
+	sys_munmap(rst_mem, rst_mem_size);
+}
+
 /*
  * Threads restoration via sigreturn. Note it's locked
  * routine and calls for unlock at the end.
@@ -837,12 +875,13 @@ __visible long __export_restore_thread(struct thread_restore_args *args)
 	ret = restore_creds(args->creds_args, args->ta->proc_fd, args->ta->lsm_type, args->ta->uid);
 	ret = ret || restore_dumpable_flag(&args->ta->mm);
 	ret = ret || restore_pdeath_sig(args);
+	ret = ret || restore_timerslack(args);
 	if (ret)
 		BUG();
 
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_CREDS);
 
-	futex_dec_and_wake(&thread_inprogress);
+	thread_fini();
 
 	new_sp = (long)rt_sigframe + RT_SIGFRAME_OFFSET(rt_sigframe);
 	rst_sigreturn(new_sp, rt_sigframe);
@@ -1238,9 +1277,9 @@ static int timerfd_arm(struct task_restore_args *args)
 
 			/*
 			 * We might need to adjust value because the checkpoint
-			 * and restore procedure takes some time itself. Note
-			 * we don't adjust nanoseconds, since the result may
-			 * overflow the limit NSEC_PER_SEC FIXME
+			 * and restore procedure takes some time itself. We also
+			 * accumulate tv_nsec and propagate any carry into tv_sec
+			 * to keep the itimerspec value normalized.
 			 */
 			if (sys_clock_gettime(t->clockid, &ts)) {
 				pr_err("Can't get current time\n");
@@ -1248,6 +1287,11 @@ static int timerfd_arm(struct task_restore_args *args)
 			}
 
 			t->val.it_value.tv_sec += (time_t)ts.tv_sec;
+			t->val.it_value.tv_nsec += ts.tv_nsec;
+			if (t->val.it_value.tv_nsec >= NSEC_PER_SEC) {
+				t->val.it_value.tv_nsec -= NSEC_PER_SEC;
+				t->val.it_value.tv_sec++;
+			}
 
 			pr_debug("Adjust id %x it_value(%llu, %llu) -> it_value(%llu, %llu)\n", t->id,
 				 (unsigned long long)ts.tv_sec, (unsigned long long)ts.tv_nsec,
@@ -1378,13 +1422,19 @@ __visible void __export_unmap(void)
 	sys_munmap(bootstrap_start, bootstrap_len - vdso_rt_size);
 }
 
-static void unregister_libc_rseq(struct rst_rseq_param *rseq)
+static int unregister_libc_rseq(struct rst_rseq_param *rseq)
 {
-	if (!rseq->rseq_abi_pointer)
-		return;
+	long ret;
 
-	/* can't fail if rseq is registered */
-	sys_rseq(decode_pointer(rseq->rseq_abi_pointer), rseq->rseq_abi_size, 1, rseq->signature);
+	if (!rseq->rseq_abi_pointer)
+		return 0;
+
+	ret = sys_rseq(decode_pointer(rseq->rseq_abi_pointer), rseq->rseq_abi_size, 1, rseq->signature);
+	if (ret) {
+		pr_err("Failed to unregister libc rseq %ld\n", ret);
+		return -1;
+	}
+	return 0;
 }
 
 /*
@@ -1581,6 +1631,294 @@ static int fd_poll(int inotify_fd)
 }
 
 /*
+ * Advance restore_vma_io by 'res' bytes consumed. Updates rio in place.
+ * Returns the new (iov_ptr, nr_iovs) for resubmission, or 0 if fully done.
+ * Used when AIO returns a short read (kernel MAX_RW_COUNT = 0x7FFFF000 limit).
+ */
+static void advance_vma_io_retry(struct restore_vma_io *rio, ssize_t res,
+				 struct iovec **iov_out, unsigned int *nr_out)
+{
+	size_t remaining;
+	unsigned int j = 0;
+
+	remaining = res;
+	rio->off += res;
+
+	while (j < rio->nr_iovs && remaining > 0) {
+		size_t len = rio->iovs[j].iov_len;
+		if (len <= remaining) {
+			remaining -= len;
+			rio->iovs[j].iov_len = 0;
+			j++;
+		} else {
+			rio->iovs[j].iov_base = (char *)rio->iovs[j].iov_base + remaining;
+			rio->iovs[j].iov_len = len - remaining;
+			remaining = 0;
+			break;
+		}
+	}
+	while (j < rio->nr_iovs && rio->iovs[j].iov_len == 0)
+		j++;
+	if (j == rio->nr_iovs) {
+		*iov_out = NULL;
+		*nr_out = 0;
+	} else {
+		*iov_out = &rio->iovs[j];
+		*nr_out = rio->nr_iovs - j;
+	}
+}
+
+/*
+ * Handle one io_getevents() completion.  Returns 0 if the event was fully
+ * consumed (caller bumps the completed counter), 1 if a short read was
+ * masked and the iocb resubmitted, or -1 on unrecoverable error.
+ */
+static int process_aio_event(struct task_restore_args *args, aio_context_t aio_ctx,
+			     struct io_event *ev, struct iocb *iocbs,
+			     struct restore_vma_io **rio_ptrs)
+{
+	ssize_t res = ev->res;
+	int fd = args->vma_ios_fd;
+	struct iocb *cb;
+	unsigned int idx;
+	struct restore_vma_io *r;
+	struct iovec *iov_next;
+	unsigned int nr_next;
+	long ret2;
+
+	if (res < 0) {
+		pr_err("AIO read failed: %lld\n", ev->res);
+		return -1;
+	}
+	if (res == 0) {
+		pr_err("AIO zero read (expected %llu)\n", ev->data);
+		return -1;
+	}
+
+	cb = (struct iocb *)(unsigned long)ev->obj;
+	idx = cb - iocbs;
+	r = rio_ptrs[idx];
+
+	if (args->auto_dedup && r->storage == VMA_IO_UNCOMPRESSED) {
+		long fr = sys_fallocate(fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+					cb->aio_offset, res);
+		if (fr < 0)
+			pr_debug("Failed to punch holes with fallocate: %ld\n", fr);
+	}
+
+	if (res == ev->data)
+		return 0;
+
+	advance_vma_io_retry(r, res, &iov_next, &nr_next);
+	if (!iov_next || nr_next == 0) {
+		pr_err("AIO retry advance produced no work after %zd bytes\n", res);
+		return -1;
+	}
+	cb->aio_buf = (unsigned long)iov_next;
+	cb->aio_nbytes = nr_next;
+	cb->aio_offset = r->off;
+	cb->aio_data -= res;
+	ret2 = sys_io_submit(aio_ctx, 1, &cb);
+	if (ret2 != 1) {
+		pr_err("AIO retry submit failed: %ld\n", ret2);
+		return -1;
+	}
+	return 1;
+}
+
+/*
+ * Submit pending iocbs in AIO_BATCH-sized chunks until the in-flight
+ * window is full or all iocbs are submitted. Returns 0 on success, -1
+ * on submit failure. Bumps *submitted with the number of new iocbs in
+ * flight.
+ */
+static int submit_aio_batch(aio_context_t aio_ctx, struct iocb **iocbps, unsigned int n,
+			    unsigned int *submitted, unsigned int completed)
+{
+	while (*submitted < n && (*submitted - completed) < AIO_BATCH) {
+		unsigned int batch = n - *submitted;
+		long aio_ret;
+
+		if (batch > AIO_BATCH - (*submitted - completed))
+			batch = AIO_BATCH - (*submitted - completed);
+		aio_ret = sys_io_submit(aio_ctx, batch, &iocbps[*submitted]);
+		if (aio_ret <= 0) {
+			pr_err("io_submit failed: %ld (submitted %u/%u)\n",
+			       aio_ret, *submitted, n);
+			return -1;
+		}
+		*submitted += aio_ret;
+	}
+	return 0;
+}
+
+/*
+ * Process a batch of io_getevents() completions. Bumps *completed for
+ * events fully consumed; short reads are masked + resubmitted by
+ * process_aio_event() without bumping. Returns 0 on success, -1 on any
+ * unrecoverable event error.
+ */
+static int reap_aio_events(struct task_restore_args *args, aio_context_t aio_ctx,
+			   struct io_event *events, long nr,
+			   struct iocb *iocbs, struct restore_vma_io **rio_ptrs,
+			   unsigned int *completed)
+{
+	long k;
+
+	for (k = 0; k < nr; k++) {
+		int rc = process_aio_event(args, aio_ctx, &events[k], iocbs, rio_ptrs);
+
+		if (rc < 0)
+			return -1;
+		if (rc == 0)
+			(*completed)++;
+	}
+	return 0;
+}
+
+static int restore_vma_preadv_one(struct task_restore_args *args,
+				  struct restore_vma_io *rio,
+				  bool allow_dedup);
+
+static int validate_direct_vma_io(struct restore_vma_io *rio)
+{
+	uint64_t payload_bytes = 0;
+	uint64_t output_bytes = 0;
+	uint64_t iov_bytes = 0;
+	int i;
+
+	if (rio->storage != VMA_IO_PACKED_RAW && rio->storage != VMA_IO_ZERO)
+		return -1;
+	if (rio->n_compressed_size <= 0 || !rio->compressed_size) {
+		pr_err("Direct compressed VMA IO has no block metadata\n");
+		return -1;
+	}
+	if (rio->region_pages && !rio->block_pages) {
+		pr_err("Direct compressed region VMA IO has no page counts\n");
+		return -1;
+	}
+
+	for (i = 0; i < rio->n_compressed_size; i++) {
+		unsigned int block_pages = rio->region_pages ?
+						rio->block_pages[i] : 1;
+		uint64_t block_bytes;
+		uint32_t compressed_size = rio->compressed_size[i];
+
+		if (!block_pages ||
+		    (rio->region_pages && block_pages > rio->region_pages)) {
+			pr_err("Invalid direct VMA IO block page count %u\n",
+			       block_pages);
+			return -1;
+		}
+		block_bytes = (uint64_t)block_pages * PAGE_SIZE;
+		if (rio->storage == VMA_IO_PACKED_RAW &&
+		    compressed_size != block_bytes) {
+			pr_err("Packed-raw VMA IO block %d has size %u, expected %llu\n",
+			       i, compressed_size,
+			       (unsigned long long)block_bytes);
+			return -1;
+		}
+		if (rio->storage == VMA_IO_ZERO && compressed_size) {
+			pr_err("Zero VMA IO block %d has payload size %u\n", i,
+			       compressed_size);
+			return -1;
+		}
+		if (payload_bytes > UINT64_MAX - compressed_size ||
+		    output_bytes > UINT64_MAX - block_bytes) {
+			pr_err("Direct VMA IO size overflows\n");
+			return -1;
+		}
+		payload_bytes += compressed_size;
+		output_bytes += block_bytes;
+	}
+
+	for (i = 0; i < rio->nr_iovs; i++) {
+		if (iov_bytes > UINT64_MAX - rio->iovs[i].iov_len) {
+			pr_err("Direct VMA IO destination size overflows\n");
+			return -1;
+		}
+		iov_bytes += rio->iovs[i].iov_len;
+	}
+
+	if (payload_bytes != rio->total_compressed_size ||
+	    output_bytes != iov_bytes || rio->n_pages <= 0 ||
+	    output_bytes != (uint64_t)rio->n_pages * PAGE_SIZE) {
+		pr_err("Inconsistent direct VMA IO sizes: payload=%llu metadata=%llu output=%llu iov=%llu\n",
+		       (unsigned long long)payload_bytes,
+		       (unsigned long long)rio->total_compressed_size,
+		       (unsigned long long)output_bytes,
+		       (unsigned long long)iov_bytes);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int restore_vma_preadv_mixed(struct task_restore_args *args)
+{
+	struct restore_vma_io *rio = args->vma_ios;
+	unsigned int i;
+	int ret = -1;
+
+	/*
+	 * Actual LZ4 blocks are restored into premapped VMAs before PIE.  A
+	 * delayed VMA can therefore contain only ordinary uncompressed pages,
+	 * packed raw-fallback blocks, or zero blocks, all of which PIE can
+	 * restore with native syscalls.
+	 */
+	for (i = 0; i < args->vma_ios_n; i++) {
+		if (rio->storage == VMA_IO_UNCOMPRESSED) {
+			if (args->vma_ios_fd == -1) {
+				pr_err("No pages image fd for uncompressed VMA IO entry\n");
+				goto out;
+			}
+
+			if (restore_vma_preadv_one(args, rio, true))
+				goto out;
+			goto next;
+		}
+		if (rio->storage == VMA_IO_PACKED_RAW) {
+			if (args->vma_ios_fd == -1) {
+				pr_err("No pages image fd for packed-raw VMA IO entry\n");
+				goto out;
+			}
+			if (validate_direct_vma_io(rio) ||
+			    restore_vma_preadv_one(args, rio, false))
+				goto out;
+			goto next;
+		}
+		if (rio->storage == VMA_IO_ZERO) {
+			int j;
+
+			if (validate_direct_vma_io(rio))
+				goto out;
+			for (j = 0; j < rio->nr_iovs; j++)
+				memset(rio->iovs[j].iov_base, 0,
+				       rio->iovs[j].iov_len);
+			goto next;
+		}
+		if (rio->storage != VMA_IO_ENCODED) {
+			pr_err("Unknown VMA IO storage kind %d\n", rio->storage);
+			goto out;
+		}
+		pr_err("Delayed VMA IO unexpectedly contains an LZ4 block\n");
+		goto out;
+
+next:
+		rio = (struct restore_vma_io *)((char *)rio + RIO_SIZE(rio->nr_iovs));
+	}
+
+	ret = 0;
+out:
+	if (args->vma_ios_fd != -1) {
+		sys_close(args->vma_ios_fd);
+		args->vma_ios_fd = -1;
+	}
+
+	return ret;
+}
+
+/*
  * Call preadv() but limit size of the read. Zero `max_to_read` skips the limit.
  */
 static ssize_t preadv_limited(int fd, struct iovec *iovs, int nr, off_t offs, size_t max_to_read)
@@ -1611,6 +1949,201 @@ static ssize_t preadv_limited(int fd, struct iovec *iovs, int nr, off_t offs, si
 	if (saved_last_iov_len)
 		iovs[nr - 1].iov_len = saved_last_iov_len;
 
+	return ret;
+}
+
+static int restore_vma_preadv_one(struct task_restore_args *args,
+				  struct restore_vma_io *rio,
+				  bool allow_dedup)
+{
+	struct iovec *iovs = rio->iovs;
+	int nr = rio->nr_iovs;
+	ssize_t r;
+
+	while (nr) {
+		pr_debug("Preadv %lx:%d... (%d iovs)\n", (unsigned long)iovs->iov_base, (int)iovs->iov_len, nr);
+		/*
+		 * If we're requested to punch holes in the file after reading we do
+		 * it to save memory. Limit the reads then to an arbitrary block size.
+		 */
+		r = preadv_limited(args->vma_ios_fd, iovs, nr, rio->off,
+				   args->auto_dedup && allow_dedup ?
+					   AUTO_DEDUP_OVERHEAD_BYTES : 0);
+		if (r < 0) {
+			pr_err("Can't read pages data (%d)\n", (int)r);
+			return -1;
+		}
+
+		if (r == 0) {
+			pr_err("Unexpected EOF reading pages data at offset %ld (%d iovs remaining)\n",
+			       (long)rio->off, nr);
+			return -1;
+		}
+
+		pr_debug("`- returned %ld\n", (long)r);
+		/*
+		 * If the file is open for writing, then it means we should
+		 * punch holes in it.
+		 */
+		if (args->auto_dedup && allow_dedup) {
+			int fr = sys_fallocate(args->vma_ios_fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+					       rio->off, r);
+			if (fr < 0)
+				pr_debug("Failed to punch holes with fallocate: %d\n", fr);
+		}
+		rio->off += r;
+		/* Advance the iovecs */
+		do {
+			if (iovs->iov_len <= r) {
+				pr_debug("   `- skip pagemap\n");
+				r -= iovs->iov_len;
+				iovs++;
+				nr--;
+				continue;
+			}
+
+			iovs->iov_base += r;
+			iovs->iov_len -= r;
+			break;
+		} while (nr > 0);
+	}
+
+	return 0;
+}
+
+/*
+ * Restore private VMA page contents via Linux native AIO.
+ *
+ * Submits aligned uncompressed and packed-raw requests against the
+ * O_DIRECT-prepared pages image in a bounded AIO_BATCH window. Zero records
+ * are cleared without I/O. Handles MAX_RW_COUNT (0x7FFFF000) short reads by
+ * masking to page alignment and resubmitting. Closes args->vma_ios_fd on exit.
+ */
+static int restore_vma_aio(struct task_restore_args *args)
+{
+	unsigned int n = args->vma_ios_n;
+	int fd = args->vma_ios_fd;
+	aio_context_t aio_ctx = 0;
+	long aio_ret;
+	struct iocb *iocbs;
+	struct iocb **iocbps;
+	struct restore_vma_io **rio_ptrs;
+	struct restore_vma_io *rio;
+	struct io_event *events;
+	unsigned long alloc_sz;
+	const unsigned long event_sz =
+		AIO_BATCH * sizeof(struct io_event);
+	const unsigned long request_sz = sizeof(struct iocb) +
+		sizeof(struct iocb *) + sizeof(struct restore_vma_io *);
+	unsigned int submitted = 0, completed = 0, read_count = 0;
+	unsigned int i;
+	int ret = -1;
+
+	if (__builtin_mul_overflow((unsigned long)n, request_sz, &alloc_sz) ||
+	    __builtin_add_overflow(alloc_sz, event_sz, &alloc_sz)) {
+		pr_err("AIO restore metadata size overflows for %u requests\n", n);
+		sys_close(fd);
+		args->vma_ios_fd = -1;
+		return -1;
+	}
+
+	aio_ret = sys_io_setup(AIO_BATCH, &aio_ctx);
+	if (aio_ret < 0) {
+		pr_err("io_setup(%d) failed: %ld\n", AIO_BATCH, aio_ret);
+		sys_close(fd);
+		args->vma_ios_fd = -1;
+		return -1;
+	}
+
+	iocbs = (void *)sys_mmap(NULL, alloc_sz, PROT_READ | PROT_WRITE,
+				 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (IS_ERR(iocbs)) {
+		pr_err("Can't mmap AIO buffers: %ld\n", PTR_ERR(iocbs));
+		sys_io_destroy(aio_ctx);
+		sys_close(fd);
+		args->vma_ios_fd = -1;
+		return -1;
+	}
+	iocbps = (struct iocb **)((char *)iocbs + n * sizeof(struct iocb));
+	rio_ptrs = (struct restore_vma_io **)((char *)iocbps + n * sizeof(struct iocb *));
+	events = (struct io_event *)((char *)rio_ptrs + n * sizeof(struct restore_vma_io *));
+
+	/* Build compact iocbs for entries which actually read from the image. */
+	rio = args->vma_ios;
+	for (i = 0; i < n; i++) {
+		struct iocb *cb;
+		size_t expected = 0;
+		int j;
+
+		if (rio->storage == VMA_IO_ZERO) {
+			if (validate_direct_vma_io(rio))
+				goto out;
+			for (j = 0; j < rio->nr_iovs; j++)
+				memset(rio->iovs[j].iov_base, 0,
+				       rio->iovs[j].iov_len);
+			goto next;
+		}
+		if (rio->storage == VMA_IO_PACKED_RAW) {
+			if (validate_direct_vma_io(rio))
+				goto out;
+		} else if (rio->storage != VMA_IO_UNCOMPRESSED) {
+			pr_err("AIO restore received storage kind %d\n", rio->storage);
+			goto out;
+		}
+
+		for (j = 0; j < rio->nr_iovs; j++) {
+			if (expected > SIZE_MAX - rio->iovs[j].iov_len) {
+				pr_err("AIO restore request size overflows\n");
+				goto out;
+			}
+			expected += rio->iovs[j].iov_len;
+		}
+
+		cb = &iocbs[read_count];
+		memset(cb, 0, sizeof(*cb));
+		cb->aio_fildes = fd;
+		cb->aio_lio_opcode = IOCB_CMD_PREADV;
+		cb->aio_buf = (unsigned long)rio->iovs;
+		cb->aio_nbytes = rio->nr_iovs;
+		cb->aio_offset = rio->off;
+		/* io_getevents() returns this as event.data for short-read checks. */
+		cb->aio_data = expected;
+		iocbps[read_count] = cb;
+		rio_ptrs[read_count] = rio;
+		read_count++;
+
+	next:
+		rio = (struct restore_vma_io *)((char *)rio + RIO_SIZE(rio->nr_iovs));
+	}
+
+	/* Submit and reap in batches */
+	while (submitted < read_count || completed < read_count) {
+		if (submit_aio_batch(aio_ctx, iocbps, read_count,
+				     &submitted, completed) < 0)
+			goto out;
+
+		if (completed >= read_count)
+			continue;
+
+		/*
+		 * min_nr=1 to block until at least one event;
+		 * nr=AIO_BATCH to reap all (incl. retries).
+		 */
+		aio_ret = sys_io_getevents(aio_ctx, 1, AIO_BATCH, events, NULL);
+		if (aio_ret <= 0) {
+			pr_err("io_getevents failed: %ld\n", aio_ret);
+			goto out;
+		}
+		if (reap_aio_events(args, aio_ctx, events, aio_ret, iocbs, rio_ptrs, &completed) < 0)
+			goto out;
+	}
+
+	ret = 0;
+out:
+	sys_io_destroy(aio_ctx);
+	sys_munmap(iocbs, alloc_sz);
+	sys_close(fd);
+	args->vma_ios_fd = -1;
 	return ret;
 }
 
@@ -1735,7 +2268,6 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	int i;
 	VmaEntry *vma_entry;
 	unsigned long va;
-	struct restore_vma_io *rio;
 	struct rt_sigframe *rt_sigframe;
 	struct prctl_mm_map prctl_map;
 	unsigned long new_sp;
@@ -1756,7 +2288,6 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	n_helpers = args->helpers_n;
 	zombies = args->zombies;
 	n_zombies = args->zombies_n;
-	*args->breakpoint = rst_sigreturn;
 #ifdef ARCH_HAS_LONG_PAGES
 	__page_size = args->page_size;
 #endif
@@ -1818,7 +2349,8 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	 * for instance once the kernel will want to update (struct rseq).cpu_id field:
 	 * https://github.com/torvalds/linux/blob/ce522ba9ef7e/kernel/rseq.c#L89
 	 */
-	unregister_libc_rseq(&args->libc_rseq);
+	if (unregister_libc_rseq(&args->libc_rseq))
+		goto core_restore_end;
 
 	if (unmap_old_vmas((void *)args->premmapped_addr, args->premmapped_len, bootstrap_start, bootstrap_len,
 			   args->task_size))
@@ -1901,60 +2433,28 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	}
 
 	/*
-	 * Now read the contents (if any)
+	 * Now read the contents (if any).
+	 *
+	 * Engine is selected from args->vma_ios_use_direct, populated by
+	 * probe_pages_o_direct() at restore-args build time:
+	 *   true  -> restore_vma_aio()    (io_submit, O_DIRECT, batched)
+	 *   false -> restore_vma_preadv_mixed() (buffered, sequential I/O)
+	 * The selected reader consumes args->vma_ios and closes
+	 * args->vma_ios_fd on exit. Compressed images can use AIO when every
+	 * delayed file-backed range is raw and page-aligned; encoded ranges are
+	 * premapped and decoded before PIE.
 	 */
+	if (args->vma_ios_n > 0 && args->vma_ios_fd != -1) {
+		int rc;
 
-	rio = args->vma_ios;
-	for (i = 0; i < args->vma_ios_n; i++) {
-		struct iovec *iovs = rio->iovs;
-		int nr = rio->nr_iovs;
-		ssize_t r;
-
-		while (nr) {
-			pr_debug("Preadv %lx:%d... (%d iovs)\n", (unsigned long)iovs->iov_base, (int)iovs->iov_len, nr);
-			/*
-			 * If we're requested to punch holes in the file after reading we do
-			 * it to save memory. Limit the reads then to an arbitrary block size.
-			 */
-			r = preadv_limited(args->vma_ios_fd, iovs, nr, rio->off,
-					   args->auto_dedup ? AUTO_DEDUP_OVERHEAD_BYTES : 0);
-			if (r < 0) {
-				pr_err("Can't read pages data (%d)\n", (int)r);
-				goto core_restore_end;
-			}
-
-			pr_debug("`- returned %ld\n", (long)r);
-			/* If the file is open for writing, then it means we should punch holes
-			 * in it. */
-			if (r > 0 && args->auto_dedup) {
-				int fr = sys_fallocate(args->vma_ios_fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
-						       rio->off, r);
-				if (fr < 0) {
-					pr_debug("Failed to punch holes with fallocate: %d\n", fr);
-				}
-			}
-			rio->off += r;
-			/* Advance the iovecs */
-			do {
-				if (iovs->iov_len <= r) {
-					pr_debug("   `- skip pagemap\n");
-					r -= iovs->iov_len;
-					iovs++;
-					nr--;
-					continue;
-				}
-
-				iovs->iov_base += r;
-				iovs->iov_len -= r;
-				break;
-			} while (nr > 0);
-		}
-
-		rio = ((void *)rio) + RIO_SIZE(rio->nr_iovs);
+		if (args->vma_ios_use_direct)
+			pr_debug("Restoring delayed VMA I/O with native AIO\n");
+		rc = args->vma_ios_use_direct ?
+			     restore_vma_aio(args) :
+			     restore_vma_preadv_mixed(args);
+		if (rc < 0)
+			goto core_restore_end;
 	}
-
-	if (args->vma_ios_fd != -1)
-		sys_close(args->vma_ios_fd);
 
 	/*
 	 * Proxify vDSO.
@@ -2011,6 +2511,9 @@ __visible long __export_restore_task(struct task_restore_args *args)
 
 		for (m = 0; m < sizeof(vma_entry->madv) * 8; m++) {
 			if (vma_entry->madv & (1ul << m)) {
+				if (!(vma_entry_is(vma_entry, VMA_AREA_REGULAR)))
+					continue;
+
 				ret = sys_madvise(vma_entry->start, vma_entry_len(vma_entry), m);
 				if (ret) {
 					pr_err("madvise(%" PRIx64 ", %" PRIu64 ", %ld) "
@@ -2350,9 +2853,12 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	ret = restore_creds(args->t->creds_args, args->proc_fd, args->lsm_type, args->uid);
 	ret = ret || restore_dumpable_flag(&args->mm);
 	ret = ret || restore_pdeath_sig(args->t);
+	ret = ret || restore_timerslack(args->t);
 	ret = ret || restore_child_subreaper(args->child_subreaper);
 
-	futex_set_and_wake(&thread_inprogress, args->nr_threads);
+	atomic_set(&thread_inprogress, args->nr_threads);
+	rst_mem = args->rst_mem;
+	rst_mem_size = args->rst_mem_size;
 
 	/*
 	 * Shadow stack of the leader can be locked only after all other
@@ -2363,15 +2869,17 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		goto core_restore_end;
 
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_CREDS);
-
+	/*
+	 * From this point forward, cross-process synchronization is strictly
+	 * prohibited. compel_stop_tasks_on_syscall enumerates all restored
+	 * tasks/threads sequentially, allowing each to execute one syscall
+	 * per iteration. Any attempt to communicate with other tasks or
+	 * threads may trigger a deadlock.
+	 */
 	if (ret)
 		BUG();
 
-	/* Wait until children stop to use args->task_entries */
-	futex_wait_while_gt(&thread_inprogress, 1);
-
 	sys_close(args->proc_fd);
-	std_log_set_fd(-1);
 
 	/*
 	 * The code that prepared the itimers makes sure that the
@@ -2389,7 +2897,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 
 	restore_posix_timers(args);
 
-	sys_munmap(args->rst_mem, args->rst_mem_size);
+	thread_fini();
 
 	/*
 	 * Sigframe stack.

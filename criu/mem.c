@@ -3,8 +3,10 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <string.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#include <stdlib.h>
 
 #include "types.h"
 #include "cr_options.h"
@@ -27,11 +29,13 @@
 #include "bitmap.h"
 #include "sk-packet.h"
 #include "files-reg.h"
+#include "pagemap.h"
 #include "pagemap-cache.h"
 #include "fault-injection.h"
 #include "prctl.h"
 #include "compel/infect-util.h"
 #include "pidfd-store.h"
+#include "compression.h"
 
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
@@ -225,9 +229,26 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 	unsigned long pages[3] = {};
 	unsigned long vaddr;
 	bool dump_all_pages;
+	bool self_contained;
+	bool force_raw;
 	int ret = 0;
 
+	self_contained = (vma->e->flags & MAP_HUGETLB) ||
+			 (vma->e->status & VMA_EXT_PLUGIN);
 	dump_all_pages = should_dump_entire_vma(vma->e);
+	force_raw = opts.compress_mode && self_contained;
+
+	/*
+	 * In region-compression mode, force the first page of this VMA to
+	 * start a new iov so a pagemap entry -- and therefore an LZ4
+	 * region -- never spans a VMA boundary by coalescing with a
+	 * contiguous neighbour. The per-VMA restore reader clamps reads at
+	 * the VMA boundary and cannot split a region there. Only at the
+	 * true VMA start (*pvaddr == vma start), not on a mid-VMA re-entry
+	 * after the page pipe filled up.
+	 */
+	if (opts.compress_mode == COMPRESS_REGION && *pvaddr == vma->e->start)
+		pp->break_iov = true;
 
 	nr_scanned = 0;
 	for (vaddr = *pvaddr; vaddr < vma->e->end; vaddr += PAGE_SIZE, nr_scanned++) {
@@ -246,6 +267,8 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 
 		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr))
 			ppb_flags |= PPB_LAZY;
+		if (force_raw)
+			ppb_flags |= PPB_FORCE_RAW;
 
 		/*
 		 * If we're doing incremental dump (parent images
@@ -254,7 +277,15 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		 * page. The latter would be checked in page-xfer.
 		 */
 
-		if (has_parent && page_in_parent(page_info.softdirty)) {
+		/*
+		 * Hugetlb and external-plugin VMAs cannot use the generic premap
+		 * path, and delayed PIE I/O cannot redirect a PE_PARENT range to a
+		 * different pages image. Keep these rare mappings self-contained at
+		 * every image level. With compression enabled, force_raw additionally
+		 * ensures PIE never has to decode LZ4.
+		 */
+		if (has_parent && !self_contained &&
+		    page_in_parent(page_info.softdirty)) {
 			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
 			st = 0;
 		} else {
@@ -382,9 +413,8 @@ static int detect_pid_reuse(struct pstree_item *item, struct proc_pid_stat *pps,
 	if (pidfd_store_ready())
 		return pidfd_store_check_pid_reuse(item->pid->real);
 
-	if (!parent_ie) {
-		pr_err("Pid-reuse detection failed: no parent inventory, "
-		       "check warnings in get_parent_inventory\n");
+	if (!parent_ie || !parent_ie->has_dump_uptime) {
+		pr_err("Pid-reuse detection failed: parent inventory has no uptime\n");
 		return -1;
 	}
 
@@ -835,6 +865,10 @@ static inline bool check_cow_vmas(struct vma_area *vma, struct vma_area *pvma)
 	/* ... belong to the same file if being filemap */
 	if (!(vma->e->flags & MAP_ANONYMOUS) && vma->e->shmid != pvma->e->shmid)
 		return false;
+	/* ... both be accountable, since COW VMAs may carry restored pages */
+	if (vma_area_is(vma, VMA_AREA_NOT_ACCOUNTABLE) ||
+	    vma_area_is(pvma, VMA_AREA_NOT_ACCOUNTABLE))
+		return false;
 
 	pr_debug("Found two COW VMAs @0x%" PRIx64 "-0x%" PRIx64 "\n", vma->e->start, pvma->e->end);
 	return true;
@@ -951,15 +985,25 @@ static int premap_private_vma(struct pstree_item *t, struct vma_area *vma, void 
 		}
 
 		/*
-		 * All mappings here get PROT_WRITE regardless of whether we
-		 * put any data into it or not, because this area will get
-		 * mremap()-ed (branch below) so we MIGHT need to have WRITE
-		 * bits there. Ideally we'd check for the whole COW-chain
-		 * having any data in.
+		 * For VMAs that have PROT_NONE and are not accountable
+		 * (did not have the "ac" flag in /proc/pid/smaps), we
+		 * can safely mmap them with PROT_NONE because we know
+		 * we will never need to write any bits to them.
 		 */
-		addr = mmap(*tgt_addr, size, vma->e->prot | PROT_WRITE, vma->e->flags | MAP_FIXED | flag, vma->e->fd,
-			    vma->e->pgoff);
-
+		if (vma->e->prot == PROT_NONE && vma_area_is(vma, VMA_AREA_NOT_ACCOUNTABLE)) {
+			addr = mmap(*tgt_addr, size, PROT_NONE, vma->e->flags | MAP_FIXED | flag, vma->e->fd,
+				    vma->e->pgoff);
+		} else {
+			/*
+			 * All mappings here get PROT_WRITE regardless of whether we
+			 * put any data into it or not, because this area will get
+			 * mremap()-ed (branch below) so we MIGHT need to have WRITE
+			 * bits there. Ideally we'd check for the whole COW-chain
+			 * having any data in.
+			 */
+			addr = mmap(*tgt_addr, size, vma->e->prot | PROT_WRITE, vma->e->flags | MAP_FIXED | flag, vma->e->fd,
+				    vma->e->pgoff);
+		}
 		if (addr == MAP_FAILED) {
 			pr_perror("Unable to map ANON_VMA");
 			return -1;
@@ -1063,6 +1107,11 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
 	filemap_ctx_init(true);
 
 	list_for_each_entry(vma, &vmas->h, list) {
+		bool exceptional;
+		int has_lz4 = 0;
+		int has_parent = 0;
+		int needs_premap = 0;
+
 		if (vma_area_is(vma, VMA_AREA_GUARD))
 			continue;
 
@@ -1079,15 +1128,77 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
 
 		if (!vma_area_is_private(vma, kdat.task_size))
 			continue;
+		exceptional = (vma->e->flags & MAP_HUGETLB) ||
+			      (vma->e->status & VMA_EXT_PLUGIN);
 
-		if (vma->e->flags & MAP_HUGETLB)
+		/*
+		 * PIE cannot link against liblz4. Premap ordinary private VMAs which
+		 * contain an actual LZ4 block so their content is decoded by the
+		 * normal page reader before switching to PIE. Also premap large zero
+		 * runs through the compressed-page worker pool, and entries whose
+		 * raw/zero run count exceeds the direct-PIE bound. Short runs then
+		 * coalesce in-process, while long runs retain direct I/O. Uniform and
+		 * lightly fragmented ranges keep the faster delayed path.
+		 *
+		 * Hugetlb and external-plugin VMAs cannot use the generic premap
+		 * path.  The dump side therefore guarantees that their compressed
+		 * pagemap entries contain raw/zero blocks only.  Reject an image
+		 * which violates that invariant before the destructive restore.
+		 */
+		if (opts.compress_mode) {
+			if (exceptional) {
+				has_lz4 = page_read_range_has_lz4(pr, vma->e->start, vma->e->end);
+				if (has_lz4 < 0) {
+					ret = -1;
+					break;
+				}
+			} else {
+				needs_premap = page_read_range_needs_premap(pr, vma->e->start, vma->e->end);
+				if (needs_premap < 0) {
+					ret = -1;
+					break;
+				}
+			}
+		}
+		if (exceptional) {
+			has_parent = page_read_range_has_parent(pr, vma->e->start, vma->e->end);
+			if (has_parent < 0) {
+				ret = -1;
+				break;
+			}
+			if (has_parent) {
+				pr_err("Non-premapped VMA %#" PRIx64 "-%#" PRIx64
+				       " contains pages inherited from a parent image\n",
+				       vma->e->start, vma->e->end);
+				ret = -1;
+				break;
+			}
+		}
+
+		if (vma->e->flags & MAP_HUGETLB) {
+			if (has_lz4) {
+				pr_err("Hugetlb VMA %#" PRIx64 "-%#" PRIx64
+				       " contains an LZ4 block\n",
+				       vma->e->start, vma->e->end);
+				ret = -1;
+				break;
+			}
 			continue;
+		}
 
 		/* VMA offset may change due to plugin so we cannot premap */
-		if (vma->e->status & VMA_EXT_PLUGIN)
+		if (vma->e->status & VMA_EXT_PLUGIN) {
+			if (has_lz4) {
+				pr_err("External-plugin VMA %#" PRIx64 "-%#" PRIx64
+				       " contains an LZ4 block\n",
+				       vma->e->start, vma->e->end);
+				ret = -1;
+				break;
+			}
 			continue;
+		}
 
-		if (vma->pvma == NULL && pr->pieok && !vma_force_premap(vma, &vmas->h)) {
+		if (vma->pvma == NULL && pr->pieok && !needs_premap && !vma_force_premap(vma, &vmas->h)) {
 			/*
 			 * VMA in question is not shared with anyone. We'll
 			 * restore it with its contents in restorer.
@@ -1116,10 +1227,13 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
 	return ret;
 }
 
+#define COW_READ_BATCH_PAGES (1UL << 8)
+
 static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 {
 	struct vma_area *vma;
 	int ret = 0;
+	int exit_code = -1;
 	struct list_head *vmas = &rsti(t)->vmas.h;
 	struct list_head *vma_io = &rsti(t)->vma_io;
 
@@ -1130,6 +1244,8 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 	unsigned int nr_enqueued = 0;
 	unsigned int nr_lazy = 0;
 	unsigned long va;
+	void *buf = NULL;
+	bool page_read_closed = false;
 
 	vma = list_first_entry(vmas, struct vma_area, list);
 	rsti(t)->pages_img_id = pr->pages_img_id;
@@ -1158,8 +1274,8 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 			continue;
 		}
 
-		for (i = 0; i < nr_pages; i++) {
-			unsigned char buf[PAGE_SIZE];
+		i = 0;
+		while (i < nr_pages) {
 			void *p;
 
 			/*
@@ -1195,14 +1311,14 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 				}
 
 				if (pagemap_enqueue_iovec(pr, (void *)va, len, vma_io))
-					return -1;
+					goto out;
 
 				pr->skip_pages(pr, len);
 
 				va += len;
 				len >>= PAGE_SHIFT;
 				nr_restored += len;
-				i += len - 1;
+				i += len;
 
 				nr_enqueued++;
 				continue;
@@ -1215,24 +1331,64 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 			off = (va - vma->e->start) / PAGE_SIZE;
 			p = decode_pointer((off)*PAGE_SIZE + vma->premmaped_addr);
 
-			set_bit(off, vma->page_bitmap);
 			if (vma_inherited(vma)) {
-				clear_bit(off, vma->pvma->page_bitmap);
+				unsigned long nr, j;
+				int memerr;
 
-				ret = pr->read_pages(pr, va, 1, buf, 0);
-				if (ret < 0)
-					goto err_read;
+				/*
+				 * A page-at-a-time read turns compressed COW restore
+				 * into one pread() and one LZ4 call per page. Read a
+				 * bounded aligned batch, then retain the existing
+				 * page-by-page sharing decision.
+				 */
+				nr = min_t(unsigned long, nr_pages - i,
+					   (vma->e->end - va) / PAGE_SIZE);
+				nr = min(nr, COW_READ_BATCH_PAGES);
+				if (pr->pe->has_region_pages && pr->pe->region_pages &&
+				    nr < nr_pages - i) {
+					unsigned long aligned =
+						nr - nr % pr->pe->region_pages;
 
-				va += PAGE_SIZE;
-				nr_compared++;
-
-				if (memcmp(p, buf, PAGE_SIZE) == 0) {
-					nr_shared++; /* the page is cowed */
-					continue;
+					if (aligned)
+						nr = aligned;
+				}
+				if (!buf) {
+					memerr = posix_memalign(&buf, PAGE_SIZE,
+						COW_READ_BATCH_PAGES * PAGE_SIZE);
+					if (memerr) {
+						pr_err("Can't allocate COW buffer: %s\n",
+						       strerror(memerr));
+						ret = -1;
+						goto err_read;
+					}
 				}
 
-				nr_restored++;
-				memcpy(p, buf, PAGE_SIZE);
+				ret = pr->read_pages(pr, va, nr, buf, PR_ASYNC);
+				if (ret < 0)
+					goto err_read;
+				if (pr->sync(pr)) {
+					ret = -1;
+					goto err_read;
+				}
+
+				for (j = 0; j < nr; j++) {
+					void *src = (char *)buf + j * PAGE_SIZE;
+					void *dst = (char *)p + j * PAGE_SIZE;
+
+					set_bit(off + j, vma->page_bitmap);
+					clear_bit(off + j, vma->pvma->page_bitmap);
+					nr_compared++;
+					if (memcmp(dst, src, PAGE_SIZE) == 0) {
+						nr_shared++; /* the page is cowed */
+						continue;
+					}
+
+					nr_restored++;
+					memcpy(dst, src, PAGE_SIZE);
+				}
+
+				va += nr * PAGE_SIZE;
+				i += nr;
 			} else {
 				int nr;
 
@@ -1247,13 +1403,14 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 
 				nr = min_t(int, nr_pages - i, (vma->e->end - va) / PAGE_SIZE);
 
+				set_bit(off, vma->page_bitmap);
 				ret = pr->read_pages(pr, va, nr, p, PR_ASYNC);
 				if (ret < 0)
 					goto err_read;
 
 				va += nr * PAGE_SIZE;
 				nr_restored += nr;
-				i += nr - 1;
+				i += nr;
 
 				bitmap_set(vma->page_bitmap, off + 1, nr - 1);
 			}
@@ -1261,12 +1418,21 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 	}
 
 err_read:
-	if (pr->sync(pr))
-		return -1;
+	{
+		int sync_ret = pr->sync(pr);
 
-	pr->close(pr);
-	if (ret < 0)
-		return ret;
+		pr->close(pr);
+		page_read_closed = true;
+		if (sync_ret) {
+			ret = -1;
+			goto out;
+		}
+	}
+
+	if (ret < 0) {
+		exit_code = ret;
+		goto out;
+	}
 
 	/* Remove pages, which were not shared with a child */
 	list_for_each_entry(vma, vmas, list) {
@@ -1290,7 +1456,7 @@ err_read:
 			ret = madvise(addr + PAGE_SIZE * i, PAGE_SIZE, MADV_DONTNEED);
 			if (ret < 0) {
 				pr_perror("madvise failed");
-				return -1;
+				goto out;
 			}
 			i++;
 			nr_dropped++;
@@ -1307,11 +1473,19 @@ err_read:
 	pr_info("nr_enqueued:       %d\n", nr_enqueued);
 	pr_info("nr_lazy:           %d\n", nr_lazy);
 
-	return 0;
+	exit_code = 0;
+	goto out;
 
 err_addr:
 	pr_err("Page entry address %lx outside of VMA %lx-%lx\n", va, (long)vma->e->start, (long)vma->e->end);
-	return -1;
+out:
+	if (!page_read_closed) {
+		if (pr->sync(pr))
+			exit_code = -1;
+		pr->close(pr);
+	}
+	xfree(buf);
+	return exit_code;
 }
 
 static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
@@ -1485,6 +1659,7 @@ int open_vmas(struct pstree_item *t)
 static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 {
 	struct cr_img *pages;
+	int ret;
 
 	/*
 	 * We optimize the case when rsti(t)->vma_io is empty.
@@ -1497,6 +1672,7 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		ta->vma_ios = NULL;
 		ta->vma_ios_n = 0;
 		ta->vma_ios_fd = -1;
+		ta->vma_ios_use_direct = false;
 		return 0;
 	}
 
@@ -1509,7 +1685,28 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		return -1;
 
 	ta->vma_ios_fd = img_raw_fd(pages);
-	return pagemap_render_iovec(&rsti(t)->vma_io, ta);
+	/*
+	 * Select direct AIO from the actual delayed ranges, not the inventory-wide
+	 * compression mode.  LZ4 ranges were premapped above, while aligned raw
+	 * fallbacks and zero ranges remain safe for the PIE fast path.
+	 */
+	if (ta->vma_ios_fd >= 0 && opts.image_io_mode == IMAGE_IO_DIRECT &&
+	    pagemap_iovec_is_direct_compatible(&rsti(t)->vma_io)) {
+		int direct = probe_pages_o_direct(ta->vma_ios_fd);
+		if (direct < 0) {
+			close_image(pages);
+			ta->vma_ios_fd = -1;
+			return -1;
+		}
+		ta->vma_ios_use_direct = (direct == 1);
+	}
+
+	ret = pagemap_render_iovec(&rsti(t)->vma_io, ta);
+	if (ret) {
+		close_image(pages);
+		ta->vma_ios_fd = -1;
+	}
+	return ret;
 }
 
 int prepare_vmas(struct pstree_item *t, struct task_restore_args *ta)

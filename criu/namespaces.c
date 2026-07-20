@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <sched.h>
 #include <sys/capability.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <limits.h>
 #include <errno.h>
@@ -28,6 +29,7 @@
 #include "fdstore.h"
 #include "kerndat.h"
 #include "util-caps.h"
+#include "filesystems.h"
 
 #include "protobuf.h"
 #include "util.h"
@@ -1010,8 +1012,9 @@ int dump_user_ns(pid_t pid, int ns_id)
 	ret = parse_id_map(pid, "uid_map", &e->uid_map);
 	if (ret < 0)
 		/*
-		 * The uid_map and gid_map is clean up in free_userns_maps
-		 * later, so we don't need to clean these up in error cases.
+		 * The uid_map, gid_map and binfmt_misc are cleaned up in
+		 * free_userns_data later, so we don't need to clean these up in error
+		 * cases.
 		 */
 		return -1;
 
@@ -1025,6 +1028,11 @@ int dump_user_ns(pid_t pid, int ns_id)
 	if (check_user_ns(pid))
 		return -1;
 
+	ret = binfmt_misc_dump_sandboxed(pid, &e->binfmt_misc);
+	if (ret < 0)
+		return -1;
+	e->n_binfmt_misc = ret;
+
 	img = open_image(CR_FD_USERNS, O_DUMP, ns_id);
 	if (!img)
 		return -1;
@@ -1036,7 +1044,7 @@ int dump_user_ns(pid_t pid, int ns_id)
 	return 0;
 }
 
-void free_userns_maps(void)
+void free_userns_data(void)
 {
 	if (userns_entry.n_uid_map > 0) {
 		xfree(userns_entry.uid_map[0]);
@@ -1046,6 +1054,8 @@ void free_userns_maps(void)
 		xfree(userns_entry.gid_map[0]);
 		xfree(userns_entry.gid_map);
 	}
+	if (userns_entry.n_binfmt_misc > 0)
+		free_pb_binfmt_misc_entries(userns_entry.binfmt_misc, userns_entry.n_binfmt_misc);
 }
 
 static int do_dump_namespaces(struct ns_id *ns)
@@ -1211,7 +1221,8 @@ static int write_id_map(pid_t pid, UidGidExtent **extents, int n, char *id_map)
 
 static int usernsd_pid;
 
-inline void unsc_msg_init(struct unsc_msg *m, uns_call_t *c, int *x, void *arg, size_t asize, int fd, pid_t *pid)
+static void unsc_msg_init_flags(struct unsc_msg *m, uns_call_t *c, int *x, void *arg, size_t asize, int fd, pid_t *pid,
+				bool send_creds)
 {
 	struct cmsghdr *ch;
 	struct ucred *ucred;
@@ -1241,24 +1252,31 @@ inline void unsc_msg_init(struct unsc_msg *m, uns_call_t *c, int *x, void *arg, 
 	 */
 	memzero(&m->c, sizeof(m->c));
 
-	m->h.msg_controllen = CMSG_SPACE(sizeof(struct ucred));
+	m->h.msg_controllen = 0;
+	ch = NULL;
 
-	ch = CMSG_FIRSTHDR(&m->h);
-	ch->cmsg_len = CMSG_LEN(sizeof(struct ucred));
-	ch->cmsg_level = SOL_SOCKET;
-	ch->cmsg_type = SCM_CREDENTIALS;
+	if (send_creds) {
+		m->h.msg_controllen = CMSG_SPACE(sizeof(struct ucred));
+		ch = CMSG_FIRSTHDR(&m->h);
+		ch->cmsg_len = CMSG_LEN(sizeof(struct ucred));
+		ch->cmsg_level = SOL_SOCKET;
+		ch->cmsg_type = SCM_CREDENTIALS;
 
-	ucred = (struct ucred *)CMSG_DATA(ch);
-	if (pid)
-		ucred->pid = *pid;
-	else
-		ucred->pid = getpid();
-	ucred->uid = getuid();
-	ucred->gid = getgid();
+		ucred = (struct ucred *)CMSG_DATA(ch);
+		if (pid)
+			ucred->pid = *pid;
+		else
+			ucred->pid = getpid();
+		ucred->uid = getuid();
+		ucred->gid = getgid();
+	}
 
 	if (fd >= 0) {
 		m->h.msg_controllen += CMSG_SPACE(sizeof(int));
-		ch = CMSG_NXTHDR(&m->h, ch);
+		if (ch)
+			ch = CMSG_NXTHDR(&m->h, ch);
+		else
+			ch = CMSG_FIRSTHDR(&m->h);
 		BUG_ON(!ch);
 		ch->cmsg_len = CMSG_LEN(sizeof(int));
 		ch->cmsg_level = SOL_SOCKET;
@@ -1267,23 +1285,33 @@ inline void unsc_msg_init(struct unsc_msg *m, uns_call_t *c, int *x, void *arg, 
 	}
 }
 
+void unsc_msg_init(struct unsc_msg *m, uns_call_t *c, int *x, void *arg, size_t asize, int fd, pid_t *pid)
+{
+	unsc_msg_init_flags(m, c, x, arg, asize, fd, pid, true);
+}
+
+void unsc_msg_init_nocreds(struct unsc_msg *m, uns_call_t *c, int *x, void *arg, size_t asize, int fd)
+{
+	unsc_msg_init_flags(m, c, x, arg, asize, fd, NULL, false);
+}
+
 void unsc_msg_pid_fd(struct unsc_msg *um, pid_t *pid, int *fd)
 {
 	struct cmsghdr *ch;
 	struct ucred *ucred;
 
 	ch = CMSG_FIRSTHDR(&um->h);
-	BUG_ON(!ch);
-	BUG_ON(ch->cmsg_len != CMSG_LEN(sizeof(struct ucred)));
-	BUG_ON(ch->cmsg_level != SOL_SOCKET);
-	BUG_ON(ch->cmsg_type != SCM_CREDENTIALS);
-
-	if (pid) {
-		ucred = (struct ucred *)CMSG_DATA(ch);
-		*pid = ucred->pid;
+	if (ch && ch->cmsg_level == SOL_SOCKET && ch->cmsg_type == SCM_CREDENTIALS) {
+		BUG_ON(ch->cmsg_len != CMSG_LEN(sizeof(struct ucred)));
+		if (pid) {
+			ucred = (struct ucred *)CMSG_DATA(ch);
+			*pid = ucred->pid;
+		}
+		ch = CMSG_NXTHDR(&um->h, ch);
+	} else {
+		if (pid)
+			*pid = -1;
 	}
-
-	ch = CMSG_NXTHDR(&um->h, ch);
 
 	if (ch && ch->cmsg_len == CMSG_LEN(sizeof(int))) {
 		BUG_ON(ch->cmsg_level != SOL_SOCKET);
@@ -1437,7 +1465,7 @@ out:
 	return ret;
 }
 
-int start_unix_cred_daemon(pid_t *pid, int (*daemon_func)(int sk))
+int start_unix_cred_daemon(pid_t *pid, int (*daemon_func)(int sk), bool passcred)
 {
 	int sk[2];
 	int one = 1;
@@ -1460,14 +1488,20 @@ int start_unix_cred_daemon(pid_t *pid, int (*daemon_func)(int sk))
 		return -1;
 	}
 
-	if (setsockopt(sk[0], SOL_SOCKET, SO_PASSCRED, &one, sizeof(one)) < 0) {
-		pr_perror("failed to setsockopt");
-		return -1;
-	}
+	if (passcred) {
+		if (setsockopt(sk[0], SOL_SOCKET, SO_PASSCRED, &one, sizeof(one)) < 0) {
+			pr_perror("failed to setsockopt");
+			close(sk[0]);
+			close(sk[1]);
+			return -1;
+		}
 
-	if (setsockopt(sk[1], SOL_SOCKET, SO_PASSCRED, &one, sizeof(1)) < 0) {
-		pr_perror("failed to setsockopt");
-		return -1;
+		if (setsockopt(sk[1], SOL_SOCKET, SO_PASSCRED, &one, sizeof(1)) < 0) {
+			pr_perror("failed to setsockopt");
+			close(sk[0]);
+			close(sk[1]);
+			return -1;
+		}
 	}
 
 	*pid = fork();
@@ -1496,7 +1530,7 @@ static int start_usernsd(void)
 	if (!(root_ns_mask & CLONE_NEWUSER))
 		return 0;
 
-	sk = start_unix_cred_daemon(&usernsd_pid, usernsd);
+	sk = start_unix_cred_daemon(&usernsd_pid, usernsd, true);
 	if (sk < 0) {
 		pr_err("failed to start usernsd\n");
 		return -1;
@@ -1571,19 +1605,49 @@ int stop_usernsd(void)
 	return ret;
 }
 
-int prepare_userns(struct pstree_item *item)
+static int read_user_ns_img(void)
 {
+	struct ns_id *ns;
 	struct cr_img *img;
-	UsernsEntry *e;
 	int ret;
 
-	img = open_image(CR_FD_USERNS, O_RSTR, item->ids->user_ns_id);
+	if (!(root_ns_mask & CLONE_NEWUSER))
+		return 0;
+
+	ns = lookup_ns_by_id(root_item->ids->user_ns_id, &user_ns_desc);
+	if (!ns) {
+		pr_err("Can not find user ns\n");
+		return -1;
+	}
+
+	img = open_image(CR_FD_USERNS, O_RSTR, root_item->ids->user_ns_id);
 	if (!img)
 		return -1;
-	ret = pb_read_one(img, &e, PB_USERNS);
+	ret = pb_read_one(img, &ns->user.e, PB_USERNS);
 	close_image(img);
-	if (ret < 0)
+	if (ret < 0) {
+		pr_err("Can not read userns object\n");
 		return -1;
+	}
+
+	return 0;
+}
+
+int prepare_userns(struct pstree_item *item)
+{
+	struct ns_id *ns;
+	UsernsEntry *e;
+
+	ns = lookup_ns_by_id(item->ids->user_ns_id, &user_ns_desc);
+	if (!ns) {
+		pr_err("Can not find user ns\n");
+		return -1;
+	}
+	e = ns->user.e;
+	if (!e) {
+		pr_err("userns image was not pre-read\n");
+		return -1;
+	}
 
 	if (write_id_map(item->pid->real, e->uid_map, e->n_uid_map, "uid_map"))
 		return -1;
@@ -1592,6 +1656,31 @@ int prepare_userns(struct pstree_item *item)
 		return -1;
 
 	return 0;
+}
+
+int restore_userns_binfmt_misc(struct pstree_item *item)
+{
+	struct ns_id *ns;
+	UsernsEntry *e;
+	int ret;
+
+	ns = lookup_ns_by_id(item->ids->user_ns_id, &user_ns_desc);
+	if (!ns) {
+		pr_err("Can not find user ns\n");
+		return -1;
+	}
+	e = ns->user.e;
+	if (!e) {
+		pr_err("userns image was not pre-read\n");
+		return -1;
+	}
+
+	ret = binfmt_misc_restore_sandboxed(item->pid->real, e->binfmt_misc, e->n_binfmt_misc);
+
+	userns_entry__free_unpacked(ns->user.e, NULL);
+	ns->user.e = NULL;
+
+	return ret ? -1 : 0;
 }
 
 int collect_namespaces(bool for_dump)
@@ -1853,6 +1942,9 @@ int prepare_namespace_before_tasks(void)
 		goto err_img;
 
 	if (read_pid_ns_img())
+		goto err_img;
+
+	if (read_user_ns_img())
 		goto err_img;
 
 	return 0;

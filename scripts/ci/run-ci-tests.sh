@@ -8,6 +8,16 @@ X86_64_PKGS=(gcc-multilib)
 # Convert from string to array.
 IFS=" " read -r -a ZDTM_OPTS <<< "$ZDTM_OPTS"
 
+SHARD_OPTS=()
+if [ -n "$ZDTM_SHARD_COUNT" ] && [ "$ZDTM_SHARD_COUNT" -gt 0 ]; then
+	if [ -z "$ZDTM_SHARD_INDEX" ]; then
+		echo "ERROR: ZDTM_SHARD_COUNT set but ZDTM_SHARD_INDEX is not"
+		exit 1
+	fi
+	SHARD_OPTS=(--test-shard-index "$ZDTM_SHARD_INDEX" \
+		--test-shard-count "$ZDTM_SHARD_COUNT")
+fi
+
 UNAME_M=$(uname -m)
 
 if [ "$UNAME_M" != "x86_64" ]; then
@@ -17,6 +27,17 @@ if [ "$UNAME_M" != "x86_64" ]; then
 	# The RUN_TESTS environment variable can override this, e.g., for aarch64.
 	[ -n "$RUN_TESTS" ] || SKIP_CI_TEST=1
 fi
+
+chmod_parents_o_x() {
+	local d
+
+	d="$(pwd -P)"
+
+	while [ "$d" != "/" ]; do
+		chmod o+x "$d" || return 1
+		d=$(dirname "$d")
+	done
+}
 
 ci_prep () {
 	[ -n "$SKIP_CI_PREP" ] && return
@@ -55,6 +76,8 @@ ci_prep () {
 	contrib/dependencies/apt-packages.sh
 	contrib/apt-install "${CI_PKGS[@]}"
 	chmod a+x "$HOME"
+	chmod_parents_o_x
+
 }
 
 test_stream() {
@@ -65,8 +88,21 @@ test_stream() {
 	# restorer and eventually close the page read. However, image-streamer expects the
 	# whole image to be read and the image is not reopened, sent twice. These MAP_HUGETLB
 	# test cases will result in EPIPE error at the moment.
-	STREAM_TEST_EXCLUDE=(-x maps09 -x maps10)
+	# Region compression (--compress-region) is incompatible with the
+	# per-page image-streamer wire format, so exclude those tests from
+	# the streamed run (they are covered by the local -a runs).
+	STREAM_TEST_EXCLUDE=(-x maps09 -x maps10
+		-x compress_pages_region00
+		-x compress_pages_region01
+		-x compress_pages_region02
+		-x compress_pages_region03)
 	./test/zdtm.py run --stream -p 2 --keep-going -a "${STREAM_TEST_EXCLUDE[@]}" "${ZDTM_OPTS[@]}"
+	if criu/criu check --feature compress; then
+		./test/zdtm.py run --stream --compress -t zdtm/static/maps00 -t zdtm/static/env00
+		./test/zdtm.py run --stream -t zdtm/static/compress_pages00 -t zdtm/static/compress_pages01 -t zdtm/static/compress_pages02
+	else
+		echo "Skipping streamed compression tests"
+	fi
 }
 
 print_header() {
@@ -153,7 +189,6 @@ ulimit -c unlimited
 cgid=$$
 cleanup_cgroup() {
 	./test/zdtm_umount_cgroups $cgid
-	dmesg
 }
 trap cleanup_cgroup EXIT
 ./test/zdtm_mount_cgroups $cgid
@@ -195,6 +230,9 @@ fi
 # umask has to be called before a first criu run, so that .gcda (coverage data)
 # files are created with read-write permissions for all.
 umask 0000
+# Also fix permissions on .gcda files already created during the build (owned
+# by root). Restored processes run as non-root and must be able to write them.
+find . -name '*.gcda' -exec chmod a+rw {} +
 ./criu/criu check
 ./criu/criu check --all || echo $?
 if [ "$UNAME_M" == "x86_64" ]; then
@@ -208,6 +246,7 @@ export SKIP_PREP=1
 chmod 0777 test/
 chmod 0777 test/zdtm/static
 chmod 0777 test/zdtm/transition
+chmod 0777 soccr/test/
 
 # We run streaming tests separately to improve test completion times,
 # hence the exit 0.
@@ -217,155 +256,268 @@ if [ "${STREAM_TEST}" = "1" ]; then
 	exit 0
 fi
 
-./test/zdtm.py run -a -p 2 --keep-going "${ZDTM_OPTS[@]}"
-if criu/criu check --feature move_mount_set_group; then
-	./test/zdtm.py run -a -p 2 --mntns-compat-mode --keep-going "${ZDTM_OPTS[@]}"
-fi
-
-./test/zdtm.py run -a -p 2 --keep-going --criu-config "${ZDTM_OPTS[@]}"
-
-# Newer kernels are blocking access to userfaultfd:
-# uffd: Set unprivileged_userfaultfd sysctl knob to 1 if kernel faults must be handled without obtaining CAP_SYS_PTRACE capability
-if [ -e /proc/sys/vm/unprivileged_userfaultfd ]; then
-	echo 1 > /proc/sys/vm/unprivileged_userfaultfd
-fi
-
-LAZY_EXCLUDE=(-x maps04 -x cmdlinenv00 -x maps007)
-
-LAZY_TESTS='.*(maps0|uffd-events|lazy-thp|futex|fork).*'
-LAZY_OPTS=(-p 2 -T "$LAZY_TESTS" "${LAZY_EXCLUDE[@]}" "${ZDTM_OPTS[@]}")
-
-./test/zdtm.py run "${LAZY_OPTS[@]}" --lazy-pages
-./test/zdtm.py run "${LAZY_OPTS[@]}" --remote-lazy-pages
-./test/zdtm.py run "${LAZY_OPTS[@]}" --remote-lazy-pages --tls
-
-bash -x ./test/jenkins/criu-fault.sh
-if [ "$UNAME_M" == "x86_64" ]; then
-	# This fails on aarch64 (aws-graviton2) with:
-	# 33: ERR: thread-bomb.c:49: pthread_attr_setstacksize(): 22
-	bash -x ./test/jenkins/criu-fcg.sh
-fi
-bash -x ./test/jenkins/criu-inhfd.sh
-
-if [ -z "$SKIP_EXT_DEV_TEST" ]; then
-	make -C test/others/mnt-ext-dev/ run
-	if criu/criu check --feature move_mount_set_group; then
-		EXTRA_OPTS=--mntns-compat-mode make -C test/others/mnt-ext-dev/ run
+run_non_shardable_tests() {
+	# Newer kernels are blocking access to userfaultfd:
+	# uffd: Set unprivileged_userfaultfd sysctl knob to 1 if kernel faults
+	# must be handled without obtaining CAP_SYS_PTRACE capability
+	if [ -e /proc/sys/vm/unprivileged_userfaultfd ]; then
+		echo 1 > /proc/sys/vm/unprivileged_userfaultfd
 	fi
-fi
 
-make -C test/others/make/ run CC="$CC"
-if [ -n "$CIRCLECI" ]; then
-       # GitHub Actions (and Cirrus CI) does not provide a real TTY and CRIU will fail with:
-       # Error (criu/tty.c:1014): tty: Don't have tty to inherit session from, aborting
-       make -C test/others/shell-job/ run
-fi
-make -C test/others/criu-ns/ run
-make -C test/others/skip-file-rwx-check/ run
-make -C test/others/rpc/ run
+	LAZY_EXCLUDE=(-x maps04 -x cmdlinenv00 -x maps007)
 
-./test/zdtm.py run -t zdtm/static/env00 --sibling
+	LAZY_TESTS='.*(maps0|uffd-events|lazy-thp|futex|fork).*'
+	LAZY_OPTS=(-p 2 -T "$LAZY_TESTS" "${LAZY_EXCLUDE[@]}" "${ZDTM_OPTS[@]}")
 
-./test/zdtm.py run -t zdtm/static/maps00 --preload-libfault
-./test/zdtm.py run -t zdtm/static/maps02 --preload-libfault
+	./test/zdtm.py run "${LAZY_OPTS[@]}" --lazy-pages
+	./test/zdtm.py run "${LAZY_OPTS[@]}" --remote-lazy-pages
+	./test/zdtm.py run "${LAZY_OPTS[@]}" --remote-lazy-pages --tls
+	if criu/criu check --feature compress; then
+		./test/zdtm.py run -t zdtm/static/maps00 --lazy-pages --compress
+		./test/zdtm.py run -t zdtm/static/compress_pages00 --remote-lazy-pages --compress
+	else
+		echo "Skipping lazy-pages compression tests"
+	fi
 
-./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --dedup
-./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --noauto-dedup
-./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --page-server
-./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --page-server --dedup
-./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --pre-dump-mode read
+	bash -x ./test/jenkins/criu-fault.sh
+	if [ "$UNAME_M" == "x86_64" ]; then
+		# This fails on aarch64 (aws-graviton2) with:
+		# 33: ERR: thread-bomb.c:49: pthread_attr_setstacksize(): 22
+		bash -x ./test/jenkins/criu-fcg.sh
+	fi
+	bash -x ./test/jenkins/criu-inhfd.sh
 
-./test/zdtm.py run -t zdtm/transition/pid_reuse --pre 2 # start time based pid reuse detection
-./test/zdtm.py run -t zdtm/transition/pidfd_store_sk --rpc --pre 2 # pidfd based pid reuse detection
+	if [ -z "$SKIP_EXT_DEV_TEST" ]; then
+		make -C test/others/mnt-ext-dev/ run
+		if criu/criu check --feature move_mount_set_group; then
+			EXTRA_OPTS=--mntns-compat-mode make -C test/others/mnt-ext-dev/ run
+		fi
+	fi
 
-./test/zdtm.py run -t zdtm/static/socket-tcp-local --norst
+	make -C test/others/make/ run CC="$CC"
+	if [ -n "$CIRCLECI" ]; then
+		# GitHub Actions (and Cirrus CI) does not provide a real TTY
+		# and CRIU will fail with:
+		# Error (criu/tty.c:1014): tty: Don't have tty to inherit
+		# session from, aborting
+		make -C test/others/shell-job/ run
+	fi
+	make -C test/others/criu-ns/ run
+	make -C test/others/skip-file-rwx-check/ run
+	make -C test/others/rpc/ run
 
-ip net add test
-./test/zdtm.py run -t zdtm/static/env00 -f h --join-ns
+	./test/zdtm.py run -t zdtm/static/env00 --sibling
 
-# RPC testing
-./test/zdtm.py run -t zdtm/static/env00 --rpc		# Basic
-./test/zdtm.py run -t zdtm/static/env00 --rpc --pre 2 --page-server
-./test/zdtm.py run -t zdtm/static/ptrace_sig -f h --rpc # Error handling (crfail test)
+	./test/zdtm.py run -t zdtm/static/maps00 --preload-libfault
+	./test/zdtm.py run -t zdtm/static/maps02 --preload-libfault
 
-./test/zdtm.py run --empty-ns -T zdtm/static/socket-tcp*-local --iter 2
+	./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --dedup
+	./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --noauto-dedup
+	./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --page-server
+	./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --page-server --dedup
+	./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --pre-dump-mode read
 
-./test/zdtm.py run -t zdtm/static/env00 -t zdtm/transition/fork -t zdtm/static/ghost_holes00 -t zdtm/static/socket-tcp -t zdtm/static/msgque -k always
-./test/crit-recode.py
+	./test/zdtm.py run -t zdtm/static/maps04 --image-io-mode direct
+	./test/zdtm.py run -t zdtm/static/maps00 --image-io-mode direct --rpc
 
-# Rootless tests
-# Check if cap_checkpoint_restore is supported and also if unshare -c is supported.
-#
-# Do not run this test in a container (see https://github.com/checkpoint-restore/criu/issues/2312).
-# Before v6.8-rc1~215^2~6, the kernel currently did not show correct device and
-# inode numbers in /proc/pid/maps for stackable file systems.
-skip=0
-findmnt -no FSTYPE / | grep overlay && {
-	./criu/criu check --feature overlayfs_maps || skip=1
+	if criu/criu check --feature compress; then
+		# The ZDTM runner deliberately starts the page server without
+		# compression options, so these cover a compressed client with a
+		# default server.
+		./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --compress
+		./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --compress --dedup
+		./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --compress --page-server
+		./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --compress --page-server --dedup
+
+		# Compression page content integrity across different modes.
+		./test/zdtm.py run -t zdtm/static/compress_pages00 -t zdtm/static/compress_pages01 -t zdtm/static/compress_pages02
+		./test/zdtm.py run -t zdtm/static/compress_pages00 --pre 2
+		./test/zdtm.py run -t zdtm/static/compress_pages01 --pre 2
+		./test/zdtm.py run -t zdtm/static/compress_pages00 --page-server
+		./test/zdtm.py run -t zdtm/static/compress_pages01 --page-server
+		./test/zdtm.py run -t zdtm/static/compress_pages00 --dedup
+		./test/zdtm.py run -t zdtm/static/compress_pages00 --lazy-pages
+		./test/zdtm.py run -t zdtm/static/compress_pages00 --image-io-mode direct
+		./test/zdtm.py run -t zdtm/static/compress_pages00 --compress-acceleration 2
+		./test/zdtm.py run -t zdtm/static/compress_pages00 -t zdtm/static/compress_pages01 --rpc
+
+		# Add parent-chain and dedup coverage for region compression.
+		./test/zdtm.py run -t zdtm/static/compress_pages_region00 --pre 2
+		./test/zdtm.py run -t zdtm/static/compress_pages_region00 --dedup
+		./test/zdtm.py run -t zdtm/static/compress_pages_region03 --pre 2
+	else
+		echo "Skipping memory compression ZDTM tests"
+	fi
+
+	# Run a small checksum-verified compression benchmark. The full benchmark
+	# remains available under contrib/compression-benchmark for performance
+	# runs; this CI wrapper avoids dropping the host page cache.
+	if criu/criu check --feature compress; then
+		make -C test/others/compression/benchmark run
+	else
+		echo "Skipping compression benchmark test"
+	fi
+
+	if criu/criu check --feature compress; then
+		# Hugetlb mappings are not premapped. Their blocks must remain
+		# self-contained raw/zero fallbacks for PIE restore.
+		./test/zdtm.py run -t zdtm/static/maps09 --pre 2 --compress
+		./test/zdtm.py run -t zdtm/static/maps09 --pre 2 --compress-region 256K
+		./test/zdtm.py run -t zdtm/static/maps10 --pre 2 --compress
+		./test/zdtm.py run -t zdtm/static/maps10 --pre 2 --compress-region 256K
+	else
+		echo "Skipping hugetlb compression tests"
+	fi
+
+	# Incremental compression parent chains.
+	if criu/criu check --feature compress && criu/criu check --feature mem_dirty_track; then
+		make -C test/others/compression/incremental run
+	else
+		echo "Skipping compression/incremental test"
+	fi
+
+	# Raw compression fallback image format.
+	if criu/criu check --feature compress; then
+		make -C test/others/compression/raw run
+	else
+		echo "Skipping compression/raw test"
+	fi
+
+	./test/zdtm.py run -t zdtm/transition/pid_reuse --pre 2 # start time based pid reuse detection
+	./test/zdtm.py run -t zdtm/transition/pidfd_store_sk --rpc --pre 2 # pidfd based pid reuse detection
+
+	./test/zdtm.py run -t zdtm/static/socket-tcp-local --norst
+
+	ip net add test
+	./test/zdtm.py run -t zdtm/static/env00 -f h --join-ns
+
+	# RPC testing
+	./test/zdtm.py run -t zdtm/static/env00 --rpc		# Basic
+	./test/zdtm.py run -t zdtm/static/env00 --rpc --pre 2 --page-server
+	./test/zdtm.py run -t zdtm/static/ptrace_sig -f h --rpc # Error handling (crfail test)
+
+	./test/zdtm.py run --empty-ns -T zdtm/static/socket-tcp*-local --iter 2
+
+	./test/zdtm.py run -t zdtm/static/env00 -t zdtm/transition/fork -t zdtm/static/ghost_holes00 -t zdtm/static/socket-tcp -t zdtm/static/msgque -k always
+	./test/crit-recode.py
+
+	# Rootless tests
+	# Check if cap_checkpoint_restore is supported and also if unshare -c
+	# is supported.
+	#
+	# Do not run this test in a container
+	# (see https://github.com/checkpoint-restore/criu/issues/2312).
+	# Before v6.8-rc1~215^2~6, the kernel currently did not show correct
+	# device and inode numbers in /proc/pid/maps for stackable file
+	# systems.
+	skip=0
+	findmnt -no FSTYPE / | grep overlay && {
+		./criu/criu check --feature overlayfs_maps || skip=1
+	}
+	unshare -c /bin/true || skip=1
+	capsh --supports=cap_checkpoint_restore || skip=1
+
+	if [ "$skip" == 0 ]; then
+		make -C test/zdtm/ cleanout
+		rm -rf test/dump
+		setcap cap_checkpoint_restore,cap_sys_ptrace+eip criu/criu
+		if [ -d /sys/fs/selinux ] && command -v getenforce &>/dev/null; then
+			# Note: selinux in Enforcing mode prevents us from
+			# calling clone3() or writing to ns_last_pid on
+			# restore; hence set to Permissive for the test and
+			# then set back.
+			selinuxmode=$(getenforce)
+			if [ "$selinuxmode" != "Disabled" ]; then
+				setenforce Permissive
+			fi
+
+		fi
+		# Run it as non-root in a user namespace. Since
+		# CAP_CHECKPOINT_RESTORE behaves differently in non-user
+		# namespaces (e.g. no access to map_files) this tests that we
+		# can dump and restore under those conditions. Note that the
+		# "... && true" part is necessary; we need at least one
+		# statement after the tests so that bash can reap zombies in
+		# the user namespace, otherwise it will exec the last statement
+		# and get replaced and nobody will be left to reap our zombies.
+		sudo --user=#65534 --group=#65534 unshare -Ucfpm --mount-proc -- bash -c "./test/zdtm.py run -t zdtm/static/maps00 -f h --rootless && true"
+		if [ -d /sys/fs/selinux ] && command -v getenforce &>/dev/null; then
+			if [ "$selinuxmode" != "Disabled" ]; then
+				setenforce "$selinuxmode"
+			fi
+		fi
+		setcap -r criu/criu
+	else
+		echo "Skipping unprivileged mode tests"
+	fi
+
+	# more crit testing
+	make -C test/others/crit run
+
+	# coredump testing
+	make -C test/others/criu-coredump run
+
+	# libcriu testing
+	make -C test/others/libcriu run
+
+	# criu-service-client testing
+	make -C contrib/criu-service-client/test run
+
+	# external namespace testing
+	make -C test/others/ns_ext run
+
+	# config file parser and parameter testing
+	make -C test/others/config-file run
+	make -C test/others/compression/page-server run
+
+	# action script testing
+	make -C test/others/action-script run
+
+	# Skip all further tests when running with GCOV=1
+	# The one test which currently cannot handle GCOV testing is
+	# compel/test. Probably because the GCOV Makefile infrastructure
+	# does not exist in compel.
+	[ -n "$GCOV" ] && return 0
+
+	# compel testing
+	make -C compel/test
+
+	# soccr testing
+	make -C soccr/test
+
+	# amdgpu and cuda plugin testing
+	make amdgpu_plugin
+	make -C plugins/amdgpu/ test_topology_remap
+	./plugins/amdgpu/test_topology_remap
+
+	./test/zdtm.py run -t zdtm/static/maps00 -t zdtm/static/maps02 --criu-plugin cuda
+	./test/zdtm.py run -t zdtm/static/maps00 -t zdtm/static/maps02 --criu-plugin amdgpu
+	./test/zdtm.py run -t zdtm/static/maps00 -t zdtm/static/maps02 --criu-plugin amdgpu cuda
+	./test/zdtm.py run -t zdtm/static/busyloop00 --criu-plugin inventory_test_enabled inventory_test_disabled
+
+	./test/zdtm.py run -t zdtm/static/sigpending -t zdtm/static/pthread00 --mocked-cuda-checkpoint --fault 138
 }
-unshare -c /bin/true || skip=1
-capsh --supports=cap_checkpoint_restore || skip=1
 
-if [ "$skip" == 0 ]; then
-	make -C test/zdtm/ cleanout
-	rm -rf test/dump
-	setcap cap_checkpoint_restore,cap_sys_ptrace+eip criu/criu
-	if [ -d /sys/fs/selinux ] && command -v getenforce &>/dev/null; then
-		# Note: selinux in Enforcing mode prevents us from calling clone3() or writing to ns_last_pid on restore; hence set to Permissive for the test and then set back.
-		selinuxmode=$(getenforce)
-		if [ "$selinuxmode" != "Disabled" ]; then
-			setenforce Permissive
-		fi
-
+# When sharding is enabled, shards 0..count-1 run sharded zdtm tests and
+# shard "count" (the extra shard) runs only the non-shardable tests.
+# When sharding is not enabled, run everything sequentially.
+if [ -z "$ZDTM_SHARD_COUNT" ] || [ "$ZDTM_SHARD_COUNT" -eq 0 ]; then
+	# No sharding: run all zdtm tests followed by non-shardable tests
+	./test/zdtm.py run -a -p 2 --keep-going "${ZDTM_OPTS[@]}"
+	if criu/criu check --feature move_mount_set_group; then
+		./test/zdtm.py run -a -p 2 --mntns-compat-mode --keep-going "${ZDTM_OPTS[@]}"
 	fi
-	# Run it as non-root in a user namespace. Since CAP_CHECKPOINT_RESTORE behaves differently in non-user namespaces (e.g. no access to map_files) this tests that we can dump and restore
-	# under those conditions. Note that the "... && true" part is necessary; we need at least one statement after the tests so that bash can reap zombies in the user namespace,
-	# otherwise it will exec the last statement and get replaced and nobody will be left to reap our zombies.
-	sudo --user=#65534 --group=#65534 unshare -Ucfpm --mount-proc -- bash -c "./test/zdtm.py run -t zdtm/static/maps00 -f h --rootless && true"
-	if [ -d /sys/fs/selinux ] && command -v getenforce &>/dev/null; then
-		if [ "$selinuxmode" != "Disabled" ]; then
-			setenforce "$selinuxmode"
-		fi
-	fi
-	setcap -r criu/criu
+	./test/zdtm.py run -a -p 2 --keep-going --criu-config "${ZDTM_OPTS[@]}"
+	run_non_shardable_tests
+elif [ "$ZDTM_SHARD_INDEX" -eq "$ZDTM_SHARD_COUNT" ]; then
+	# This is the extra non-shardable shard (index == count, e.g. shard 4
+	# when count is 4). Only run non-shardable tests, skip zdtm shards.
+	run_non_shardable_tests
 else
-	echo "Skipping unprivileged mode tests"
+	# Shards 0..count-1: run only the sharded zdtm tests
+	./test/zdtm.py run -a -p 2 --keep-going "${SHARD_OPTS[@]}" "${ZDTM_OPTS[@]}"
+	if criu/criu check --feature move_mount_set_group; then
+		./test/zdtm.py run -a -p 2 --mntns-compat-mode --keep-going "${SHARD_OPTS[@]}" "${ZDTM_OPTS[@]}"
+	fi
+	./test/zdtm.py run -a -p 2 --keep-going --criu-config "${SHARD_OPTS[@]}" "${ZDTM_OPTS[@]}"
 fi
-
-# more crit testing
-make -C test/others/crit run
-
-# coredump testing
-make -C test/others/criu-coredump run
-
-# libcriu testing
-make -C test/others/libcriu run
-
-# external namespace testing
-make -C test/others/ns_ext run
-
-# config file parser and parameter testing
-make -C test/others/config-file run
-
-# action script testing
-make -C test/others/action-script run
-
-# Skip all further tests when running with GCOV=1
-# The one test which currently cannot handle GCOV testing is compel/test
-# Probably because the GCOV Makefile infrastructure does not exist in compel
-[ -n "$GCOV" ] && exit 0
-
-# compel testing
-make -C compel/test
-
-# amdgpu and cuda plugin testing
-make amdgpu_plugin
-make -C plugins/amdgpu/ test_topology_remap
-./plugins/amdgpu/test_topology_remap
-
-./test/zdtm.py run -t zdtm/static/maps00 -t zdtm/static/maps02 --criu-plugin cuda
-./test/zdtm.py run -t zdtm/static/maps00 -t zdtm/static/maps02 --criu-plugin amdgpu
-./test/zdtm.py run -t zdtm/static/maps00 -t zdtm/static/maps02 --criu-plugin amdgpu cuda
-./test/zdtm.py run -t zdtm/static/busyloop00 --criu-plugin inventory_test_enabled inventory_test_disabled
-
-./test/zdtm.py run -t zdtm/static/sigpending -t zdtm/static/pthread00 --mocked-cuda-checkpoint --fault 138

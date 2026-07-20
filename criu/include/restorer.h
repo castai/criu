@@ -114,6 +114,8 @@ struct thread_restore_args {
 	unsigned int siginfo_n;
 
 	int pdeath_sig;
+	bool has_timerslack_ns;
+	unsigned long timerslack_ns;
 
 	struct thread_creds_args *creds_args;
 
@@ -133,9 +135,39 @@ struct thread_restore_args {
 
 typedef long (*thread_restore_fcall_t)(struct thread_restore_args *args);
 
+/*
+ * Internal representation of a pages-image range queued for PIE restore.
+ *
+ * PACKED_RAW and ZERO originate from entries which still carry compression
+ * metadata.  They are separate from UNCOMPRESSED so that the restorer can
+ * bypass LZ4 without treating their packed image offsets as ordinary pages
+ * image offsets (in particular, --auto-dedup must not punch PACKED_RAW).
+ */
+enum restore_vma_io_storage {
+	VMA_IO_UNCOMPRESSED,
+	VMA_IO_ENCODED,
+	VMA_IO_PACKED_RAW,
+	VMA_IO_ZERO,
+};
+
 struct restore_vma_io {
 	int nr_iovs;
 	loff_t off;
+	enum restore_vma_io_storage storage;
+	uint32_t *compressed_size;
+	uint64_t total_compressed_size;
+	int n_compressed_size;
+	/*
+	 * Region compression metadata. region_pages == 0 means per-page
+	 * compression and block_pages is unused. When region_pages > 0,
+	 * compressed_size[] holds n_compressed_size (== n_blocks) entries
+	 * and block_pages is a parallel uint16_t-per-block array giving
+	 * each block's page count (the last block of any pagemap entry
+	 * spanning this iov may be shorter than region_pages).
+	 */
+	uint32_t region_pages;
+	int n_pages;
+	uint16_t *block_pages;
 	struct iovec iovs[0];
 };
 
@@ -174,6 +206,7 @@ struct task_restore_args {
 	int vma_ios_fd;
 	struct restore_vma_io *vma_ios;
 	unsigned int vma_ios_n;
+	bool vma_ios_use_direct;	/* set from probe_pages_o_direct() in mem.c */
 
 	struct restore_posix_timer *posix_timers;
 	unsigned int posix_timers_n;
@@ -239,7 +272,6 @@ struct task_restore_args {
 	unsigned long vdso_rt_size;
 	struct vdso_maps vdso_maps_rt;	 /* runtime vdso symbols */
 	unsigned long vdso_rt_parked_at; /* safe place to keep vdso */
-	void **breakpoint;
 
 	enum faults fault_strategy;
 #ifdef ARCH_HAS_LONG_PAGES
@@ -314,6 +346,7 @@ enum {
 	 * purely to make sure all tasks be in sync.
 	 */
 	CR_STATE_FORKING,
+	CR_STATE_PRE_RESTORER,
 	/*
 	 * Main restore stage. By the end of it all tasks are
 	 * almost ready and what's left is:

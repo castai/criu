@@ -24,7 +24,6 @@ def recode_and_check(imgf, o_img, pretty):
     try:
         r_img = pycriu.images.dumps(pb)
     except Exception as e:
-        r_img = pycriu.images.dumps(pb)
         print("%s %s encode fails: %s" % (imgf, pretty and 'pretty ' or '', e))
         return False
 
@@ -62,7 +61,8 @@ for imgf in find.stdout.readlines():
     if imgf_b.startswith(b'rule-'):
         continue
 
-    o_img = open(imgf.decode(), "rb").read()
+    with open(imgf.decode(), "rb") as fh:
+        o_img = fh.read()
     if not recode_and_check(imgf, o_img, False):
         test_pass = False
     if not recode_and_check(imgf, o_img, True):

@@ -38,7 +38,7 @@ static int do_infection(int pid)
 		err_and_ret("Can't stop task");
 
 	printf("Preparing parasite ctl\n");
-	ctl = compel_prepare(pid);
+	ctl = compel_prepare(pid, false);
 	if (!ctl)
 		err_and_ret("Can't prepare for infection");
 
@@ -112,6 +112,9 @@ int main(int argc, char **argv)
 		return -1;
 	}
 
+#ifdef GCS_TEST_ENABLE
+	setenv("GLIBC_TUNABLES", "glibc.cpu.aarch64_gcs=1:glibc.cpu.aarch64_gcs_policy=2", 1);
+#endif
 	pid = vfork();
 	if (pid == 0) {
 		close(p_in[1]);

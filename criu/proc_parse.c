@@ -123,10 +123,11 @@ bool handle_vma_plugin(int *fd, struct stat *stat)
 }
 
 static void __parse_vmflags(char *buf, u32 *flags, u64 *madv, int *io_pf,
-			    int *shstk)
+			    int *shstk, bool *no_ac)
 {
 	char *tok;
 
+	*no_ac = true;
 	if (!buf[0])
 		return;
 
@@ -174,6 +175,9 @@ static void __parse_vmflags(char *buf, u32 *flags, u64 *madv, int *io_pf,
 		if (_vmflag_match(tok, "ss"))
 			*shstk = 1;
 
+		if (_vmflag_match(tok, "ac"))
+			*no_ac = false;
+
 		/*
 		 * Anything else is just ignored.
 		 */
@@ -185,20 +189,25 @@ static void __parse_vmflags(char *buf, u32 *flags, u64 *madv, int *io_pf,
 void parse_vmflags(char *buf, u32 *flags, u64 *madv, int *io_pf)
 {
 	int shstk = 0;
+	bool no_ac = false;
 
-	__parse_vmflags(buf, flags, madv, io_pf, &shstk);
+	__parse_vmflags(buf, flags, madv, io_pf, &shstk, &no_ac);
 }
 
 static void parse_vma_vmflags(char *buf, struct vma_area *vma_area)
 {
 	int io_pf = 0;
 	int shstk = 0;
+	bool no_ac = false;
 
 	__parse_vmflags(buf, &vma_area->e->flags, &vma_area->e->madv, &io_pf,
-			&shstk);
+			&shstk, &no_ac);
 
 	if (shstk)
 		vma_area->e->status |= VMA_AREA_SHSTK;
+
+	if (no_ac)
+		vma_area->e->status |= VMA_AREA_NOT_ACCOUNTABLE;
 
 	/*
 	 * vmsplice doesn't work for VM_IO and VM_PFNMAP mappings, the
@@ -989,16 +998,21 @@ err:
 
 int prepare_loginuid(unsigned int value)
 {
-	int fd, ret = 0;
-	char buf[11]; /* 4294967295 is maximum for u32 */
+	int fd, len, ret = 0;
+	char buf[11];  /* 4294967295 is maximum for u32 */
 
 	fd = open_proc_rw(PROC_SELF, "loginuid");
 	if (fd < 0)
 		return -1;
 
-	snprintf(buf, 11, "%u", value);
+	len = snprintf(buf, sizeof(buf), "%u", value);
+	if (len >= sizeof(buf)) {
+		pr_err("loginuid value %u is too long\n", value);
+		close(fd);
+		return -1;
+	}
 
-	if (write(fd, buf, 11) < 0) {
+	if (write(fd, buf, len) < 0) {
 		pr_warn("Write %s to /proc/self/loginuid failed: %s\n", buf, strerror(errno));
 		ret = -1;
 	}
@@ -1262,13 +1276,13 @@ static bool sb_opt_cb(char *opt, char *unknown, size_t *uoff)
 {
 	unsigned int id;
 
-	if (sscanf(opt, "gid=%d", &id) == 1) {
-		*uoff += sprintf(unknown + *uoff, "gid=%d", userns_gid(id));
+	if (sscanf(opt, "gid=%u", &id) == 1) {
+		*uoff += sprintf(unknown + *uoff, "gid=%u", userns_gid(id));
 		unknown[*uoff] = ',';
 		(*uoff)++;
 		return true;
-	} else if (sscanf(opt, "uid=%d", &id) == 1) {
-		*uoff += sprintf(unknown + *uoff, "uid=%d", userns_uid(id));
+	} else if (sscanf(opt, "uid=%u", &id) == 1) {
+		*uoff += sprintf(unknown + *uoff, "uid=%u", userns_uid(id));
 		unknown[*uoff] = ',';
 		(*uoff)++;
 		return true;
@@ -1542,7 +1556,13 @@ static int parse_mountinfo_ent(char *str, struct mount_info *new, char **fsname)
 
 	new->fstype = find_fstype_by_name(*fsname);
 
-	new->options = xmalloc(strlen(opt) + 1);
+	/*
+	 * sb_opt_cb() may translate uid=/gid= values via userns mappings,
+	 * producing longer decimal strings than the original. Let's
+	 * reserve extra space for the worst-case expansion of both a uid=
+	 * and a gid= value to 10-digit numbers.
+	 */
+	new->options = xmalloc(strlen(opt) + 1 + 2 * (sizeof("4294967295") - 1));
 	if (!new->options)
 		goto err;
 
@@ -1738,8 +1758,7 @@ struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid, bool for_dump)
 			}
 		}
 	end:
-		if (fsname)
-			free(fsname);
+		free(fsname);
 
 		if (new)
 			mntinfo_add_list_before(&list, new);
@@ -2038,7 +2057,7 @@ static int parse_fdinfo_pid_s(int pid, int fd, int type, void *arg)
 			eventpoll_tfd_entry__init(e);
 
 			ret = sscanf(str,
-				     "tfd: %d events: %x data: %llx"
+				     "tfd: %" SCNu32 " events: %x data: %llx"
 				     " pos:%lli ino:%lx sdev:%x",
 				     &e->tfd, &e->events, (long long *)&e->data, (long long *)&e->pos,
 				     (long *)&e->inode, &e->dev);
@@ -2565,6 +2584,12 @@ int parse_threads(int pid, struct pid **_t, int *_n)
 			}
 			t = tmp;
 			t[nr - 1].ns[0].virt = -1;
+		} else {
+			if (nr > *_n) {
+				pr_err("Too many threads for %d (%d > %d)\n", pid, nr, *_n);
+				closedir(dir);
+				return -1;
+			}
 		}
 		t[nr - 1].real = atoi(de->d_name);
 		t[nr - 1].state = TASK_THREAD;

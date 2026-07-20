@@ -4,6 +4,11 @@ LDLIBS	+= $(LIB)
 CPPFLAGS += -I$(LIBDIR)
 
 TST_NOFILE	:=				\
+		pages_content01			\
+		pages_content03			\
+		compress_pages01			\
+		compress_pages_region01			\
+		compress_pages_region03			\
 		busyloop00			\
 		sleeping00			\
 		pid00				\
@@ -26,6 +31,7 @@ TST_NOFILE	:=				\
 		timers				\
 		timers01			\
 		timerfd				\
+		timerslack_ns			\
 		unbound_sock			\
 		sched_prio00			\
 		sched_policy00			\
@@ -67,12 +73,14 @@ TST_NOFILE	:=				\
 		pipe00				\
 		pipe01				\
 		pipe02				\
+		pipe_owner			\
 		pthread00			\
 		pthread00-pac			\
 		pthread01			\
 		pthread02			\
 		pthread_timers			\
 		pthread_timers_h		\
+		leader_posix_timer		\
 		rseq00				\
 		membarrier			\
 		vdso00				\
@@ -137,6 +145,7 @@ TST_NOFILE	:=				\
 		socket-tcp-skip-in-flight	\
 		socket-tcp-keepalive		\
 		socket-linger			\
+		socket-timeo			\
 		sock_opts00			\
 		sock_opts01			\
 		sock_opts02			\
@@ -194,6 +203,7 @@ TST_NOFILE	:=				\
 		sk-unix-ext-stream		\
 		unhashed_proc			\
 		cow00				\
+		cow02				\
 		child_opened_proc		\
 		proc_task_comm			\
 		posix_timers			\
@@ -219,6 +229,7 @@ TST_NOFILE	:=				\
 		dumpable02			\
 		remap_dead_pid			\
 		remap_dead_pid_root			\
+		reservation_mmaps		\
 		scm00				\
 		scm01				\
 		scm02				\
@@ -227,7 +238,10 @@ TST_NOFILE	:=				\
 		scm04				\
 		scm05				\
 		scm06				\
+		scm07				\
+		scm08				\
 		scm09				\
+		scm10				\
 		aio00				\
 		aio01				\
 		fd				\
@@ -284,6 +298,7 @@ TST_NOFILE	:=				\
 		memfd03				\
 		memfd04				\
 		memfd05				\
+		memfd06				\
 		shmemfd				\
 		shmemfd-priv			\
 		time				\
@@ -321,6 +336,12 @@ ifeq ($(ARCH),s390)
 endif
 
 TST_FILE	=				\
+			pages_content00		\
+			pages_content02		\
+			compress_pages00		\
+			compress_pages02		\
+			compress_pages_region00		\
+			compress_pages_region02		\
 		maps06				\
 		write_read00			\
 		write_read01			\
@@ -333,6 +354,7 @@ TST_FILE	=				\
 		deleted_unix_sock		\
 		sk-unix-rel			\
 		sk-unix-rel-seqpacket		\
+		sk-unix-ucred			\
 		deleted_dev			\
 		unlink_fstat00			\
 		unlink_fstat01			\
@@ -373,6 +395,7 @@ TST_FILE	=				\
 		file_lease02			\
 		file_lease03			\
 		file_lease04			\
+		file_lease05			\
 		file_locks00			\
 		file_locks00_fail		\
 		file_locks01			\
@@ -473,6 +496,7 @@ TST_DIR		=				\
 		sk-unix-mntns			\
 		sk-unix01			\
 		sk-unix01-seqpacket		\
+		sk-unix-dgram-cred          \
 		sk-unix-dgram-ghost		\
 		unsupported_children_collision  \
 		shared_slave_mount_children	\
@@ -484,6 +508,7 @@ TST_DIR		=				\
 		symlink				\
 		symlink01			\
 		unbindable			\
+		inotify_overlayfs		\
 
 TST_DIR_FILE	=				\
 		chroot				\
@@ -529,30 +554,30 @@ install: all
 .PHONY: all install
 
 $(TST_NOFILE:%=%.pid):	%.pid:	%
-	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out
 
 $(TST_FILE:%=%.pid):	%.pid:	%
-	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --filename=$<.test
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --filename=$<.test
 
 $(TST_DIR:%=%.pid):	%.pid:	%
-	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --dirname=$<.test
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --dirname=$<.test
 
 $(TST_DIR_FILE:%=%.pid):	%.pid:	%
-	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --dirname=$<.dir.test --filename=$<.test
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --dirname=$<.dir.test --filename=$<.test
 
 cmdlinenv00.pid: cmdlinenv00
-	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --arg1=arg1 --arg2=arg2 --arg3=arg3
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --arg1=arg1 --arg2=arg2 --arg3=arg3
 
 shm-unaligned.pid: shm-unaligned
-	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --shmem_size=5000
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --shmem_size=5000
 
 shm-hugetlb.pid: shm-hugetlb
-	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --shmem_size=4194304
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --shmem_size=4194304
 
 env00.pid:	env00
-	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --envname=ENV_00_TEST
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --envname=ENV_00_TEST
 umask00.pid:	umask00
-	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --mask=0345
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --mask=0345
 
 fifo-rowo-pair.pid: fifo-rowo-pair
 	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --name_master=$<.master.test --name_slave=$<.slave.test
@@ -622,11 +647,13 @@ pthread01:		LDLIBS += -pthread
 pthread02:		LDLIBS += -pthread
 pthread_timers:		LDLIBS += -lrt -pthread
 pthread_timers_h:	LDLIBS += -lrt -pthread
+leader_posix_timer:	LDLIBS += -lrt -pthread
 different_creds:	LDLIBS += -pthread
 sigpending:		LDLIBS += -pthread
 sigaltstack:		LDLIBS += -pthread
 seccomp_filter_tsync:	LDLIBS += -pthread
 seccomp_filter_threads:	LDLIBS += -pthread
+timerslack_ns:		LDLIBS += -pthread
 shm:			CFLAGS += -DNEW_IPC_NS
 msgque:			CFLAGS += -DNEW_IPC_NS
 sem:			CFLAGS += -DNEW_IPC_NS
@@ -660,13 +687,16 @@ vdso01:			LDLIBS += -lrt
 scm01:			CFLAGS += -DKEEP_SENT_FD
 scm02:			CFLAGS += -DSEND_BOTH
 scm04:			CFLAGS += -DSEPARATE
+scm08:			CFLAGS += -DSEND_ANOTHER_FD
 scm09:			CFLAGS += -DCLOSE_SENDER_FD
+scm10:			CFLAGS += -DCLOSE_SENDER_FD
 mntns_link_remap:	CFLAGS += -DZDTM_LINK_REMAP
 mntns_shared_bind02:	CFLAGS += -DSHARED_BIND02
 mntns_root_bind02:	CFLAGS += -DROOT_BIND02
 maps02: get_smaps_bits.o
 mlock_setuid: get_smaps_bits.o
 thp_disable: get_smaps_bits.o
+reservation_mmaps: get_smaps_bits.o
 inotify01:		CFLAGS += -DINOTIFY01
 unlink_fstat01+:	CFLAGS += -DUNLINK_OVER
 unlink_fstat04:		CFLAGS += -DUNLINK_FSTAT04
@@ -705,6 +735,7 @@ socket-tcp4v6-last-ack:	CFLAGS += -D ZDTM_TCP_LAST_ACK -D ZDTM_IPV4V6
 socket-tcp4v6-closing:	CFLAGS += -D ZDTM_IPV4V6
 memfd02-hugetlb:	CFLAGS += -D ZDTM_HUGETLB
 memfd05:		CFLAGS += -D ZDTM_MEMFD05
+memfd06:		LDLIBS += -pthread
 
 sockets00-seqpacket:	CFLAGS += -D ZDTM_UNIX_SEQPACKET
 sockets01-seqpacket:	CFLAGS += -D ZDTM_UNIX_SEQPACKET

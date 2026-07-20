@@ -156,6 +156,18 @@ int main(void)
 }
 endef
 
+define FEATURE_TEST_DRM_COLOR_CTM_3X4
+
+#include <drm_mode.h>
+
+int main(void)
+{
+	struct drm_color_ctm_3x4 ctm = {};
+
+	return (int)ctm.matrix[0];
+}
+endef
+
 define FEATURE_TEST_NO_LIBC_RSEQ_DEFS
 
 #ifdef __has_include
@@ -165,8 +177,7 @@ define FEATURE_TEST_NO_LIBC_RSEQ_DEFS
 #endif
 
 enum rseq_cpu_id_state {
-	RSEQ_CPU_ID_UNINITIALIZED = -1,
-	RSEQ_CPU_ID_REGISTRATION_FAILED = -2,
+	RSEQ_CPU_CRIU_TEST = -1,
 };
 
 int main(void)

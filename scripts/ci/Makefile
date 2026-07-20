@@ -22,7 +22,7 @@ export UNAME
 CONTAINER_RUNTIME := docker
 export CONTAINER_RUNTIME
 
-alpine: ZDTM_OPTS=-x zdtm/static/binfmt_misc -x zdtm/static/sched_policy00
+alpine: ZDTM_OPTS=-x zdtm/static/sched_policy00
 
 ifeq ($(GITHUB_ACTIONS),true)
 	# GitHub Actions does not give us a real TTY and errors out with
@@ -45,14 +45,25 @@ endif
 ifeq ($(CONTAINER_RUNTIME),podman)
 	# Podman limits the number of processes in a container using cgroups.
 	# Disable it as it breaks the thread-bomb test
-	CONTAINER_OPTS += --pids-limit=0
+	CONTAINER_OPTS += --pids-limit=-1
+	CONTAINER_OPTS += --ulimit nproc=-1:-1
 endif
 
 export ZDTM_OPTS
+export ZDTM_SHARD_INDEX
+export ZDTM_SHARD_COUNT
 
 $(TARGETS):
 	$(MAKE) -C ../build $@$(target-suffix)
-	$(CONTAINER_RUNTIME) run --env-file docker.env -v `pwd`/../../:/criu $(if $(ZDTM_OPTS),-e ZDTM_OPTS) $(CONTAINER_OPTS) criu-$@ scripts/ci/run-ci-tests.sh
+	$(CONTAINER_RUNTIME) run \
+		--env-file docker.env \
+		-v `pwd`/../../:/criu \
+		$(if $(ZDTM_OPTS),-e ZDTM_OPTS) \
+		$(if $(ZDTM_SHARD_INDEX),-e ZDTM_SHARD_INDEX) \
+		$(if $(ZDTM_SHARD_COUNT),-e ZDTM_SHARD_COUNT) \
+		$(if $(CLANG),-e CC=clang -e HOSTCC=clang) \
+		$(CONTAINER_OPTS) \
+		criu-$@ scripts/ci/run-ci-tests.sh
 
 fedora-asan:
 	$(MAKE) -C ../build $@$(target-suffix)
@@ -67,21 +78,8 @@ podman-test:
 java-test:
 	./java-test.sh
 
-setup-vagrant:
-	./vagrant.sh setup
-
-vagrant-fedora-no-vdso: setup-vagrant
-	./vagrant.sh fedora-no-vdso
-
-vagrant-fedora-rawhide: setup-vagrant
-	./vagrant.sh fedora-rawhide
-
-vagrant-fedora-non-root: setup-vagrant
-	./vagrant.sh fedora-non-root
-
-.PHONY: setup-vagrant vagrant-fedora-no-vdso vagrant-fedora-rawhide vagrant-fedora-non-root
-
 check-commit:
+	(cd ../.. && git clean -dfx)
 	($(MAKE) -j $$(nproc) -C ../.. && \
 		echo "Commit $$(git rev-parse --short HEAD) built successfully") || \
 		(echo "Build failed for $$(git rev-list -n 1 --pretty HEAD)" && \
