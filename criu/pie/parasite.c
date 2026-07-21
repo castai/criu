@@ -71,9 +71,10 @@ static int mprotect_vmas(struct parasite_dump_pages_args *args)
 static int dump_pages(struct parasite_dump_pages_args *args)
 {
 	int p, ret, tsock;
-	struct iovec *iovs;
-	int off, nr_segs;
+	struct iovec *iovs, *cur_iov;
+	int off, nr_segs, cur_nr;
 	unsigned long spliced_bytes = 0;
+	unsigned long total_bytes;
 
 	tsock = parasite_get_rpc_sock();
 	p = recv_fd(tsock);
@@ -85,21 +86,48 @@ static int dump_pages(struct parasite_dump_pages_args *args)
 	nr_segs = args->nr_segs;
 	if (nr_segs > UIO_MAXIOV)
 		nr_segs = UIO_MAXIOV;
-	while (1) {
+	total_bytes = (unsigned long)args->nr_pages * PAGE_SIZE;
+
+	while (spliced_bytes < total_bytes) {
 		ret = sys_vmsplice(p, &iovs[args->off + off], nr_segs, SPLICE_F_GIFT | SPLICE_F_NONBLOCK);
-		if (ret < 0) {
+		if (ret <= 0) {
 			sys_close(p);
 			pr_err("Can't splice pages to pipe (%d/%d/%d)\n", ret, nr_segs, args->off + off);
 			return -1;
 		}
 		spliced_bytes += ret;
-		off += nr_segs;
-		if (off == args->nr_segs)
-			break;
-		if (off + nr_segs > args->nr_segs)
+
+		/*
+		 * Advance the iovec array by the number of bytes actually
+		 * transferred.  Fully consumed iovecs are dropped from the
+		 * current batch; a partially consumed iovec is adjusted in
+		 * place and stays at the head of the next submission.
+		 */
+		cur_iov = &iovs[args->off + off];
+		cur_nr = nr_segs;
+		while (cur_nr > 0 && ret >= (int)cur_iov->iov_len) {
+			ret -= cur_iov->iov_len;
+			cur_iov++;
+			cur_nr--;
+			off++;
+			nr_segs--;
+		}
+		if (cur_nr > 0 && ret > 0) {
+			cur_iov->iov_base = (char *)cur_iov->iov_base + ret;
+			cur_iov->iov_len -= ret;
+		}
+
+		/*
+		 * If the current batch is exhausted but more iovecs remain,
+		 * start a new UIO_MAXIOV batch.
+		 */
+		if (nr_segs == 0 && off < args->nr_segs) {
 			nr_segs = args->nr_segs - off;
+			if (nr_segs > UIO_MAXIOV)
+				nr_segs = UIO_MAXIOV;
+		}
 	}
-	if (spliced_bytes != args->nr_pages * PAGE_SIZE) {
+	if (spliced_bytes != total_bytes) {
 		sys_close(p);
 		pr_err("Can't splice all pages to pipe (%ld/%ld)\n", spliced_bytes, args->nr_pages);
 		return -1;
