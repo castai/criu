@@ -1127,6 +1127,37 @@ int set_dump_pidns_level(pid_t root)
 }
 
 /*
+ * The pid of a task in its own (the innermost) pid namespace: the one
+ * its own kin, e.g. the task which has forked it, sees it as.
+ */
+pid_t pid_at_own_level(pid_t pid, pid_t fallback)
+{
+	char path[64], buf[1024];
+	FILE *f;
+	pid_t ret = fallback;
+
+	snprintf(path, sizeof(path), "/proc/%d/status", pid);
+	f = fopen(path, "r");
+	if (!f)
+		return fallback;
+
+	while (fgets(buf, sizeof(buf), f)) {
+		char *p, *last = NULL;
+
+		if (strncmp(buf, "NSpid:", 6))
+			continue;
+		for (p = buf; (p = strchr(p, '\t')) != NULL; p++)
+			last = p;
+		if (last)
+			ret = atoi(last);
+		break;
+	}
+	fclose(f);
+
+	return ret;
+}
+
+/*
  * The pid of a task at the level of the pid namespace of the root task
  * of the dump. With a fallback for when the NSpid chain of the task is
  * shorter than that level.

@@ -6,6 +6,7 @@
 #include "types.h"
 #include "cr_options.h"
 #include "pstree.h"
+#include "proc_parse.h"
 #include "rst-malloc.h"
 #include "common/lock.h"
 #include "namespaces.h"
@@ -225,6 +226,7 @@ struct pstree_item *__alloc_pstree_item(bool rst)
 
 	item->pid->ns[0].virt = -1;
 	item->pid->real = -1;
+	item->own_ns_pid = 0;
 	item->pid->state = TASK_UNDEF;
 	item->pid->stop_signo = -1;
 	item->born_sid = -1;
@@ -321,6 +323,22 @@ int dump_pstree(struct pstree_item *root_item)
 		e.pgid = item->pgid;
 		e.sid = item->sid;
 		e.n_threads = item->nr_threads;
+
+		/*
+		 * A task living in a pid namespace nested in the one of
+		 * the root task of the dump is known by its pid in it to
+		 * its own kin: the one which has forked it, the ones it
+		 * lives with. Record it, so the restore forks it with the
+		 * pid at the level of its parent as well.
+		 */
+		{
+			pid_t own = pid_at_own_level(item->pid->real, vpid(item));
+
+			if (own != vpid(item)) {
+				e.own_pid = own;
+				e.has_own_pid = true;
+			}
+		}
 
 		e.threads = xmalloc(sizeof(e.threads[0]) * e.n_threads);
 		if (!e.threads)
@@ -582,6 +600,7 @@ static int read_one_pstree_item(struct cr_img *img, pid_t *pid_max)
 	pi->pid->ns[0].virt = e->pid;
 	if (e->pid > *pid_max)
 		*pid_max = e->pid;
+	pi->own_ns_pid = e->has_own_pid ? e->own_pid : e->pid;
 	pi->pgid = e->pgid;
 	if (e->pgid > *pid_max)
 		*pid_max = e->pgid;
@@ -1062,6 +1081,15 @@ int prepare_pstree(void)
 	}
 
 	pid = getpid();
+
+	/*
+	 * Re-parent the tasks which have entered the namespaces of an
+	 * inner container (e.g. the docker exec-ed ones) under the init
+	 * one of it, before the clone flags are derived from the parent
+	 * relationships, so they are forked from it and inherit the
+	 * namespaces instead of creating their own copies of them.
+	 */
+	nested_ns_fix_exec_pstree();
 
 	if (!ret)
 		/*

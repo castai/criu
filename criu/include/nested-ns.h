@@ -116,6 +116,19 @@ int nested_ns_fix_task_creds(struct pstree_item *item, struct CoreEntry *core);
 void nested_ns_fix_exec_userns(void);
 
 /*
+ * Update the start time of the init processes in the state files of the
+ * inner runtimes, which have recorded the one of the dump time.
+ */
+void nested_ns_patch_runc_states(void);
+
+/*
+ * Re-parent the tasks which have entered the namespaces of an inner
+ * container under the init one of it, so they inherit the namespaces
+ * with the fork instead of creating their own copies.
+ */
+void nested_ns_fix_exec_pstree(void);
+
+/*
  * Child task: wake up the parent, as we are dying before the maps of
  * our user namespace are written.
  */

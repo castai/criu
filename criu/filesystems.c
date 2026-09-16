@@ -417,8 +417,8 @@ static int tmpfs_dump(struct mount_info *pm)
 		userns_pid = root_item->pid->real;
 
 	ret = cr_system_userns(fd, img_raw_fd(img), -1, "tar",
-			       (char *[]){ "tar", "--create", "--gzip", "--no-unquote", "--no-wildcards",
-					   "--one-file-system", "--check-links", "--preserve-permissions", "--sparse",
+			       (char *[]){ "tar", "--create", "--no-unquote", "--no-wildcards",
+					   "--one-file-system", "--check-links", "--preserve-permissions",
 					   "--numeric-owner", "--directory", "/proc/self/fd/0", ".", NULL },
 			       0, userns_pid);
 
@@ -451,7 +451,7 @@ static int tmpfs_restore(struct mount_info *pm)
 	}
 
 	ret = cr_system(img_raw_fd(img), -1, -1, "tar",
-			(char *[]){ "tar", "--extract", "--gzip", "--no-unquote", "--no-wildcards", "--directory",
+			(char *[]){ "tar", "--extract", "--no-unquote", "--no-wildcards", "--directory",
 				    service_mountpoint(pm), NULL },
 			0);
 	close_image(img);
