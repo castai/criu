@@ -19,6 +19,7 @@ extern int netns_keep_nsfd(void);
 
 struct pstree_item;
 extern int restore_task_net_ns(struct pstree_item *current);
+extern int nested_ns_child_netns(struct ns_id *nsid);
 
 struct veth_pair {
 	struct list_head node;

@@ -40,6 +40,7 @@ extern bool sfds_protected;
 extern const char *sfd_type_name(enum sfd_type type);
 extern int init_service_fd(void);
 extern int get_service_fd(enum sfd_type type);
+extern bool sfds_protected_get(void);
 extern bool is_any_service_fd(int fd);
 extern bool is_service_fd(int fd, enum sfd_type type);
 extern int service_fd_min_fd(struct pstree_item *item);

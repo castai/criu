@@ -21,6 +21,7 @@
 #include "pstree.h"
 #include "image.h"
 #include "namespaces.h"
+#include "nested-ns.h"
 #include "protobuf.h"
 #include "fs-magic.h"
 #include "path.h"
@@ -1900,6 +1901,14 @@ struct mount_info *collect_mntinfo(struct ns_id *ns, bool for_dump)
 	if (ns->mnt.mntinfo_tree == NULL)
 		goto err;
 
+	/*
+	 * The fdstore ids of the mount namespace and of its root are
+	 * only assigned when they are pinned (at dump in none, at restore
+	 * in the first task of it): they start as unset.
+	 */
+	ns->mnt.nsfd_id = -1;
+	ns->mnt.root_fd_id = -1;
+
 	ns->mnt.mntinfo_list = pm;
 	return pm;
 err:
@@ -1919,9 +1928,10 @@ static int dump_mnt_ns(struct ns_id *ns, struct mount_info *pms)
 	if (!img)
 		goto err;
 
-	for (pm = pms; pm && pm->nsid == ns; pm = pm->next)
+	for (pm = pms; pm && pm->nsid == ns; pm = pm->next) {
 		if (dump_one_mountpoint(pm, img))
 			goto err_i;
+	}
 
 	ret = 0;
 err_i:
@@ -2252,8 +2262,17 @@ static int userns_mount(char *src, void *args, int fd, pid_t pid)
 
 	snprintf(target, sizeof(target), "/proc/self/fd/%d", fd);
 
-	if (pid != getpid() && switch_ns(pid, &mnt_ns_desc, &rst))
-		return -1;
+	if (pid != getpid() && switch_ns(pid, &mnt_ns_desc, &rst)) {
+		/*
+		 * The mount namespace of the task is owned by a user
+		 * namespace which the calling one is not an ancestor of
+		 * (e.g. a task forked into its own copy of it): the mounts
+		 * of the namespace are set up by the task itself, so the
+		 * one asked for here is skipped.
+		 */
+		pr_warn("Can't switch to the mount namespace of %d: the mount is skipped\n", pid);
+		return 0;
+	}
 
 	err = mount(src, target, NULL, flags, NULL);
 	if (err)
@@ -3394,6 +3413,14 @@ int read_mnt_ns_img(void)
 		if (collect_mnt_from_image(&head, &tail, nsid))
 			return -1;
 
+		/*
+		 * The fdstore ids of the mount namespace and of its root are
+		 * assigned when the first task of it forks: they are not pinned
+		 * here, so they start as unset.
+		 */
+		nsid->mnt.nsfd_id = -1;
+		nsid->mnt.root_fd_id = -1;
+
 		nsid->mnt.mntinfo_tree = mnt_build_tree(head);
 		if (!nsid->mnt.mntinfo_tree)
 			return -1;
@@ -3467,6 +3494,9 @@ static int do_restore_task_mnt_ns(struct ns_id *nsid)
 int restore_task_mnt_ns(struct pstree_item *current)
 {
 	if ((root_ns_mask & CLONE_NEWNS) == 0)
+		return 0;
+
+	if (nested_ns_skip_mntns(current))
 		return 0;
 
 	if (current->ids && current->ids->has_mnt_ns_id) {
@@ -3753,6 +3783,12 @@ int prepare_mnt_ns(void)
 
 		if (nsid->nd != &mnt_ns_desc)
 			continue;
+
+		if (nested_ns_own_mntns(nsid)) {
+			/* created at fork by the task in the nested user namespace */
+			continue;
+		}
+
 		/* Create the new mount namespace */
 		if (unshare(CLONE_NEWNS)) {
 			pr_perror("Unable to create a new mntns");
@@ -3821,7 +3857,7 @@ err:
 }
 
 static int mntns_root_pid = -1;
-static int mntns_set_root_fd(pid_t pid, int fd)
+int mntns_set_root_fd(pid_t pid, int fd)
 {
 	int ret;
 
@@ -3914,7 +3950,7 @@ int mntns_get_root_fd(struct ns_id *mntns)
 	 * root from the root task.
 	 */
 
-	if (!mntns->ns_populated) {
+	if (!mntns->ns_populated || nested_ns_use_fdstore(mntns)) {
 		int fd;
 
 		fd = fdstore_get(mntns->mnt.root_fd_id);
@@ -3972,6 +4008,18 @@ static int collect_mntns(struct ns_id *ns, void *__arg)
 
 	if (arg->for_dump && ns->type != NS_CRIU)
 		arg->need_to_validate = true;
+
+	if (arg->for_dump && nested_ns_enabled()) {
+		/*
+		 * The sharing of the mounts can span the nested mount
+		 * namespaces of the inner containers of a nested container
+		 * runtime (e.g. docker-in-docker), and it can't be restored.
+		 */
+		struct mount_info *mi;
+
+		for (mi = pms; mi; mi = mi->next)
+			mi->shared_id = mi->master_id = 0;
+	}
 
 	mntinfo_add_list(pms);
 
