@@ -31,9 +31,11 @@
 
 #include "imgset.h"
 #include "namespaces.h"
+#include "nested-ns.h"
 #include "net.h"
 #include "net-clm-conntrack.h"
 #include "libnetlink.h"
+#include "common/asm/atomic.h"
 #include "cr_options.h"
 #include "sk-inet.h"
 #include "tun.h"
@@ -1954,6 +1956,9 @@ static int restore_links(void)
 			if (nsid->nd != &net_ns_desc)
 				continue;
 
+			if (nested_ns_own_netns(nsid))
+				continue;
+
 			if (switch_ns_by_fd(nsid->net.ns_fd, &net_ns_desc, NULL))
 				return -1;
 
@@ -1971,6 +1976,7 @@ static int restore_links(void)
 
 	return 0;
 }
+
 
 static int run_ip_tool(char *arg1, char *arg2, char *arg3, char *arg4, int fdin, int fdout, unsigned flags)
 {
@@ -2921,7 +2927,12 @@ int dump_net_ns(struct ns_id *ns)
 #endif
 		if (!ret)
 			ret = dump_netns_conf(ns, fds);
-	} else if (ns->type != NS_ROOT) {
+	} else if (ns->type != NS_ROOT && !nested_ns_enabled()) {
+		/*
+		 * With the nested user namespaces the non-root network ones
+		 * are created by the tasks entering them on restore, and their
+		 * content is not dumped, like the empty root one.
+		 */
 		pr_err("Unable to dump more than one netns if the --emptyns is set\n");
 		ret = -1;
 	}
@@ -3035,6 +3046,113 @@ static int prepare_net_ns_second_stage(struct ns_id *ns)
 	return ret;
 }
 
+/*
+ * Create the network namespace owned by the nested user namespace
+ * of the calling task and fill it in from its image, called by the
+ * task which has entered the user namespace. The ones created by
+ * the root task are owned by its user namespace, which the tasks
+ * below can not enter.
+ */
+/*
+ * The states of the creation of a nested network namespace, kept in
+ * its shared nsfd_id: not started, being created by one of the tasks
+ * of the tree (the others wait for it), and done (the fdstore id of
+ * the pinned one).
+ */
+#define NETNS_CREATING (-2)
+
+static int nested_ns_enter(struct ns_id *nsid)
+{
+	int fd = fdstore_get(nsid->net.nsfd_id);
+
+	if (fd < 0)
+		return -1;
+	if (setns(fd, CLONE_NEWNET)) {
+		/*
+		 * Entering the namespace needs CAP_SYS_ADMIN in the user
+		 * one owning it: a task which was forked into its own copy
+		 * of the user namespace of the container (e.g. a docker
+		 * exec-ed one) is in a sibling of it, and can not enter.
+		 * It stays in the fresh network namespace of its fork,
+		 * which is enough for the ones not using the network of
+		 * the container (e.g. with the TCP connections closed).
+		 */
+		pr_warn("Can't enter the nested netns: staying in the fork one\n");
+		close(fd);
+		return 0;
+	}
+	close(fd);
+	return 0;
+}
+
+int nested_ns_child_netns(struct ns_id *nsid)
+{
+	int fd;
+
+	while (nsid->net.nsfd_id == NETNS_CREATING)
+		/* The namespace is being created by another task: the
+		 * fdstore id of it appears when it is filled in. */
+		usleep(10000);
+
+	if (nsid->net.nsfd_id >= 0)
+		return nested_ns_enter(nsid);
+
+	/*
+	 * Only one task of the tree creates the namespace and fills it
+	 * in from the image, the same way as the root one does it for
+	 * the regular ones: the others enter the created one. The state
+	 * is claimed with a compare-and-swap, so that the tasks forking
+	 * concurrently see at most one creator.
+	 */
+	if (atomic_cmpxchg((atomic_t *)&nsid->net.nsfd_id, -1, NETNS_CREATING) != -1) {
+		while (nsid->net.nsfd_id == NETNS_CREATING)
+			usleep(10000);
+		if (nsid->net.nsfd_id >= 0)
+			return nested_ns_enter(nsid);
+		pr_err("The nested netns %u was not created\n", nsid->id);
+		return -1;
+	}
+
+	if (unshare(CLONE_NEWNET)) {
+		pr_perror("Can't unshare net namespace");
+		return -1;
+	}
+
+	fd = open_proc(PROC_SELF, "ns/net");
+	if (fd < 0)
+		return -1;
+	nsid->net.ns_fd = fd;
+
+	if (prepare_net_ns_first_stage(nsid))
+		return -1;
+
+	nsid->net.nlsk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+	if (nsid->net.nlsk < 0) {
+		pr_perror("Can't create nlk socket");
+		return -1;
+	}
+
+	{
+		int nrcreated = 0, nrlinks = 0;
+
+		if (__restore_links(nsid, &nrlinks, &nrcreated))
+			return -1;
+
+		/* The links with peers in other namespaces are not supported yet */
+		if (nrcreated != nrlinks) {
+			pr_err("Can't fully restore the links of the nested netns %u\n", nsid->id);
+			return -1;
+		}
+	}
+
+	if (prepare_net_ns_second_stage(nsid))
+		return -1;
+
+	close_safe(&nsid->net.nlsk);
+
+	return 0;
+}
+
 static int open_net_ns(struct ns_id *nsid)
 {
 	int fd;
@@ -3085,6 +3203,9 @@ static int __prepare_net_namespaces(void *unused)
 
 		if (nsid->type == NS_ROOT) {
 			nsid->net.ns_fd = root_ns;
+		} else if (nested_ns_own_netns(nsid)) {
+			/* created by the task in the nested user namespace */
+			continue;
 		} else {
 			if (do_create_net_ns(nsid))
 				goto err;
@@ -3093,6 +3214,9 @@ static int __prepare_net_namespaces(void *unused)
 
 	for (nsid = ns_ids; nsid != NULL; nsid = nsid->next) {
 		if (nsid->nd != &net_ns_desc)
+			continue;
+
+		if (nested_ns_own_netns(nsid))
 			continue;
 
 		if (switch_ns_by_fd(nsid->net.ns_fd, &net_ns_desc, NULL))
@@ -3113,6 +3237,9 @@ static int __prepare_net_namespaces(void *unused)
 
 	for (nsid = ns_ids; nsid != NULL; nsid = nsid->next) {
 		if (nsid->nd != &net_ns_desc)
+			continue;
+
+		if (nested_ns_own_netns(nsid))
 			continue;
 
 		if (switch_ns_by_fd(nsid->net.ns_fd, &net_ns_desc, NULL))
@@ -3165,6 +3292,9 @@ int restore_task_net_ns(struct pstree_item *current)
 	if (current->ids && current->ids->has_net_ns_id) {
 		unsigned int id = current->ids->net_ns_id;
 		struct ns_id *nsid;
+
+		if (nested_ns_skip_netns(current))
+			return 0;
 
 		nsid = lookup_ns_by_id(id, &net_ns_desc);
 		if (nsid == NULL) {

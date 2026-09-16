@@ -228,6 +228,21 @@ int check_open_handle(unsigned int s_dev, unsigned long i_ino, FhEntry *f_handle
 	char *path, *irmap_path;
 	struct mount_info *mi;
 
+	/*
+	 * Watches on cgroupfs (e.g. the ones the inner containerd-shims of
+	 * a docker-in-docker put on their cgroups) can not be resolved into
+	 * paths: the filesystem has no irmap-able entries, and the watched
+	 * cgroups are re-created on restore, so the handles are stale there
+	 * anyway. Dump the watch with its handle only: it is dropped on
+	 * restore, the watchers track their containers by other means
+	 * (pidfd, waitpid) as well.
+	 */
+	mi = lookup_mnt_sdev(s_dev);
+	if (mi && (mi->fstype->code == FSTYPE__CGROUP || mi->fstype->code == FSTYPE__CGROUP2)) {
+		pr_debug("\tHandle 0x%x:0x%lx is on cgroupfs, dumping with the handle only\n", s_dev, i_ino);
+		goto out_nopath;
+	}
+
 	if (fault_injected(FI_CHECK_OPEN_HANDLE))
 		goto fault;
 
@@ -540,6 +555,20 @@ static int restore_one_inotify(int inotify_fd, struct fsnotify_mark_info *info)
 	int ret = -1, target = -1;
 	char buf[PSFDS], *path;
 	uint32_t mask;
+	struct mount_info *mi;
+
+	/*
+	 * The watches on cgroupfs are dumped with their handle only (see
+	 * check_open_handle): the cgroups they were put on are re-created
+	 * on restore, so the handles are stale. Drop the watches, the
+	 * watchers track their containers by other means (pidfd, waitpid)
+	 * as well.
+	 */
+	mi = lookup_mnt_sdev(iwe->s_dev);
+	if (mi && (mi->fstype->code == FSTYPE__CGROUP || mi->fstype->code == FSTYPE__CGROUP2)) {
+		pr_warn("\tDropping the stale cgroupfs watch %#08x:%#016lx\n", iwe->s_dev, iwe->i_ino);
+		return 0;
+	}
 
 	path = get_mark_path("inotify", info->remap, iwe->f_handle, iwe->i_ino, iwe->s_dev, buf, &target);
 	if (!path)

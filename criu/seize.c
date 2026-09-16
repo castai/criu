@@ -738,7 +738,7 @@ static int collect_children(struct pstree_item *item)
 
 		if (ret == TASK_ZOMBIE)
 			ret = TASK_DEAD;
-		else
+		else if (processes_to_wait > 0)
 			processes_to_wait--;
 
 		if (ret == TASK_STOPPED)
@@ -926,7 +926,7 @@ static int collect_threads(struct pstree_item *item)
 
 		if (ret == TASK_ZOMBIE)
 			ret = TASK_DEAD;
-		else
+		else if (processes_to_wait > 0)
 			processes_to_wait--;
 
 		BUG_ON(item->nr_threads + 1 > nr_threads);
@@ -1051,6 +1051,9 @@ int collect_pstree(void)
 	int ret, exit_code = -1;
 	struct proc_status_creds creds;
 
+	if (set_dump_pidns_level(pid))
+		goto err;
+
 	timing_start(TIME_FREEZING);
 
 	/*
@@ -1098,7 +1101,7 @@ int collect_pstree(void)
 
 	if (ret == TASK_ZOMBIE)
 		ret = TASK_DEAD;
-	else
+	else if (processes_to_wait > 0)
 		processes_to_wait--;
 
 	if (ret == TASK_STOPPED)

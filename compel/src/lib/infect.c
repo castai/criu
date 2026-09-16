@@ -255,6 +255,20 @@ try_again:
 
 	if (ret < 0 || WIFEXITED(status) || WIFSIGNALED(status)) {
 		if (ss->state != 'Z') {
+			/*
+			 * With the cgroup freezer the tasks are pre-seized via
+			 * the freezer cgroup's thread list. A task which lives in
+			 * a cgroup outside of the dumped one (e.g. a docker-in-docker
+			 * inner container's process, which the inner daemon puts into
+			 * a cgroup it creates elsewhere) is not traced yet: seize
+			 * it here, the same way the non-freezer mode does.
+			 */
+			if (ret < 0 && wait_errno == ECHILD && !compel_interrupt_task(pid)) {
+				if (free_status)
+					free_status(pid, ss, data);
+				goto try_again;
+			}
+
 			if (pid == getpid())
 				pr_err("The criu itself is within dumped tree.\n");
 			else

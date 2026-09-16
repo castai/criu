@@ -208,6 +208,7 @@ struct cr_options {
 	int deprecated_ok;
 	int display_stats;
 	int weak_sysctls;
+	int nested_ns;
 	int status_fd;
 	bool orphan_pts_master;
 	int stream;

@@ -9,6 +9,7 @@
 #include "rst-malloc.h"
 #include "common/lock.h"
 #include "namespaces.h"
+#include "nested-ns.h"
 #include "files.h"
 #include "tty.h"
 #include "mount.h"
@@ -481,6 +482,10 @@ void pstree_insert_pid(struct pid *pid_node)
 
 	n = lookup_create_pid(pid_node->ns[0].virt, pid_node);
 
+	if (n != pid_node)
+		pr_err("Duplicate vpid %d: new real %d vs existing real %d\n", pid_node->ns[0].virt,
+		       pid_node->real, n->real);
+
 	BUG_ON(n != pid_node);
 }
 
@@ -930,12 +935,18 @@ static int prepare_pstree_kobj_ids(void)
 		}
 
 		rsti(item)->clone_flags = cflags;
-		if (parent)
+		if (parent && !nested_ns_skip_mntns(item))
 			/*
 			 * Mount namespaces are setns()-ed at
 			 * restore_task_mnt_ns() explicitly,
 			 * no need in creating it with its own
 			 * temporary namespace.
+			 *
+			 * A task entering a nested user namespace
+			 * with its own mount namespace is born in
+			 * a copy of the parent's one, owned by the
+			 * new user namespace, which it fills in
+			 * by itself.
 			 *
 			 * Root task is exceptional -- it will
 			 * be born in a fresh new mount namespace
@@ -945,9 +956,14 @@ static int prepare_pstree_kobj_ids(void)
 			rsti(item)->clone_flags &= ~CLONE_NEWNS;
 
 		/**
-		 * Only child reaper can clone with CLONE_NEWPID
+		 * Only child reaper can clone with CLONE_NEWPID.
+		 *
+		 * A task entering a nested user namespace with its own pid
+		 * namespace is the child reaper of the new one, even though
+		 * its vpid is not the INIT_PID of the root one.
 		 */
-		if (vpid(item) != INIT_PID)
+		if (vpid(item) != INIT_PID && !(nested_ns_enabled() && item->ids && item->parent &&
+						item->ids->pid_ns_id != item->parent->ids->pid_ns_id))
 			rsti(item)->clone_flags &= ~CLONE_NEWPID;
 
 		cflags &= CLONE_ALLNS;
@@ -955,7 +971,7 @@ static int prepare_pstree_kobj_ids(void)
 		if (item == root_item) {
 			pr_info("Will restore in %lx namespaces\n", cflags);
 			root_ns_mask = cflags;
-		} else if (cflags & ~(root_ns_mask & CLONE_SUBNS)) {
+		} else if ((cflags & ~(root_ns_mask & CLONE_SUBNS)) && !nested_ns_cflags_ok(cflags)) {
 			/*
 			 * Namespaces from CLONE_SUBNS can be nested, but in
 			 * this case nobody can't share external namespaces of
@@ -970,6 +986,14 @@ static int prepare_pstree_kobj_ids(void)
 			return -1;
 		}
 	}
+
+	/*
+	 * Only the first task of each nested user namespace creates it at
+	 * restore: the others (the ones which have entered it at dump, e.g.
+	 * the docker exec-ed processes of an inner container) are forked
+	 * without CLONE_NEWUSER and join the created one instead.
+	 */
+	nested_ns_fix_exec_userns();
 
 	pr_debug("NS mask to use %lx\n", root_ns_mask);
 	return 0;

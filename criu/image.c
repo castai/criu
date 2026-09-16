@@ -632,6 +632,21 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 			goto skip_magic;
 		}
 
+		{
+			struct stat st;
+			char lnk[64], tgt[PATH_MAX];
+			int serr = errno;
+
+			pr_err("IMGDBG: open %s failed errno=%d dfd=%d uid=%d euid=%d", path, serr, dfd, getuid(), geteuid());
+			if (fstatat(dfd, path, &st, 0) == 0)
+				pr_err("IMGDBG: stat mode=%o uid=%d gid=%d", st.st_mode, st.st_uid, st.st_gid);
+			else
+				pr_err("IMGDBG: fstatat failed errno=%d", errno);
+			snprintf(lnk, sizeof(lnk), "/proc/self/fd/%d", dfd);
+			if (readlink(lnk, tgt, sizeof(tgt)) > 0)
+				pr_err("IMGDBG: dfd -> %s", tgt);
+			errno = serr;
+		}
 		pr_perror("Unable to open %s", path);
 		goto err;
 	}

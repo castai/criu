@@ -147,6 +147,7 @@ message criu_opts {
 	optional bool			log_to_stderr		= 71;
 	optional bool			allow_uprobes		= 72;
 	optional bool			keep_network_lock	= 73;
+	optional bool			nested_ns		= 74;
 /*	optional bool			check_mounts		= 128;	*/
 }
 

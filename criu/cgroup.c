@@ -1303,6 +1303,16 @@ int restore_task_cgroup(struct pstree_item *me)
 	if (!rsti(me)->cg_set)
 		return 0;
 
+	/*
+	 * A task entering a nested user namespace stays in the cgroup of
+	 * its parent task: the inner containers of a nested container
+	 * runtime (e.g. docker-in-docker) are in the cgroup of the outer
+	 * container anyway, and the nested user namespace doesn't have
+	 * the permissions to move into a cgroup of the parent one.
+	 */
+	if (rsti(me)->clone_flags & CLONE_NEWUSER)
+		return 0;
+
 	/* Zombies and helpers can have cg_set == 0 so we skip them */
 	while (parent && !rsti(parent)->cg_set)
 		parent = parent->parent;

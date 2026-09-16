@@ -82,6 +82,12 @@ struct rst_info {
 
 	struct rst_rseq *rseqe;
 
+	/*
+	 * Set when the uid and gid maps of the user namespace this
+	 * task was born in are written, see prepare_userns_child().
+	 */
+	futex_t userns_maps;
+
 	futex_t shstk_enable;
 	futex_t shstk_unlock;
 

@@ -73,10 +73,12 @@ static bool can_dump_netlink_sk(int lfd)
 	int ret;
 
 	ret = fd_has_data(lfd);
+	if (ret < 0)
+		return false;
 	if (ret == 1)
-		pr_err("The socket has data to read\n");
+		pr_warn("The socket has data to read. It will be dropped on restore\n");
 
-	return ret == 0;
+	return true;
 }
 
 static int dump_one_netlink_fd(int lfd, u32 id, const struct fd_parms *p)

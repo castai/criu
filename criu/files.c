@@ -582,10 +582,26 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 	}
 
 	if (S_ISFIFO(p.stat.st_mode)) {
-		if (p.fs_type == PIPEFS_MAGIC)
+		if (p.fs_type == PIPEFS_MAGIC) {
 			ops = &pipe_dump_ops;
-		else
+		} else if (p.flags & O_PATH) {
+			/*
+			 * An O_PATH fd of a fifo (e.g. a docker-in-docker daemon
+			 * holding the stdio of its inner containers via a symlink)
+			 * can't be used to drain the pipe data: fcntl fails with
+			 * EBADF on O_PATH fds. Dump it as a path to the fifo.
+			 */
+			if (fill_fdlink(lfd, &p, &link))
+				return -1;
+
+			p.link = &link;
+			if (link.name[1] != '/')
+				return dump_unsupp_fd(&p, lfd, "reg", link.name + 1, e);
+
+			ops = &regfile_dump_ops;
+		} else {
 			ops = &fifo_dump_ops;
+		}
 
 		return do_dump_gen_file(&p, lfd, ops, e);
 	}
@@ -1038,8 +1054,10 @@ static int send_fd_to_peer(int fd, struct fdinfo_list_entry *fle)
 	transport_name_gen(&saddr, &len, fle->pid);
 	pr_info("\t\tSend fd %d to %s\n", fd, saddr.sun_path + 1);
 	ret = send_fds(sock, &saddr, len, &fd, 1, (void *)&fle, sizeof(struct fdinfo_list_entry *));
-	if (ret < 0)
+	if (ret < 0) {
+		pr_err("SENDDBG: send_fds failed for pid %d, sock=%d, errno=%d\n", fle->pid, sock, errno);
 		return -1;
+	}
 	return set_fds_event(fle->pid);
 }
 
@@ -1095,10 +1113,25 @@ static int serve_out_fd(int pid, int fd, struct file_desc *d)
 	pr_info("\t\tCreate fd for %d\n", fd);
 
 	list_for_each_entry(fle, &d->fd_info_head, desc_list) {
-		if (pid == fle->pid)
+		struct pstree_item *fle_item;
+
+		if (pid == fle->pid) {
 			ret = send_fd_to_self(fd, fle);
-		else
+		} else {
+			/*
+			 * A task in a nested pid namespace is not reachable by
+			 * its vpid: the actual pid in the root one is different,
+			 * and the /proc and transport socket routing breaks.
+			 * Skip the fd distribution to it: it opens its own copy.
+			 */
+			fle_item = pstree_item_by_virt(fle->pid);
+			if (fle_item && fle_item->ids && root_item->ids &&
+			    fle_item->ids->pid_ns_id != root_item->ids->pid_ns_id) {
+				pr_debug("Skipping fd %d send to nested task %d\n", fd, fle->pid);
+				continue;
+			}
 			ret = send_fd_to_peer(fd, fle);
+		}
 
 		if (ret) {
 			pr_err("Can't sent fd %d to %d\n", fd, fle->pid);

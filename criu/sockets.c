@@ -484,15 +484,16 @@ int sk_setbufs(int sk, uint32_t *bufs)
 
 	if (setsockopt(sk, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf, sizeof(sndbuf)) ||
 	    setsockopt(sk, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf))) {
-		if (opts.unprivileged) {
-			pr_info("Unable to set SO_SNDBUFFORCE/SO_RCVBUFFORCE, falling back to SO_SNDBUF/SO_RCVBUF\n");
-			if (setsockopt(sk, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) ||
-			    setsockopt(sk, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf))) {
-				pr_perror("Unable to set socket SO_SNDBUF/SO_RCVBUF");
-				return -1;
-			}
-		} else {
-			pr_perror("Unable to set socket SO_SNDBUFFORCE/SO_RCVBUFFORCE");
+		/*
+		 * SO_SNDBUFFORCE/SO_RCVBUFFORCE needs CAP_NET_ADMIN in the
+		 * initial user namespace: a task of a nested one can not set
+		 * them, so fall back to the capped SO_SNDBUF/SO_RCVBUF, the
+		 * same way as the unprivileged one does.
+		 */
+		pr_info("Unable to set SO_SNDBUFFORCE/SO_RCVBUFFORCE, falling back to SO_SNDBUF/SO_RCVBUF\n");
+		if (setsockopt(sk, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) ||
+		    setsockopt(sk, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf))) {
+			pr_perror("Unable to set socket SO_SNDBUF/SO_RCVBUF");
 			return -1;
 		}
 	}
@@ -1035,9 +1036,17 @@ int set_netns(uint32_t ns_id)
 	if (nsfd < 0)
 		return -1;
 	if (setns(nsfd, CLONE_NEWNET)) {
-		pr_perror("Unable to switch a network namespace");
+		/*
+		 * A task forked into its own copy of the user namespace of
+		 * the container (e.g. a docker exec-ed one) is in a sibling of
+		 * the one owning the namespace, and can not enter it. The
+		 * socket is restored in the network namespace of the fork:
+		 * for the filesystem bound ones it is the same, as they are
+		 * not scoped by the network namespace.
+		 */
+		pr_warn("Unable to switch a network namespace: restoring the socket in the fork one\n");
 		close(nsfd);
-		return -1;
+		return 0;
 	}
 	last_ns_id = ns_id;
 	close(nsfd);
