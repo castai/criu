@@ -1374,6 +1374,23 @@ static inline int fork_with_pid(struct pstree_item *item)
 				set_tid[1] = pid;
 				set_tid_size = 2;
 			}
+		} else if (item->own_ns_pid && item->own_ns_pid != pid) {
+			/*
+			 * The task is forked by a one living in a nested pid
+			 * namespace: its pid in it differs from the one in the
+			 * root one. It is restored with the one of its own
+			 * namespace, which its own kin, e.g. the task which
+			 * has forked it, knows it by. The one of the root
+			 * namespace is not settable by its parent: setting a
+			 * pid at an outer level needs a capability in the user
+			 * namespace owning it, which a task of a nested one
+			 * does not have. Nothing outside of the inner one
+			 * tracks a task by its pid in the root one, except for
+			 * the init task of an inner container, which is forked
+			 * by its tracker with the pid in the root namespace as
+			 * well (see the CLONE_NEWPID branch above).
+			 */
+			set_tid[0] = item->own_ns_pid;
 		}
 
 		ret = clone3_with_pids_noasan(restore_task_with_children, &ca,
@@ -1536,20 +1553,47 @@ static void restore_sid(void)
 	 */
 
 	if (vpid(current) == current->sid) {
+		pid_t expected;
+
 		pr_info("Restoring %d to %d sid\n", vpid(current), current->sid);
 		sid = setsid();
 		/*
-		 * A task forked with CLONE_NEWPID is the init one of its new
-		 * pid namespace, so setsid() returns its pid in it, and not
-		 * the vpid from the root pid namespace.
+		 * A task forked with CLONE_NEWPID is the init one of its new pid
+		 * namespace, so setsid() returns its pid in it, and not the
+		 * vpid from the root pid namespace. The same for a task of a
+		 * nested one: setsid() returns its own pid in it, which its
+		 * own kin, the members of the session of it, know it by.
 		 */
-		if (sid != current->sid && !(rsti(current)->clone_flags & CLONE_NEWPID && sid == INIT_PID)) {
-			pr_perror("Can't restore sid (%d), expected %d, vpid %d, cflags %lx", sid, current->sid, vpid(current),
+		expected = current->own_ns_pid ? current->own_ns_pid : current->sid;
+		if (sid != expected && !(rsti(current)->clone_flags & CLONE_NEWPID && sid == INIT_PID)) {
+			pr_perror("Can't restore sid (%d), expected %d, vpid %d, cflags %lx", sid, expected, vpid(current),
 				  rsti(current)->clone_flags);
 			exit(1);
 		}
 	} else {
+		struct pstree_item *leader = pstree_item_by_virt(current->sid);
+
 		sid = getsid(0);
+		/*
+		 * The session id is the pid of its leader: the own one of
+		 * it in its pid namespace, which the members of the session
+		 * are restored to see it at.
+		 */
+		if (leader && leader->own_ns_pid) {
+			if (sid == leader->own_ns_pid)
+				goto sid_ok;
+			/*
+			 * A task in a nested pid namespace (created by an
+			 * ancestor forked with CLONE_NEWPID) inherits the sid
+			 * of the init one of that namespace, and not the one
+			 * from the root pid namespace.
+			 */
+			if (sid == INIT_PID && current->ids && root_item->ids &&
+			    current->ids->pid_ns_id != root_item->ids->pid_ns_id)
+				goto sid_ok;
+			pr_err("Requested sid %d doesn't match inherited %d\n", leader->own_ns_pid, sid);
+			exit(1);
+		}
 		if (sid != current->sid) {
 			/* Skip the root task if it's not init */
 			if (current == root_item && vpid(root_item) != INIT_PID)
@@ -1567,6 +1611,7 @@ static void restore_sid(void)
 			exit(1);
 		}
 	}
+
 sid_ok:;
 }
 
@@ -1755,13 +1800,19 @@ static int __restore_task_with_children(void *_arg)
 	 * namespace, so getpid() returns INIT_PID in it, and not the vpid
 	 * from the root pid namespace. A task forked by a one living in a
 	 * nested user namespace gets a random pid, as its parent can not
-	 * set it in the inherited pid namespace.
+	 * set it in the inherited pid namespace. A task living in a nested
+	 * pid namespace is seen by its own kin at its own pid in it, not
+	 * by the one of the root namespace.
 	 */
-	if (vpid(current) != pid && !(rsti(current)->clone_flags & CLONE_NEWPID && pid == INIT_PID) &&
-	    !child_pid_can_not_be_set(current)) {
-		pr_err("Pid %d do not match expected %d\n", pid, vpid(current));
-		set_task_cr_err(EEXIST);
-		goto err;
+	{
+		pid_t expected = current->own_ns_pid ? current->own_ns_pid : vpid(current);
+
+		if (expected != pid && !(rsti(current)->clone_flags & CLONE_NEWPID && pid == INIT_PID) &&
+		    !child_pid_can_not_be_set(current)) {
+			pr_err("Pid %d do not match expected %d\n", pid, expected);
+			set_task_cr_err(EEXIST);
+			goto err;
+		}
 	}
 
 	if (log_init_by_pid(vpid(current)))
@@ -1928,6 +1979,14 @@ static int __restore_task_with_children(void *_arg)
 		if (restore_wait_other_tasks())
 			goto err;
 		fini_restore_mntns();
+
+		/*
+		 * The start times of all the restored processes are known
+		 * now: update the ones in the state files of the inner
+		 * runtimes, which have recorded the ones of the dump time.
+		 */
+		nested_ns_patch_runc_states();
+
 		__restore_switch_stage(CR_STATE_RESTORE);
 	} else {
 		if (restore_finish_stage(task_entries, CR_STATE_FORKING) < 0)

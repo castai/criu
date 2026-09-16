@@ -93,6 +93,7 @@ extern int prepare_loginuid(unsigned int value);
 extern int parse_pid_status(pid_t pid, struct seize_task_status *, void *data);
 extern int set_dump_pidns_level(pid_t root);
 extern pid_t pid_at_dump_level(pid_t pid, pid_t fallback);
+extern pid_t pid_at_own_level(pid_t pid, pid_t fallback);
 extern int parse_pid_session(pid_t pid, int *pgid, int *sid);
 extern int parse_file_locks(void);
 extern int get_fd_mntid(int fd, int *mnt_id);

@@ -1,5 +1,6 @@
 #include <unistd.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <grp.h>
 #include <errno.h>
 #include <limits.h>
@@ -781,6 +782,79 @@ int nested_ns_pin_roots(void)
  * task of a user namespace (the one which has created it at dump) keeps
  * the flag: the others are forked without it and join the created one.
  */
+/*
+ * A task which has entered the namespaces of an inner container
+ * without creating them (e.g. a docker exec-ed process) is restored
+ * with the flags of the namespaces derived from the difference of its
+ * ids from the ones of its parent task, so it would fork into its own
+ * copies of them: siblings of the original ones, not enterable. It is
+ * re-parented under the first task of the inner container instead
+ * (the init one, which has created the namespaces): forked from it,
+ * it inherits all of them, the same way as at dump.
+ */
+void nested_ns_fix_exec_pstree(void)
+{
+	struct pstree_item *item;
+
+	if (!nested_ns_enabled())
+		return;
+
+	for_each_pstree_item(item) {
+		struct pstree_item *parent = item->parent, *home;
+
+		if (!parent || !item->ids)
+			continue;
+
+		/* Zombies and helpers can have ids == 0 so we skip them */
+		while (parent && !parent->ids)
+			parent = parent->parent;
+		if (!parent)
+			continue;
+
+		/*
+		 * The task is in the namespaces of its parent: nothing
+		 * to fix, it inherits them with the fork.
+		 */
+		if (item->ids->pid_ns_id == parent->ids->pid_ns_id &&
+		    item->ids->mnt_ns_id == parent->ids->mnt_ns_id &&
+		    item->ids->user_ns_id == parent->ids->user_ns_id)
+			continue;
+
+		/*
+		 * Find the home for the task: the first one in its
+		 * mount namespace which is not a descendant of it (the
+		 * init one of the inner container, normally).
+		 */
+		home = NULL;
+		for_each_pstree_item(home) {
+			if (home == item || !home->ids || !home->parent)
+				continue;
+
+			if (home->ids->mnt_ns_id == item->ids->mnt_ns_id &&
+			    home->ids->pid_ns_id == item->ids->pid_ns_id &&
+			    home->ids->user_ns_id == item->ids->user_ns_id &&
+			    home->pid->state != TASK_DEAD) {
+				/* not a descendant of item */
+				struct pstree_item *p = home;
+
+				while (p && p != item)
+					p = p->parent;
+				if (!p)
+					break;
+			}
+		}
+		if (!home || !home->ids || home == item)
+			continue;
+
+		pr_info("Re-parenting the task %d from %d to %d: it has entered the namespaces of the one at dump\n",
+			vpid(item), vpid(parent), vpid(home));
+
+		list_del(&item->sibling);
+		item->parent = home;
+		list_add_tail(&item->sibling, &home->children);
+	}
+}
+
 void nested_ns_fix_exec_userns(void)
 {
 	struct pstree_item *item, *creator;
@@ -962,6 +1036,156 @@ int nested_ns_child_report(struct pstree_item *item)
 	return 0;
 }
 
+/*
+ * The start time of a process, as it is recorded in its /proc stat:
+ * the identifier of the boot of the running kernel, which the runtimes
+ * (e.g. runc) use to tell a process from a re-used pid.
+ */
+static unsigned long nested_proc_starttime(const char *proc_root, pid_t pid)
+{
+	char buf[4096], *p;
+	int fd, n, field;
+
+	snprintf(buf, sizeof(buf), "%s/%d/stat", proc_root, pid);
+	fd = open(buf, O_RDONLY);
+	if (fd < 0)
+		return 0;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return 0;
+	buf[n] = '\0';
+
+	/* The fields after the (comm) one, the starttime is the 22nd. */
+	p = strrchr(buf, ')');
+	if (!p)
+		return 0;
+
+	for (field = 2, p++; field < 22 && *p; p++)
+		if (*p == ' ')
+			field++;
+	if (field != 22)
+		return 0;
+
+	return strtoul(p, NULL, 10);
+}
+
+static int nested_patch_state_json(const char *proc_root, const char *path)
+{
+	char buf[32768], *start_f, *pid_f, *end;
+	unsigned long st;
+	pid_t pid;
+	int fd, n, len;
+	char *out;
+
+	fd = open(path, O_RDWR);
+	if (fd < 0)
+		return 0;
+	n = read(fd, buf, sizeof(buf) - 1);
+	if (n <= 0) {
+		close(fd);
+		return 0;
+	}
+	buf[n] = '\0';
+
+	pid_f = strstr(buf, "\"init_process_pid\":");
+	if (!pid_f) {
+		close(fd);
+		return 0;
+	}
+	pid = strtoul(pid_f + sizeof("\"init_process_pid\":") - 1, NULL, 10);
+
+	start_f = strstr(buf, "\"init_process_start\":");
+	if (!start_f) {
+		close(fd);
+		return 0;
+	}
+
+	st = nested_proc_starttime(proc_root, pid);
+	if (!st) {
+		/* The init process is not visible: leave the state as it is. */
+		return 0;
+	}
+
+	end = start_f + sizeof("\"init_process_start\":") - 1;
+	while (*end >= '0' && *end <= '9')
+		end++;
+
+	out = xmalloc(n + 32);
+	if (!out) {
+		close(fd);
+		return -1;
+	}
+	len = snprintf(out, (start_f - buf) + 48, "%.*s\"init_process_start\":%lu", (int)(start_f - buf), buf, st);
+	memcpy(out + len, end, buf + n - end);
+	len += buf + n - end;
+
+	if (lseek(fd, 0, SEEK_SET) < 0 || write(fd, out, len) != len)
+		pr_warn("Can't update the start time of the init process in %s\n", path);
+
+	xfree(out);
+	close(fd);
+	return 0;
+}
+
+static const char *nested_proc_root = "/proc";
+
+static int nested_state_cb(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf)
+{
+	size_t len = strlen(fpath);
+
+	if (typeflag != FTW_F || len < 11 || strcmp(fpath + len - 11, "/state.json"))
+		return 0;
+
+	return nested_patch_state_json(nested_proc_root, fpath);
+}
+
+/*
+ * The inner runtimes (e.g. the runc one of a docker-in-docker) keep the
+ * state of the containers they run in their own files, which are
+ * restored as they were at the dump time. The one of a container
+ * records the pid and the start time of its init process: the pid is
+ * restored, but the start time is the one of the freshly forked
+ * process, and the identity check of the runtime fails on it, e.g. an
+ * exec into the container is refused with "cannot exec in a stopped
+ * container". Walk the runtime state files of the restored tree and
+ * update the start time of the init processes in them.
+ */
+void nested_ns_patch_runc_states(void)
+{
+	char proc_root[] = "/tmp/.criu-proc-XXXXXX";
+	bool mounted = false;
+
+	if (!nested_ns_enabled())
+		return;
+
+	/*
+	 * The /proc of the root task of the restore is the one of the
+	 launching criu one, which sees the processes in the pid
+	 * namespace of the node: the init processes of the inner
+	 * containers are not reachable by their pids in it. Mount a
+	 * fresh procfs, which is bound to our own pid namespace, the
+	 * one of the restored tree root, so they are.
+	 */
+	if (mkdtemp(proc_root)) {
+		if (mount("proc", proc_root, "proc", 0, NULL) == 0) {
+			mounted = true;
+			nested_proc_root = proc_root;
+		} else {
+			pr_warn("Can't mount a fresh procfs at %s: %s\n", proc_root, strerror(errno));
+			rmdir(proc_root);
+		}
+	}
+
+	if (nftw("/run", nested_state_cb, 12, FTW_PHYS) < 0)
+		pr_warn("Can't walk the runtime state files of /run\n");
+
+	if (mounted) {
+		umount(proc_root);
+		rmdir(proc_root);
+	}
+}
+
 int nested_ns_child_wait(struct pstree_item *item)
 {
 	if (!item->parent || !(rsti(item)->clone_flags & CLONE_NEWUSER))
@@ -974,6 +1198,114 @@ int nested_ns_child_wait(struct pstree_item *item)
 	futex_wait_until(&rsti(item)->userns_maps, 2);
 
 	return 0;
+}
+
+/*
+ * The numeric ids of a tar (ustar) archive entry are stored in the
+ * octal notation: parse one.
+ */
+static unsigned int tar_octal(const char *p, int len)
+{
+	unsigned int v = 0;
+	int i;
+
+	for (i = 0; i < len && p[i] >= '0' && p[i] <= '7'; i++)
+		v = v * 8 + (p[i] - '0');
+
+	return v;
+}
+
+/*
+ * The archive of the tmpfs content is created in the context of the
+ * dumping criu, so the ids of its entries are the ones of the kernel
+ * view of the dump time user namespaces. The task restoring the content
+ * of a tmpfs of a nested user namespace runs in it: the tar of an inner
+ * container (a busybox one, normally) can not set such ids, as they are
+ * not mapped in it, and the extracted files end up owned by itself.
+ * Walk the archive here and fix the ownership of the extracted files
+ * with the ids translated to the view of the current user namespace.
+ */
+static int nested_fix_tmpfs_ownership(struct cr_img *img, const char *root)
+{
+	char hdr[512], full[512], lname[256];
+	const char *file;
+	int ifd = img_raw_fd(img), dfd;
+	unsigned int uid, gid, size;
+	char typeflag;
+	int ret = 0;
+
+	dfd = open(root, O_RDONLY | O_DIRECTORY);
+	if (dfd < 0) {
+		pr_perror("Can't open the tmpfs root %s", root);
+		return -1;
+	}
+
+	/* The tar has read the image to the end: rewind it. */
+	if (lseek(ifd, 0, SEEK_SET) < 0) {
+		pr_perror("Can't rewind the tmpfs content image");
+		close(dfd);
+		return -1;
+	}
+
+	lname[0] = '\0';
+	while (read(ifd, hdr, sizeof(hdr)) == sizeof(hdr)) {
+		/* The end of the archive: one or two zero blocks. */
+		if (hdr[0] == '\0')
+			break;
+
+		size = tar_octal(hdr + 124, 12);
+		uid = tar_octal(hdr + 108, 8);
+		gid = tar_octal(hdr + 116, 8);
+		typeflag = hdr[156];
+
+		if (typeflag == 'L') {
+			/* The GNU long name of the next entry: read it. */
+			size_t rd = size < sizeof(lname) - 1 ? size : sizeof(lname) - 1;
+
+			if (read(ifd, lname, rd) < 0)
+				break;
+			lname[rd] = '\0';
+			lseek(ifd, round_up(size, 512) - rd, SEEK_CUR);
+			continue;
+		}
+
+		if (typeflag == '0' || typeflag == '\0' || typeflag == '5' || typeflag == '2') {
+			const char *prefix = hdr + 345;
+
+			if (lname[0]) {
+				file = lname;
+			} else {
+				if (prefix[0])
+					snprintf(full, sizeof(full), "%.*s/%.*s", 155, prefix, 100, hdr);
+				else
+					snprintf(full, sizeof(full), "%.*s", 100, hdr);
+				file = full[0] == '.' && full[1] == '/' ? full + 2 : full;
+			}
+
+			if (file[0] == '.' && file[1] == '/')
+				file += 2;
+
+			if (*file) {
+				unsigned int tuid = uid, tgid = gid;
+
+				userns_view_id(&tuid, true);
+				userns_view_id(&tgid, false);
+
+				if (fchownat(dfd, file, tuid, tgid, AT_SYMLINK_NOFOLLOW) < 0 && errno != ENOENT) {
+					pr_warn("Can't set the ownership (%u, %u) of %s in %s: %s\n",
+						 tuid, tgid, file, root, strerror(errno));
+					ret = -1;
+				}
+			}
+		}
+
+		/* Skip the data of the entry. */
+		lseek(ifd, round_up(size, 512), SEEK_CUR);
+		lname[0] = '\0';
+	}
+
+	close(dfd);
+	return ret;
 }
 
 /*
@@ -1004,7 +1336,9 @@ static int nested_restore_tmpfs_content(struct mount_info *mi)
 	}
 
 	ret = cr_system(img_raw_fd(img), -1, -1, "tar",
-			(char *[]){ "tar", "--extract", "--gzip", "--directory", mi->ns_mountpoint, NULL }, 0);
+			(char *[]){ "tar", "--extract", "--directory", mi->ns_mountpoint, NULL }, 0);
+	if (!ret)
+		ret = nested_fix_tmpfs_ownership(img, mi->ns_mountpoint);
 	close_image(img);
 
 	if (ret)
@@ -1048,6 +1382,18 @@ int nested_ns_child_namespaces(struct pstree_item *item)
 
 	if (rsti(item)->clone_flags & CLONE_NEWUTS) {
 		if (prepare_utsns(item->ids->uts_ns_id))
+			return -1;
+	}
+
+	if (rsti(item)->clone_flags & CLONE_NEWIPC) {
+		/*
+		 * The IPC namespace created at our fork is empty:
+		 * fill it in from its image, so the sysv shmem and
+		 * semaphore segments of the inner container appear
+		 * with their original ids in it, as the tasks forked
+		 * by us mmap the former and use the latter.
+		 */
+		if (prepare_ipc_ns(item->ids->ipc_ns_id))
 			return -1;
 	}
 

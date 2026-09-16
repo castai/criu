@@ -23,6 +23,7 @@
 #include "util.h"
 #include "util-pie.h"
 #include "sockets.h"
+#include "nested-ns.h"
 #include "sk-queue.h"
 #include "sk-unix-shared.h"
 #include "mount.h"
@@ -531,10 +532,18 @@ static int dump_one_unix_fd(int lfd, uint32_t id, const struct fd_parms *p)
 			/*
 			 * There's no known way to get data out of the write
 			 * queue of an icon socket. The only good solution for
-			 * now is to fail the migration.
+			 * now is to fail the migration. A task of a nested
+			 * namespace (e.g. an inner container of a
+			 * docker-in-docker) is not reachable by its vpid, so
+			 * the connection it is served by is dropped at restore
+			 * anyway: losing the queued data is fine, as a
+			 * connection without it is.
 			 */
-			pr_err("Non-empty write queue on an in-flight socket %#x\n", ue->ino);
-			goto err;
+			if (!nested_ns_enabled()) {
+				pr_err("Non-empty write queue on an in-flight socket %#x\n", ue->ino);
+				goto err;
+			}
+			pr_warn("Non-empty write queue on an in-flight socket %#x: dropping it\n", ue->ino);
 		}
 
 		ue->peer = e->sk_desc->sd.ino;

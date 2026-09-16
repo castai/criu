@@ -1004,10 +1004,40 @@ out_eperm:
 	return -1;
 }
 
+/*
+ * The ids in the images are the ones of the kernel view of the dump
+ * time user namespace of the task. A task restored into a nested one
+ * sees the ids translated by its id maps: a chown with a kernel view
+ * id is rejected there (EINVAL, unmapped). Translate the ids to the
+ * view of the namespace the current task is in: in the outer ones the
+ * maps are the identity, the translation changes nothing.
+ */
+void userns_view_id(unsigned int *id, bool is_uid)
+{
+	FILE *map;
+	unsigned int in_base, out_base, len;
+
+	map = fopen(is_uid ? "/proc/self/uid_map" : "/proc/self/gid_map", "r");
+	if (!map)
+		return;
+
+	while (fscanf(map, "%u %u %u", &in_base, &out_base, &len) == 3) {
+		if (*id >= out_base && *id - out_base < len) {
+			*id = *id - out_base + in_base;
+			break;
+		}
+	}
+
+	fclose(map);
+}
+
 int cr_fchpermat(int dirfd, const char *path, uid_t new_uid, gid_t new_gid, mode_t new_mode, int flags)
 {
 	struct stat st;
 	int ret;
+
+	userns_view_id((unsigned int *)&new_uid, true);
+	userns_view_id((unsigned int *)&new_gid, false);
 
 	if (fchownat(dirfd, path, new_uid, new_gid, flags) < 0 && errno != EPERM) {
 		int errno_cpy = errno;

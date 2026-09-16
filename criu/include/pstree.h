@@ -21,6 +21,12 @@ struct pstree_item {
 	pid_t pgid;
 	pid_t sid;
 	pid_t born_sid;
+	/*
+	 * The pid of the task in its own (the innermost) pid namespace:
+	 * the one its parent forks it with, equal to pid for the ones
+	 * living in the one of the root task of the dump.
+	 */
+	pid_t own_ns_pid;
 
 	int nr_threads;	     /* number of threads */
 	struct pid *threads; /* array of threads */
