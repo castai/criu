@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
+#include <sys/syscall.h>
 #include <sys/socket.h>
 #include <linux/capability.h>
 #include <linux/nsfs.h>
@@ -1072,7 +1073,7 @@ static unsigned long nested_proc_starttime(const char *proc_root, pid_t pid)
 
 static int nested_patch_state_json(const char *proc_root, const char *path)
 {
-	char buf[32768], *start_f, *pid_f, *end;
+	char buf[32768], *start_f, *pid_f, *root_f, *end;
 	unsigned long st;
 	pid_t pid;
 	int fd, n, len;
@@ -1110,6 +1111,45 @@ static int nested_patch_state_json(const char *proc_root, const char *path)
 	end = start_f + sizeof("\"init_process_start\":") - 1;
 	while (*end >= '0' && *end <= '9')
 		end++;
+
+	/*
+	 * The root filesystem of the container is mounted at the path
+	 * recorded in its state: the processes of it are chrooted into
+	 * it. The ones of an exec are chrooted the same way by the
+	 * runtime, from inside the user namespace of the container:
+	 * the search permission is needed on the whole path, but the
+	 * storage of a remapped user is owned by the root of the outer
+	 * container without one for the others, and the capabilities
+	 * of the user namespace of the container do not cover the
+	 * files of the outer root. Add the permission on the path
+	 * components: we run as the root of the outer container here.
+	 */
+	root_f = strstr(buf, "\"rootfs\":\"");
+	if (root_f) {
+		char rpath[PATH_MAX];
+		size_t plen = 0, i;
+
+		root_f += sizeof("\"rootfs\":\"") - 1;
+		while (root_f[plen] && root_f[plen] != '"' && plen < sizeof(rpath) - 1) {
+			rpath[plen] = root_f[plen];
+			plen++;
+		}
+		rpath[plen] = '\0';
+
+		for (i = 1; i <= plen; i++) {
+			if (rpath[i] == '/' || rpath[i] == '\0') {
+				struct stat st;
+				char comp[PATH_MAX];
+
+				memcpy(comp, rpath, i);
+				comp[i] = '\0';
+				if (stat(comp, &st) == 0 && S_ISDIR(st.st_mode) && !(st.st_mode & S_IXOTH)) {
+					if (chmod(comp, st.st_mode | S_IXOTH) < 0)
+						pr_warn("Can't add the search permission on %s\n", comp);
+				}
+			}
+		}
+	}
 
 	out = xmalloc(n + 32);
 	if (!out) {
@@ -1395,6 +1435,25 @@ int nested_ns_child_namespaces(struct pstree_item *item)
 		 */
 		if (prepare_ipc_ns(item->ids->ipc_ns_id))
 			return -1;
+	}
+
+	if (rsti(item)->clone_flags & CLONE_NEWCGROUP) {
+		/*
+		 * The cgroup namespace is not created at the fork of the
+		 * task (see fork_with_pid): it is created here instead,
+		 * after the task has been moved into the cgroup of the
+		 * container, so the root of it is the same as the one at
+		 * the dump time. The tasks forked by it inherit the
+		 * namespace: they are members of it, like the ones of the
+		 * other namespaces owned by our user namespace. Without
+		 * it the tasks run in the one of their parent task: the
+		 * one of an ancestor user namespace, which they can not
+		 * enter (e.g. the runtime of the container at an exec).
+		 */
+		if (unshare(CLONE_NEWCGROUP)) {
+			pr_perror("Can't create the cgroup namespace");
+			return -1;
+		}
 	}
 
 	/*
@@ -2036,6 +2095,20 @@ int nested_ns_child_mntns(struct pstree_item *item)
 			n_bind_fds++;
 		}
 
+		/*
+		 * The root filesystem of the nested mount namespace is the
+		 * overlayfs one of the inner container, which is already
+		 * mounted in the parent's tree (e.g. at
+		 * /docker-data/overlay2/<id>/merged of the outer one).
+		 * Chroot into it and mount the essential filesystems.
+		 *
+		 * It is a chroot and not the root of the namespace: the
+		 * mounts of the copy of the parent one are locked in the
+		 * user namespace, so the root can not be pivoted or
+		 * stacked over. The runtime of the container enters it
+		 * with a chroot of its own (see the exec one of our runc
+		 * fork).
+		 */
 		if (chdir(rootfs_path) < 0) {
 			pr_perror("Can't chdir to %s", rootfs_path);
 			return -1;
