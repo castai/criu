@@ -14,6 +14,7 @@
 #include <sys/mount.h>
 #include <sys/types.h>
 #include <net/if.h>
+#include <sys/ioctl.h>
 #include <linux/sockios.h>
 #include <libnl3/netlink/attr.h>
 #include <libnl3/netlink/msg.h>
@@ -3116,6 +3117,35 @@ int nested_ns_child_netns(struct ns_id *nsid)
 	if (unshare(CLONE_NEWNET)) {
 		pr_perror("Can't unshare net namespace");
 		return -1;
+	}
+
+	/*
+	 * The content of the namespace is not dumped (see dump_net_ns):
+	 * nothing brings the loopback interface up, while the runtime of
+	 * the inner container had it up, e.g. the database of a CI runner
+	 * is reached on 127.0.0.1 by the builds. Bring it up the way the
+	 * runtime does it: it is the task of the namespace, which has the
+	 * capabilities of it.
+	 */
+	{
+		struct ifreq ifr;
+		int sk;
+
+		sk = socket(AF_INET, SOCK_DGRAM, 0);
+		if (sk < 0) {
+			pr_perror("Can't open a socket for the loopback up");
+			return -1;
+		}
+
+		memset(&ifr, 0, sizeof(ifr));
+		strncpy(ifr.ifr_name, "lo", IFNAMSIZ - 1);
+		ifr.ifr_flags = IFF_UP | IFF_RUNNING;
+		if (ioctl(sk, SIOCSIFFLAGS, &ifr) < 0) {
+			pr_perror("Can't bring the loopback up");
+			close(sk);
+			return -1;
+		}
+		close(sk);
 	}
 
 	fd = open_proc(PROC_SELF, "ns/net");
