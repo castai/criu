@@ -1,5 +1,5 @@
 {
-    'flavor': 'ns uns',
+    'flavor': 'uns',
     'flags': 'suid',
     'opts': '--nested-ns',
     'deps': ['/bin/sh', '/sbin/ip|/bin/ip', '/bin/tar',
