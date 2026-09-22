@@ -231,16 +231,15 @@ criu-deps	+= include/common/asm
 # Configure variables.
 export CONFIG_HEADER := include/common/config.h
 ifeq ($(filter tags etags cscope clean lint indent fetch-clang-format help mrproper,$(MAKECMDGOALS)),)
-# CAST AI: the criu binary of the fork is linked statically (see
-# criu/Makefile) and ships without the gnutls support: the static
-# linking of it needs the static libraries of the dependencies of
-# gnutls (nettle, hogweed, gmp, tasn1), which are not part of the
-# usual development environments (e.g. the CI runners have the
-# headers of gnutls, but not the static libraries of the ones it
-# depends on). The production binary is built in a container without
-# the gnutls development files as well. Override with NO_GNUTLS=
-# to enable it back.
-NO_GNUTLS ?= y
+# CAST AI: the production flavor of the fork, built by the LIVE CI
+# workflows and the production builds: a statically linked binary
+# without the gnutls support, as the static linking of it needs the
+# static libraries of its dependencies (nettle, hogweed, gmp,
+# tasn1), which the usual development environments don't have. The
+# rest of the builds keeps the original way.
+ifeq ($(CASTAI_STATIC),y)
+NO_GNUTLS := y
+endif
 
 include Makefile.config
 else
