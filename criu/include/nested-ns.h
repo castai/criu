@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <sys/types.h>
 
+#include "images/core.pb-c.h"
 #include "images/userns.pb-c.h"
 
 struct pstree_item;
@@ -112,14 +113,12 @@ bool nested_ns_pid_not_visible(struct pstree_item *item);
  */
 int nested_ns_child_namespaces(struct pstree_item *item);
 
-struct CoreEntry;
-
 /*
  * Translate the ids of the credentials of a task living in a nested
  * user namespace from the view of the dumping criu process into the
  * one of the user namespace of the task.
  */
-int nested_ns_fix_task_creds(struct pstree_item *item, struct CoreEntry *core);
+int nested_ns_fix_task_creds(struct pstree_item *item, CoreEntry *core);
 
 /*
  * Re-parent the tasks which have entered the namespaces of an inner
