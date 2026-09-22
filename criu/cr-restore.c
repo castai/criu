@@ -401,77 +401,16 @@ static int populate_root_fd_off(void)
 	return ret >= 0 ? 0 : -1;
 }
 
-/*
- * A task living in a nested user namespace has no capabilities in the
- * user namespace owning the inherited pid namespace, so it can not set
- * the pid of a child forked into it: the kernel fails clone3() with
- * set_tid, and the write into ns_last_pid with EPERM. Such a child is
- * restored with a random pid, and the tasks waiting for the original
- * one get an ECHILD error from wait*(), like if it had died.
- */
-static bool child_pid_can_not_be_set(struct pstree_item *item)
-{
-	struct pstree_item *parent = item->parent;
-
-	/* The pid is always set in the new pid namespace of the child. */
-	if (rsti(item)->clone_flags & CLONE_NEWPID)
-		return false;
-
-	/* Zombies and helpers can have ids == 0 so we skip them */
-	while (parent && !parent->ids)
-		parent = parent->parent;
-
-	/*
-	 * The parent task is in the root user namespace: it has the
-	 * capabilities of the restoring criu, so it can set the pid.
-	 */
-	if (!parent || parent->ids->user_ns_id == root_ids->user_ns_id)
-		return false;
-
-	/*
-	 * The pid of the child is set in the pid namespace of the parent
-	 * one, so the parent needs CAP_CHECKPOINT_RESTORE in the user
-	 * namespace owning it. The one owning the pid namespace of the
-	 * parent task is the one of the task which has created it: if that
-	 * one has entered its own user namespace at the same fork (e.g. an
-	 * inner container of a docker with userns-remap), the namespace
-	 * is owned by the one of the parent task, and the pid can be set.
-	 * Otherwise (e.g. a process unshared into a user namespace below
-	 * the one of the container), it is owned by an ancestor one, and
-	 * the pid can not be set.
-	 */
-	{
-		struct pstree_item *creator = parent;
-
-		while (creator) {
-			if ((rsti(creator)->clone_flags & CLONE_NEWPID) && creator->ids &&
-			    creator->ids->pid_ns_id == parent->ids->pid_ns_id)
-				return !(rsti(creator)->clone_flags & CLONE_NEWUSER);
-			creator = creator->parent;
-		}
-	}
-
-	/* No creator of the pid namespace found below the root: the
-	 * namespace is the one of the restoring criu, owned by the root
-	 * user namespace, which the parent task is not in. */
-	return true;
-}
-
 static int populate_pid_proc(void)
 {
 	if (open_pid_proc(vpid(current)) < 0) {
-		/*
-		 * A task in a nested pid namespace might not be visible
-		 * by its vpid in the /proc of the mount namespace copy:
-		 * only the /proc/self one is used for the service fd.
-		 *
-		 * A task forked by a one living in a nested user namespace
-		 * is restored with a random pid, so its vpid is not in the
-		 * /proc either: only the /proc/self one is used as well.
-		 */
-		if (current->ids && root_item->ids &&
-		    (current->ids->pid_ns_id != root_item->ids->pid_ns_id ||
-		     child_pid_can_not_be_set(current))) {
+		if (nested_ns_pid_not_visible(current)) {
+			/*
+			 * A task in a nested pid namespace might not be visible
+			 * by its vpid in the /proc of the mount namespace copy,
+			 * or is restored with a random pid, as its parent can
+			 * not set it: only the /proc/self one is used.
+			 */
 			pr_debug("pid not visible in /proc, using /proc/self only\n");
 		} else {
 			pr_err("Can't open PROC_SELF\n");
@@ -1328,7 +1267,7 @@ static inline int fork_with_pid(struct pstree_item *item)
 
 	pr_info("Forking task with %d pid (flags 0x%lx)\n", pid, ca.clone_flags);
 
-	pid_not_set = child_pid_can_not_be_set(item);
+	pid_not_set = nested_ns_pid_can_not_be_set(item);
 	if (pid_not_set)
 		pr_warn("The pid of the task %d can not be set: it will be restored with a random one\n", pid);
 
@@ -1361,20 +1300,14 @@ static inline int fork_with_pid(struct pstree_item *item)
 		set_tid[0] = pid;
 		if (ca.clone_flags & CLONE_NEWPID) {
 			/*
-			 * The task is the init one of the new pid namespace. For
-			 * a task below the root one its pid in the namespace of
-			 * the forking task is kept as well, e.g. for a
-			 * docker-in-docker inner container which is tracked by
-			 * its pid by the inner containerd-shim. The root task
-			 * is forked from the criu one, so its pid can't be
-			 * specified in it.
-			 */
-			/*
 			 * The task is the init one of the new pid namespace,
-			 * unless it has entered the one of an inner
-			 * container at dump (e.g. a docker exec-ed process
-			 * of it): then it is restored with the pid it had
-			 * in it, the same one it sees itself at.
+			 * with the pid it had in it: the one it sees itself
+			 * at, which its own kin knows it by. For a task below
+			 * the root one its pid in the namespace of the forking
+			 * task is kept as well, e.g. for a docker-in-docker
+			 * inner container which is tracked by its pid by the
+			 * inner containerd-shim. The root task is forked from
+			 * the criu one, so its pid can't be specified in it.
 			 */
 			set_tid[0] = item->own_ns_pid ? item->own_ns_pid : INIT_PID;
 			if (item != root_item) {
@@ -1815,7 +1748,7 @@ static int __restore_task_with_children(void *_arg)
 		pid_t expected = current->own_ns_pid ? current->own_ns_pid : vpid(current);
 
 		if (expected != pid && !(rsti(current)->clone_flags & CLONE_NEWPID && pid == INIT_PID) &&
-		    !child_pid_can_not_be_set(current)) {
+		    !nested_ns_pid_can_not_be_set(current)) {
 			pr_err("Pid %d do not match expected %d\n", pid, expected);
 			set_task_cr_err(EEXIST);
 			goto err;

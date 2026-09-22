@@ -62,17 +62,17 @@ int prepare_utsns(int pid)
 	req[1].arg = ue->domainname;
 	req[1].type = CTL_STR(strlen(ue->domainname));
 
-	/*
-	 * A task entering a nested user namespace might not have the
-	 * permission to write the hostname and domainname sysctls,
-	 * which are owned by the parent user namespace. The hostname
-	 * of the inner containers is not critical for the restore.
-	 */
-	if (nested_ns_enabled()) {
-		pr_warn("Skipping the hostname restore for a nested uts namespace\n");
+	ret = sysctl_op(req, ARRAY_SIZE(req), CTL_WRITE, CLONE_NEWUTS);
+	if (ret && nested_ns_enabled()) {
+		/*
+		 * A task entering a nested user namespace might not have
+		 * the permission to write the hostname and domainname
+		 * sysctls, which are owned by the parent user namespace.
+		 * The hostname of the inner containers is not critical for
+		 * the restore.
+		 */
+		pr_warn("Can't restore the hostname of a nested uts namespace\n");
 		ret = 0;
-	} else {
-		ret = sysctl_op(req, ARRAY_SIZE(req), CTL_WRITE, CLONE_NEWUTS);
 	}
 	utsns_entry__free_unpacked(ue, NULL);
 out:

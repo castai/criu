@@ -94,6 +94,19 @@ int nested_ns_child_report(struct pstree_item *item);
 int nested_ns_child_wait(struct pstree_item *item);
 
 /*
+ * Whether the parent of the task can not set its pid: it lives in a
+ * nested user namespace which has no capabilities in the one owning
+ * the inherited pid namespace.
+ */
+bool nested_ns_pid_can_not_be_set(struct pstree_item *item);
+
+/*
+ * Whether the vpid of the task can not be used to open its /proc entry
+ * (see nested_ns_pid_can_not_be_set).
+ */
+bool nested_ns_pid_not_visible(struct pstree_item *item);
+
+/*
  * Child task: restore the content of the namespaces owned by our
  * nested user namespace (e.g. the hostname of our own uts one).
  */
