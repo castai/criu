@@ -1045,7 +1045,7 @@ int nested_ns_child_report(struct pstree_item *item)
 /*
  * The start time of a process, as it is recorded in its /proc stat:
  * the identifier of the boot of the running kernel, which the runtimes
- * (e.g. runc) use to tell a process from a re-used pid.
+ * (e.g. runc) use to tell a process from a reused pid.
  */
 static unsigned long nested_proc_starttime(const char *proc_root, pid_t pid)
 {
