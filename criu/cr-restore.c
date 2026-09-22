@@ -1572,7 +1572,7 @@ static void restore_pgid(void)
 	 * The pgid of a task in a nested pid namespace is set by the
 	 * fork, and its value in it differs from the root pid namespace.
 	 */
-	if (current->ids && root_item->ids &&
+	if (nested_ns_enabled() && current->ids && root_item->ids &&
 	    current->ids->pid_ns_id != root_item->ids->pid_ns_id)
 		return;
 
@@ -1606,7 +1606,7 @@ static void restore_pgid(void)
 	 * namespace: it is its own session and process group leader after
 	 * setsid(), and setpgid() on a session leader always fails.
 	 */
-	if (rsti(current)->clone_flags & CLONE_NEWPID)
+	if (nested_ns_enabled() && (rsti(current)->clone_flags & CLONE_NEWPID))
 		goto skip_setpgid;
 	if (setpgid(0, my_pgid) != 0) {
 		pr_perror("Can't restore pgid (%d/%d->%d)", vpid(current), pgid, current->pgid);
@@ -1617,7 +1617,7 @@ static void restore_pgid(void)
 		futex_set_and_wake(&rsti(current)->pgrp_set, 1);
 
 skip_setpgid:
-	if (rsti(current)->clone_flags & CLONE_NEWPID)
+	if (nested_ns_enabled() && (rsti(current)->clone_flags & CLONE_NEWPID))
 		futex_set_and_wake(&rsti(current)->pgrp_set, 1);
 }
 
@@ -1744,7 +1744,13 @@ static int __restore_task_with_children(void *_arg)
 	 * pid namespace is seen by its own kin at its own pid in it, not
 	 * by the one of the root namespace.
 	 */
-	{
+	if (!nested_ns_enabled()) {
+		if (vpid(current) != pid) {
+			pr_err("Pid %d do not match expected %d\n", pid, vpid(current));
+			set_task_cr_err(EEXIST);
+			goto err;
+		}
+	} else {
 		pid_t expected = current->own_ns_pid ? current->own_ns_pid : vpid(current);
 
 		if (expected != pid && !(rsti(current)->clone_flags & CLONE_NEWPID && pid == INIT_PID) &&

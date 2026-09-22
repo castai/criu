@@ -41,6 +41,7 @@
 #include "ptrace-compat.h"
 #include "util.h"
 #include "namespaces.h"
+#include "nested-ns.h"
 #include "image.h"
 #include "proc_parse.h"
 #include "parasite.h"
@@ -1529,7 +1530,7 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 		goto err_cure;
 	}
 
-	item->pid->ns[0].virt = pid_at_dump_level(pid, misc.pid);
+	item->pid->ns[0].virt = nested_ns_enabled() ? pid_at_dump_level(pid, misc.pid) : misc.pid;
 
 	mdc.pre_dump = true;
 	mdc.lazy = false;
@@ -1670,15 +1671,16 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
-	item->pid->ns[0].virt = pid_at_dump_level(pid, misc.pid);
+	item->pid->ns[0].virt = nested_ns_enabled() ? pid_at_dump_level(pid, misc.pid) : misc.pid;
 	pstree_insert_pid(item->pid);
 	/*
-	 * The sid and the pgid from the parasite are in the pid namespace
-	 * of the task. Translate them into the one of the root task, the
-	 * same way as the pid itself: the /proc/<pid>/stat ones are
-	 * already in the pid namespace of the reading process.
+	 * The sid and the pgid from the parasite are in the pid
+	 * namespace of the task. Translate them into the one of the
+	 * root task, the same way as the pid itself: the
+	 * /proc/<pid>/stat ones are already in the pid namespace
+	 * of the reading process.
 	 */
-	{
+	if (nested_ns_enabled()) {
 		int pgid, sid;
 
 		if (parse_pid_session(pid, &pgid, &sid)) {
@@ -1687,6 +1689,9 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		}
 		item->sid = sid;
 		item->pgid = pgid;
+	} else {
+		item->sid = misc.sid;
+		item->pgid = misc.pgid;
 	}
 
 	pr_info("sid=%d pgid=%d pid=%d\n", item->sid, item->pgid, vpid(item));
