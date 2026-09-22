@@ -1090,7 +1090,6 @@ static int send_fd_to_peer(int fd, struct fdinfo_list_entry *fle)
 			pr_debug("Sent fd %d to %d via fdstore id %d\n", fd, fle->pid, id);
 			return set_fds_event(fle->pid);
 		}
-		pr_err("SENDDBG: send_fds failed for pid %d, sock=%d, errno=%d\n", fle->pid, sock, errno);
 		return -1;
 	}
 	return set_fds_event(fle->pid);

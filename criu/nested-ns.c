@@ -793,6 +793,69 @@ int nested_ns_pin_roots(void)
  * (the init one, which has created the namespaces): forked from it,
  * it inherits all of them, the same way as at dump.
  */
+void nested_ns_fix_exec_pstree(void)
+{
+	struct pstree_item *item;
+
+	if (!nested_ns_enabled())
+		return;
+
+	for_each_pstree_item(item) {
+		struct pstree_item *parent = item->parent, *home;
+
+		if (!parent || !item->ids)
+			continue;
+
+		/* Zombies and helpers can have ids == 0 so we skip them */
+		while (parent && !parent->ids)
+			parent = parent->parent;
+		if (!parent)
+			continue;
+
+		/*
+		 * The task is in the namespaces of its parent: nothing
+		 * to fix, it inherits them with the fork.
+		 */
+		if (item->ids->pid_ns_id == parent->ids->pid_ns_id &&
+		    item->ids->mnt_ns_id == parent->ids->mnt_ns_id &&
+		    item->ids->user_ns_id == parent->ids->user_ns_id)
+			continue;
+
+		/*
+		 * Find the home for the task: the first one in its
+		 * mount namespace which is not a descendant of it (the
+		 * init one of the inner container, normally).
+		 */
+		home = NULL;
+		for_each_pstree_item(home) {
+			if (home == item || !home->ids || !home->parent)
+				continue;
+
+			if (home->ids->mnt_ns_id == item->ids->mnt_ns_id &&
+			    home->ids->pid_ns_id == item->ids->pid_ns_id &&
+			    home->ids->user_ns_id == item->ids->user_ns_id &&
+			    home->pid->state != TASK_DEAD) {
+				/* not a descendant of item */
+				struct pstree_item *p = home;
+
+				while (p && p != item)
+					p = p->parent;
+				if (!p)
+					break;
+			}
+		}
+		if (!home || !home->ids || home == item)
+			continue;
+
+		pr_info("Re-parenting the task %d from %d to %d: it has entered the namespaces of the one at dump\n",
+			vpid(item), vpid(parent), vpid(home));
+
+		list_del(&item->sibling);
+		item->parent = home;
+		list_add_tail(&item->sibling, &home->children);
+	}
+}
+
 void nested_ns_fix_exec_userns(void)
 {
 	struct pstree_item *item, *creator;
@@ -832,16 +895,7 @@ void nested_ns_fix_exec_userns(void)
 		}
 		if (creator && creator->ids && creator->ids->user_ns_id == item->ids->user_ns_id &&
 		    vpid(creator) < vpid(item)) {
-			/*
-			 * The task has entered the namespaces of the inner
-			 * container at dump, without creating them (e.g. a
-			 * docker exec-ed process of it): the ones owned by
-			 * its user namespace are joined the same way on
-			 * restore (see nested_ns_child_namespaces), so the
-			 * flags of them are stripped from the fork: it would
-			 * create fresh twin namespaces instead.
-			 */
-			rsti(item)->clone_flags &= ~(CLONE_NEWUSER | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWCGROUP);
+			rsti(item)->clone_flags &= ~CLONE_NEWUSER;
 		}
 	}
 }
@@ -853,65 +907,40 @@ void nested_ns_fix_exec_userns(void)
  * the user namespace of the restoring criu, from which the one of the
  * container is enterable.
  */
-/*
- * Find the creator of the nested user namespace of the task: the one
- * which has kept the CLONE_NEWUSER flag, i.e. which has created the
- * namespace at its fork.
- */
-static struct pstree_item *nested_ns_userns_creator(struct pstree_item *item)
-{
-	struct pstree_item *creator;
-
-	for_each_pstree_item(creator) {
-		if (creator->ids && creator->ids->user_ns_id == item->ids->user_ns_id &&
-		    (rsti(creator)->clone_flags & CLONE_NEWUSER) && creator->pid->real > 0)
-			return creator;
-	}
-	return NULL;
-}
-
-/*
- * Join a namespace of the creator of the nested user namespace of the
- * task: the uts, ipc, cgroup or network one of the inner container,
- * entered by the tasks which have entered the container at dump (see
- * nested_ns_fix_exec_userns).
- */
-static int nested_ns_join_ns(struct pstree_item *creator, struct ns_desc *nd)
-{
-	char path[64];
-	int dfd, fd;
-
-	dfd = get_service_fd(CR_PROC_FD_OFF);
-	if (dfd < 0) {
-		pr_err("Can't get criu proc fd\n");
-		return -1;
-	}
-
-	snprintf(path, sizeof(path), "%d/ns/%s", creator->pid->real, nd->name);
-	fd = openat(dfd, path, O_RDONLY);
-	if (fd < 0) {
-		pr_perror("Can't open %s", path);
-		return -1;
-	}
-
-	if (setns(fd, nd->cflag)) {
-		pr_perror("Can't join the %s namespace of %d", nd->name, creator->pid->real);
-		close(fd);
-		return -1;
-	}
-	close(fd);
-
-	return 0;
-}
-
 static int nested_ns_join_userns(struct pstree_item *item)
 {
 	struct pstree_item *creator;
 	char path[64];
 	int dfd, fd;
 
-	creator = nested_ns_userns_creator(item);
-	if (!creator) {
+	creator = item;
+	while (creator->parent) {
+		struct pstree_item *parent = creator->parent;
+
+		/* Zombies and helpers can have ids == 0 so we skip them */
+		while (parent && !parent->ids)
+			parent = parent->parent;
+		if (!parent)
+			break;
+
+		if (parent->ids->user_ns_id == item->ids->user_ns_id)
+			break;
+
+		/*
+		 * The nearest ancestor with the same user namespace... no:
+		 * find the FIRST task of the namespace, which has created it.
+		 */
+		break;
+	}
+
+	/* Find the creator: the task which has kept the CLONE_NEWUSER flag,
+	 * i.e. the one which has created the namespace at its fork. */
+	for_each_pstree_item(creator) {
+		if (creator->ids && creator->ids->user_ns_id == item->ids->user_ns_id &&
+		    (rsti(creator)->clone_flags & CLONE_NEWUSER) && creator->pid->real > 0)
+			break;
+	}
+	if (!creator || !creator->ids || creator->ids->user_ns_id != item->ids->user_ns_id) {
 		pr_err("Can't find the creator of the user namespace of %d\n", vpid(item));
 		return -1;
 	}
@@ -1386,44 +1415,9 @@ int nested_ns_child_namespaces(struct pstree_item *item)
 
 		if (parent && parent->ids && item->ids && root_item->ids &&
 		    item->ids->user_ns_id != parent->ids->user_ns_id &&
-		    item->ids->user_ns_id != root_item->ids->user_ns_id) {
-			/*
-			 * The task has entered the namespaces of the inner
-			 * container at dump (e.g. a docker exec-ed process
-			 * of it): join the uts, ipc and cgroup ones the same
-			 * way as the user one, so it is a member of them,
-			 * like at the dump time. The network one is entered
-			 * below.
-			 */
-			struct pstree_item *creator;
-
-			if (nested_ns_join_userns(item))
-				return -1;
-
-			creator = nested_ns_userns_creator(item);
-			if (!creator) {
-				pr_err("Can't find the creator of the user namespace of %d\n", vpid(item));
-				return -1;
-			}
-
-			if (rsti(item)->clone_flags & CLONE_NEWUTS) {
-				if (nested_ns_join_ns(creator, &uts_ns_desc))
-					return -1;
-			}
-			if (rsti(item)->clone_flags & CLONE_NEWIPC) {
-				if (nested_ns_join_ns(creator, &ipc_ns_desc))
-					return -1;
-			}
-			if (rsti(item)->clone_flags & CLONE_NEWCGROUP) {
-				if (nested_ns_join_ns(creator, &cgroup_ns_desc))
-					return -1;
-			}
-		}
-		/*
-		 * Fall through: the network namespace of the inner container
-		 * is entered by the task which has entered it at dump, the
-		 * same as by the one which has created it.
-		 */
+		    item->ids->user_ns_id != root_item->ids->user_ns_id)
+			return nested_ns_join_userns(item);
+		return 0;
 	}
 
 	if (rsti(item)->clone_flags & CLONE_NEWUTS) {
@@ -1643,163 +1637,6 @@ bool nested_ns_skip_mntns(struct pstree_item *item)
 	       item->ids->mnt_ns_id != root_item->ids->mnt_ns_id;
 }
 
-static struct mount_info *match_mi;
-static int match_found;
-
-static int uns_match_mountpoint(struct mount_info *mi)
-{
-	if (!strcmp(mi->ns_mountpoint, match_mi->ns_mountpoint) && mi->s_dev == match_mi->s_dev)
-		match_found = 1;
-
-	return 0;
-}
-
-/*
- * Whether the mount is inherited from the parent task: the mount
- * namespace of the task is a copy of the parent's one made at fork,
- * which keeps the mounts with the same mountpoint and device.
- */
-static bool mount_inherited(struct mount_info *mi, struct mount_info *parent_root)
-{
-	match_mi = mi;
-	match_found = 0;
-
-	if (parent_root)
-		mnt_tree_for_each(parent_root, uns_match_mountpoint);
-
-	return match_found;
-}
-
-static struct mount_info *parent_tree_root;
-
-/*
- * The uid= and gid= options of a mount are dumped in the view of
- * the user namespace of the dumping criu process, and are not
- * valid in the one of the new mount. Strip them: the mount is
- * done by the same user as the original one, so the ownership
- * of the mount is the same, and the ownership of the files is
- * restored from the image anyway.
- */
-static char *strip_id_options(char *options)
-{
-	char *res, *tok, *save, *p;
-	int len;
-
-	if (!options)
-		return NULL;
-
-	if (!strstr(options, "uid=") && !strstr(options, "gid="))
-		return options;
-
-	res = xmalloc(strlen(options) + 1);
-	if (!res)
-		return NULL;
-
-	p = res;
-	for (tok = strtok_r(options, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
-		if (!strncmp(tok, "uid=", 4) || !strncmp(tok, "gid=", 4))
-			continue;
-
-		len = strlen(tok);
-		if (p != res)
-			*p++ = ',';
-		memcpy(p, tok, len);
-		p += len;
-	}
-	*p = '\0';
-
-	return res;
-}
-
-/*
- * Restore the content of a tmpfs of the nested user namespace. The
- * ownership in the tarball is expressed in the view of the user
- * namespace the dump has run in, which is not ours, so it is not
- * restored: we are the one who has mounted this file system, so the
- * files get the right owner.
- */
-static int __maybe_unused uns_restore_tmpfs_content(struct mount_info *mi)
-{
-	struct cr_img *img;
-	int ret;
-
-	img = open_image(CR_FD_TMPFS_DEV, O_RSTR, mi->s_dev);
-	if (empty_image(img)) {
-		close_image(img);
-		img = open_image(CR_FD_TMPFS_IMG, O_RSTR, mi->mnt_id);
-	}
-	if (!img)
-		return -1;
-	if (empty_image(img)) {
-		close_image(img);
-		return -1;
-	}
-
-	ret = cr_system(img_raw_fd(img), -1, -1, "tar",
-			(char *[]){ "tar", "--extract", "--gzip", "--no-unquote", "--no-wildcards",
-				    "--no-same-owner", "--directory", mi->ns_mountpoint, NULL },
-			0);
-	close_image(img);
-
-	if (ret) {
-		pr_err("Can't restore tmpfs content\n");
-		return -1;
-	}
-
-	return 0;
-}
-
-static int uns_mount_one(struct mount_info *mi)
-{
-	/*
-	 * Only the root filesystem of the nested mount namespace is
-	 * considered: the task is born in a copy of the parent's mount
-	 * tree, and the mountpoints from the nested image are relative
-	 * to the nested root filesystem, which is not the same as the
-	 * parent's one. The rest of the mounts of the nested mount
-	 * namespace are skipped: they are the ones of an inner
-	 * container, and the inner container runtime (e.g. docker)
-	 * re-creates them when it runs its containers.
-	 */
-	if (strcmp(mi->ns_mountpoint, "/") != 0)
-		return 0;
-
-	/*
-	 * The root mount of the nested mount namespace can be the one
-	 * inherited from the parent (e.g. the outer container rootfs,
-	 * which is already in the copy of the parent's tree), in
-	 * which case there is nothing to mount.
-	 */
-	if (mount_inherited(mi, parent_tree_root))
-		return 0;
-
-	{
-		char *opts = strip_id_options(mi->options);
-		char *src = mi->source[0] ? mi->source : "none";
-
-		if (mount(src, "/", "overlay", mi->sb_flags, opts) < 0) {
-			pr_perror("Can't mount overlay at / (src=%s opts=%s)", src, opts);
-			return -1;
-		}
-	}
-
-	return 0;
-}
-
-static int uns_mount_err;
-
-static int __maybe_unused uns_mount_tree(struct mount_info *mi)
-{
-	if (uns_mount_one(mi)) {
-		uns_mount_err = -1;
-		return -1;
-	}
-
-	return 0;
-}
-
-/* Set in the task that was born into a nested mount namespace */
-static bool nested_child_mntns;
 
 /*
  * Whether this task, living in a nested user namespace, has to take
@@ -1945,7 +1782,6 @@ int nested_ns_child_mntns(struct pstree_item *item)
 	 * of its children. In that case only the /proc/self entry is
 	 * pre-installed, as the one of the pid doesn't exist.
 	 */
-	nested_child_mntns = true;
 
 	fd = open_pid_proc(vpid(item));
 	if (fd < 0)
@@ -2224,7 +2060,6 @@ int nested_ns_child_mntns(struct pstree_item *item)
 				}
 				break;
 			}
-				break;
 			default:
 				/*
 				 * The other mounts (bind mounts of the

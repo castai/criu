@@ -500,10 +500,6 @@ void pstree_insert_pid(struct pid *pid_node)
 
 	n = lookup_create_pid(pid_node->ns[0].virt, pid_node);
 
-	if (n != pid_node)
-		pr_err("Duplicate vpid %d: new real %d vs existing real %d\n", pid_node->ns[0].virt,
-		       pid_node->real, n->real);
-
 	BUG_ON(n != pid_node);
 }
 
@@ -1083,6 +1079,15 @@ int prepare_pstree(void)
 	}
 
 	pid = getpid();
+
+	/*
+	 * Re-parent the tasks which have entered the namespaces of an
+	 * inner container (e.g. the docker exec-ed ones) under the init
+	 * one of it, before the clone flags are derived from the parent
+	 * relationships, so they are forked from it and inherit the
+	 * namespaces instead of creating their own copies of them.
+	 */
+	nested_ns_fix_exec_pstree();
 
 	if (!ret)
 		/*

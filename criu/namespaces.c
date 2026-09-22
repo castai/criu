@@ -360,9 +360,6 @@ static struct ns_id *rst_new_ns_id(unsigned int id, pid_t pid, struct ns_desc *n
 			INIT_LIST_HEAD(&nsid->net.ids);
 			INIT_LIST_HEAD(&nsid->net.links);
 			nsid->net.netns = NULL;
-			/* The fdstore id is only assigned when the namespace is
-			 * created or pinned: it starts as unset. */
-			nsid->net.nsfd_id = -1;
 		}
 	}
 
