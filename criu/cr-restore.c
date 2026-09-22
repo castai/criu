@@ -24,6 +24,7 @@
 #include "common/compiler.h"
 
 #include "linux/rseq.h"
+#include "asm/thread_pointer.h"
 
 #ifdef __has_include
 #if __has_include("sys/rseq.h")
