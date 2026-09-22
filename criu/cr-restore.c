@@ -24,6 +24,7 @@
 #include "common/compiler.h"
 
 #include "linux/rseq.h"
+#include "asm/thread_pointer.h"
 
 #include "clone-noasan.h"
 #include "cr_options.h"
