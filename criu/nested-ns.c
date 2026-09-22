@@ -1388,6 +1388,79 @@ static int nested_restore_tmpfs_content(struct mount_info *mi)
 }
 
 /*
+ * A task living in a nested user namespace has no capabilities in the
+ * user namespace owning the inherited pid namespace, so it can not set
+ * the pid of a child forked into it: the kernel fails clone3() with
+ * set_tid, and the write into ns_last_pid with EPERM. Such a child is
+ * restored with a random pid, and the tasks waiting for the original
+ * one get an ECHILD error from wait*(), like if it had died.
+ */
+bool nested_ns_pid_can_not_be_set(struct pstree_item *item)
+{
+	struct pstree_item *parent = item->parent;
+
+	/* The pid is always set in the new pid namespace of the child. */
+	if (rsti(item)->clone_flags & CLONE_NEWPID)
+		return false;
+
+	/* Zombies and helpers can have ids == 0 so we skip them */
+	while (parent && !parent->ids)
+		parent = parent->parent;
+
+	/*
+	 * The parent task is in the root user namespace: it has the
+	 * capabilities of the restoring criu, so it can set the pid.
+	 */
+	if (!parent || parent->ids->user_ns_id == root_ids->user_ns_id)
+		return false;
+
+	/*
+	 * The pid of the child is set in the pid namespace of the parent
+	 * one, so the parent needs CAP_CHECKPOINT_RESTORE in the user
+	 * namespace owning it. The one owning the pid namespace of the
+	 * parent task is the one of the task which has created it: if that
+	 * one has entered its own user namespace at the same fork (e.g. an
+	 * inner container of a docker with userns-remap), the namespace
+	 * is owned by the one of the parent task, and the pid can be set.
+	 * Otherwise (e.g. a process unshared into a user namespace below
+	 * the one of the container), it is owned by an ancestor one, and
+	 * the pid can not be set.
+	 */
+	{
+		struct pstree_item *creator = parent;
+
+		while (creator) {
+			if ((rsti(creator)->clone_flags & CLONE_NEWPID) && creator->ids &&
+			    creator->ids->pid_ns_id == parent->ids->pid_ns_id)
+				return !(rsti(creator)->clone_flags & CLONE_NEWUSER);
+			creator = creator->parent;
+		}
+	}
+
+	/* No creator of the pid namespace found below the root: the
+	 * namespace is the one of the restoring criu, owned by the root
+	 * user namespace, which the parent task is not in. */
+	return true;
+}
+
+/*
+ * Whether the vpid of the task can not be used to open its /proc entry:
+ * a task in a nested pid namespace is not visible by its vpid in the
+ * /proc of the mount namespace copy, and a task forked by a one living
+ * in a nested user namespace is restored with a random pid, as its
+ * parent can not set it. Only the /proc/self one is usable then.
+ */
+bool nested_ns_pid_not_visible(struct pstree_item *item)
+{
+	if (!nested_ns_enabled())
+		return false;
+
+	return item->ids && root_item->ids &&
+	       (item->ids->pid_ns_id != root_item->ids->pid_ns_id ||
+		nested_ns_pid_can_not_be_set(item));
+}
+
+/*
  * Restore the content of the namespaces owned by the nested user
  * namespace of this task: they are created empty at fork and are
  * filled in from their images here.
