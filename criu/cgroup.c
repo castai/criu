@@ -13,6 +13,7 @@
 #include "common/list.h"
 #include "xmalloc.h"
 #include "cgroup.h"
+#include "nested-ns.h"
 #include "cgroup-props.h"
 #include "cr_options.h"
 #include "pstree.h"
@@ -1310,7 +1311,7 @@ int restore_task_cgroup(struct pstree_item *me)
 	 * container anyway, and the nested user namespace doesn't have
 	 * the permissions to move into a cgroup of the parent one.
 	 */
-	if (rsti(me)->clone_flags & CLONE_NEWUSER)
+	if (nested_ns_enabled() && (rsti(me)->clone_flags & CLONE_NEWUSER))
 		return 0;
 
 	/* Zombies and helpers can have cg_set == 0 so we skip them */
