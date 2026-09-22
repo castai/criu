@@ -346,7 +346,7 @@ static void nsid_add(struct ns_id *ns, struct ns_desc *nd, unsigned int id, pid_
 	pr_info("Add %s ns %d pid %d\n", nd->str, ns->id, ns->ns_pid);
 }
 
-static struct ns_id *rst_new_ns_id(unsigned int id, pid_t pid, struct ns_desc *nd, enum ns_type type)
+static struct ns_id *rst_new_ns_id(unsigned int id, pid_t pid, struct ns_desc *nd, enum criu_ns_type type)
 {
 	struct ns_id *nsid;
 
@@ -450,7 +450,7 @@ int walk_namespaces(struct ns_desc *nd, int (*cb)(struct ns_id *, void *), void 
 static unsigned int generate_ns_id(int pid, unsigned int kid, struct ns_desc *nd, struct ns_id **ns_ret)
 {
 	struct ns_id *nsid;
-	enum ns_type type;
+	enum criu_ns_type type;
 
 	nsid = lookup_ns_by_kid(kid, nd);
 	if (nsid)
