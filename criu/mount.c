@@ -1928,10 +1928,9 @@ static int dump_mnt_ns(struct ns_id *ns, struct mount_info *pms)
 	if (!img)
 		goto err;
 
-	for (pm = pms; pm && pm->nsid == ns; pm = pm->next) {
+	for (pm = pms; pm && pm->nsid == ns; pm = pm->next)
 		if (dump_one_mountpoint(pm, img))
 			goto err_i;
-	}
 
 	ret = 0;
 err_i:

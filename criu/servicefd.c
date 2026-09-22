@@ -29,11 +29,6 @@ static int service_fd_base;
 /* Id of current process in shared fdt */
 static int service_fd_id = 0;
 
-bool sfds_protected_get(void)
-{
-	return sfds_protected;
-}
-
 static DECLARE_BITMAP(sfd_map, SERVICE_FD_MAX);
 static int sfd_arr[SERVICE_FD_MAX];
 /*

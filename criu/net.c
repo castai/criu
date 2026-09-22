@@ -36,7 +36,6 @@
 #include "net.h"
 #include "net-clm-conntrack.h"
 #include "libnetlink.h"
-#include "common/asm/atomic.h"
 #include "cr_options.h"
 #include "sk-inet.h"
 #include "tun.h"
@@ -1978,7 +1977,6 @@ static int restore_links(void)
 	return 0;
 }
 
-
 static int run_ip_tool(char *arg1, char *arg2, char *arg3, char *arg4, int fdin, int fdout, unsigned flags)
 {
 	char *ip_tool_cmd;
@@ -3054,65 +3052,9 @@ static int prepare_net_ns_second_stage(struct ns_id *ns)
  * the root task are owned by its user namespace, which the tasks
  * below can not enter.
  */
-/*
- * The states of the creation of a nested network namespace, kept in
- * its shared nsfd_id: not started, being created by one of the tasks
- * of the tree (the others wait for it), and done (the fdstore id of
- * the pinned one).
- */
-#define NETNS_CREATING (-2)
-
-static int nested_ns_enter(struct ns_id *nsid)
-{
-	int fd = fdstore_get(nsid->net.nsfd_id);
-
-	if (fd < 0)
-		return -1;
-	if (setns(fd, CLONE_NEWNET)) {
-		/*
-		 * Entering the namespace needs CAP_SYS_ADMIN in the user
-		 * one owning it: a task which was forked into its own copy
-		 * of the user namespace of the container (e.g. a docker
-		 * exec-ed one) is in a sibling of it, and can not enter.
-		 * It stays in the fresh network namespace of its fork,
-		 * which is enough for the ones not using the network of
-		 * the container (e.g. with the TCP connections closed).
-		 */
-		pr_warn("Can't enter the nested netns: staying in the fork one\n");
-		close(fd);
-		return 0;
-	}
-	close(fd);
-	return 0;
-}
-
 int nested_ns_child_netns(struct ns_id *nsid)
 {
 	int fd;
-
-	while (nsid->net.nsfd_id == NETNS_CREATING)
-		/* The namespace is being created by another task: the
-		 * fdstore id of it appears when it is filled in. */
-		usleep(10000);
-
-	if (nsid->net.nsfd_id >= 0)
-		return nested_ns_enter(nsid);
-
-	/*
-	 * Only one task of the tree creates the namespace and fills it
-	 * in from the image, the same way as the root one does it for
-	 * the regular ones: the others enter the created one. The state
-	 * is claimed with a compare-and-swap, so that the tasks forking
-	 * concurrently see at most one creator.
-	 */
-	if (atomic_cmpxchg((atomic_t *)&nsid->net.nsfd_id, -1, NETNS_CREATING) != -1) {
-		while (nsid->net.nsfd_id == NETNS_CREATING)
-			usleep(10000);
-		if (nsid->net.nsfd_id >= 0)
-			return nested_ns_enter(nsid);
-		pr_err("The nested netns %u was not created\n", nsid->id);
-		return -1;
-	}
 
 	if (unshare(CLONE_NEWNET)) {
 		pr_perror("Can't unshare net namespace");

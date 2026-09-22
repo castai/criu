@@ -109,6 +109,14 @@ struct CoreEntry;
 int nested_ns_fix_task_creds(struct pstree_item *item, struct CoreEntry *core);
 
 /*
+ * Re-parent the tasks which have entered the namespaces of an inner
+ * container (e.g. the docker exec-ed ones) under the init one of it,
+ * before the clone flags are derived, so they are forked from it and
+ * inherit the namespaces instead of creating their own copies of them.
+ */
+void nested_ns_fix_exec_pstree(void);
+
+/*
  * Strip the CLONE_NEWUSER flag from the tasks which have entered a nested
  * user namespace without creating it, so they are forked without it and
  * join the one of the creator (see nested_ns_child_namespaces).
