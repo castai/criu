@@ -2015,7 +2015,7 @@ int nested_ns_child_mntns(struct pstree_item *item)
 
 			bind_fds[n_bind_fds] = open(source, O_PATH | O_CLOEXEC);
 			if (bind_fds[n_bind_fds] < 0) {
-				pr_perror("Can't open the source %s of the bind mount %s\n",
+				pr_perror("Can't open the source %s of the bind mount %s",
 					  source, mi->ns_mountpoint);
 				continue;
 			}
@@ -2174,7 +2174,7 @@ int nested_ns_child_mntns(struct pstree_item *item)
 			snprintf(target, sizeof(target), "%s", mi->ns_mountpoint);
 
 			if (fstat(bind_fds[bi], &st) < 0) {
-				pr_perror("Can't stat the source of the bind mount %s\n", target);
+				pr_perror("Can't stat the source of the bind mount %s", target);
 				close(bind_fds[bi]);
 				continue;
 			}
