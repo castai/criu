@@ -177,16 +177,21 @@ static int dump_nested_userns(struct ns_id *ns)
 
 	img = open_image(CR_FD_USERNS, O_DUMP, ns->id);
 	if (!img)
-		return -1;
+		goto err;
+
 	ret = pb_write_one(img, &e, PB_USERNS);
 	close_image(img);
 	if (ret < 0)
-		return -1;
+		goto err;
 
 	free_map_exts(e.uid_map, e.n_uid_map);
 	free_map_exts(e.gid_map, e.n_gid_map);
 
 	return 0;
+err:
+	free_map_exts(e.uid_map, e.n_uid_map);
+	free_map_exts(e.gid_map, e.n_gid_map);
+	return -1;
 }
 
 int nested_ns_collect_user_namespaces(void)
@@ -602,7 +607,7 @@ err:
 static int write_child_userns_maps(struct pstree_item *item, pid_t real_pid)
 {
 	struct cr_img *img;
-	UsernsEntry *e;
+	UsernsEntry *e, *pe = NULL;
 	int ret;
 
 	img = open_image(CR_FD_USERNS, O_RSTR, item->ids->user_ns_id);
@@ -628,30 +633,52 @@ static int write_child_userns_maps(struct pstree_item *item, pid_t real_pid)
 
 		if (parent && parent->ids->user_ns_id != root_ids->user_ns_id) {
 			struct cr_img *pimg;
-			UsernsEntry *pe;
 			int pret;
 
 			pimg = open_image(CR_FD_USERNS, O_RSTR, parent->ids->user_ns_id);
 			if (!pimg)
-				return -1;
+				goto err;
 			pret = pb_read_one(pimg, &pe, PB_USERNS);
 			close_image(pimg);
 			if (pret < 0)
-				return -1;
+				goto err;
 
 			if (translate_lower_ids(e->uid_map, e->n_uid_map, pe->uid_map, pe->n_uid_map))
-				return -1;
+				goto err_free_pe;
 
 			if (translate_lower_ids(e->gid_map, e->n_gid_map, pe->gid_map, pe->n_gid_map))
-				return -1;
+				goto err_free_pe;
+
+			userns_entry__free_unpacked(pe, NULL);
 		}
 	}
 
 	if (write_id_map_crfd(real_pid, e->uid_map, e->n_uid_map, "uid_map"))
-		return -1;
+		goto err;
 
 	if (write_id_map_crfd(real_pid, e->gid_map, e->n_gid_map, "gid_map"))
-		return -1;
+		goto err;
+
+	userns_entry__free_unpacked(e, NULL);
+	return 0;
+
+err_free_pe:
+	userns_entry__free_unpacked(pe, NULL);
+err:
+	if (pe)
+		userns_entry__free_unpacked(pe, NULL);
+	userns_entry__free_unpacked(e, NULL);
+	return -1;
+}
+
+static int chmod_images_cb(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf)
+{
+	mode_t mode = sb->st_mode & ~S_IFMT;
+
+	if (!(mode & S_IRUSR) || !(mode & S_IRGRP) || !(mode & S_IROTH)) {
+		if (chmod(fpath, mode | S_IRUSR | S_IRGRP | S_IROTH))
+			pr_warn("Can't make the image file %s readable\n", fpath);
+	}
 
 	return 0;
 }
@@ -661,18 +688,16 @@ static int nested_ns_chmod_images(void)
 	/*
 	 * The checkpoint image files are owned by root, and the task
 	 * entering a nested user namespace runs as the remapped user
-	 * on the node, so it can't read them. Make them readable.
+	 * on the node, so it can't read them. Make them readable,
+	 * walking the directory instead of running a shell command
+	 * over the path of it.
 	 */
-	char cmd[PATH_MAX];
-	char *dir = opts.imgs_dir;
-
-	if (!dir)
+	if (!opts.imgs_dir)
 		return 0;
 
-	snprintf(cmd, sizeof(cmd), "chmod -R a+r '%s'", dir);
-	if (system(cmd)) {
+	if (nftw(opts.imgs_dir, chmod_images_cb, 12, FTW_PHYS) < 0)
 		pr_warn("Can't make the image directory readable\n");
-	}
+
 	return 0;
 }
 
@@ -913,26 +938,6 @@ static int nested_ns_join_userns(struct pstree_item *item)
 	char path[64];
 	int dfd, fd;
 
-	creator = item;
-	while (creator->parent) {
-		struct pstree_item *parent = creator->parent;
-
-		/* Zombies and helpers can have ids == 0 so we skip them */
-		while (parent && !parent->ids)
-			parent = parent->parent;
-		if (!parent)
-			break;
-
-		if (parent->ids->user_ns_id == item->ids->user_ns_id)
-			break;
-
-		/*
-		 * The nearest ancestor with the same user namespace... no:
-		 * find the FIRST task of the namespace, which has created it.
-		 */
-		break;
-	}
-
 	/* Find the creator: the task which has kept the CLONE_NEWUSER flag,
 	 * i.e. the one which has created the namespace at its fork. */
 	for_each_pstree_item(creator) {
@@ -1082,8 +1087,16 @@ static int nested_patch_state_json(const char *proc_root, const char *path)
 	fd = open(path, O_RDWR);
 	if (fd < 0)
 		return 0;
-	n = read(fd, buf, sizeof(buf) - 1);
+	do {
+		n = read(fd, buf, sizeof(buf) - 1);
+	} while (n < 0 && errno == EINTR);
 	if (n <= 0) {
+		close(fd);
+		return 0;
+	}
+	if (n == sizeof(buf) - 1) {
+		/* The state file is too large for the buffer: leave it as it is. */
+		pr_warn("The runtime state file %s is too large\n", path);
 		close(fd);
 		return 0;
 	}
@@ -1302,7 +1315,7 @@ static int nested_fix_tmpfs_ownership(struct cr_img *img, const char *root)
 			/* The GNU long name of the next entry: read it. */
 			size_t rd = size < sizeof(lname) - 1 ? size : sizeof(lname) - 1;
 
-			if (read(ifd, lname, rd) < 0)
+			if (read(ifd, lname, rd) != rd)
 				break;
 			lname[rd] = '\0';
 			lseek(ifd, round_up(size, 512) - rd, SEEK_CUR);

@@ -4011,11 +4011,13 @@ static int collect_mntns(struct ns_id *ns, void *__arg)
 	if (arg->for_dump && ns->type != NS_CRIU)
 		arg->need_to_validate = true;
 
-	if (arg->for_dump && nested_ns_enabled()) {
+	if (arg->for_dump && nested_ns_enabled() && ns->type == NS_OTHER) {
 		/*
 		 * The sharing of the mounts can span the nested mount
 		 * namespaces of the inner containers of a nested container
-		 * runtime (e.g. docker-in-docker), and it can't be restored.
+		 * runtime (e.g. docker-in-docker), and it can't be restored:
+		 * drop it for the nested ones, keeping the one of the root
+		 * task intact.
 		 */
 		struct mount_info *mi;
 
