@@ -6,6 +6,7 @@
 #include "imgset.h"
 #include "files.h"
 #include "sockets.h"
+#include "nested-ns.h"
 #include "util.h"
 
 #include "protobuf.h"
@@ -73,12 +74,22 @@ static bool can_dump_netlink_sk(int lfd)
 	int ret;
 
 	ret = fd_has_data(lfd);
-	if (ret < 0)
-		return false;
-	if (ret == 1)
-		pr_warn("The socket has data to read. It will be dropped on restore\n");
 
-	return true;
+	if (nested_ns_enabled()) {
+		/*
+		 * The netlink sockets of the daemons of a nested container
+		 * runtime (e.g. a docker-in-docker) may hold the events of
+		 * the ones running in another network namespace: the data
+		 * is dropped on restore, like on a live one.
+		 */
+		if (ret < 0)
+			return false;
+		if (ret == 1)
+			pr_warn("The socket has data to read. It will be dropped on restore\n");
+		return true;
+	}
+
+	return ret == 0;
 }
 
 static int dump_one_netlink_fd(int lfd, u32 id, const struct fd_parms *p)

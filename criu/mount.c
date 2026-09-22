@@ -2262,15 +2262,18 @@ static int userns_mount(char *src, void *args, int fd, pid_t pid)
 	snprintf(target, sizeof(target), "/proc/self/fd/%d", fd);
 
 	if (pid != getpid() && switch_ns(pid, &mnt_ns_desc, &rst)) {
-		/*
-		 * The mount namespace of the task is owned by a user
-		 * namespace which the calling one is not an ancestor of
-		 * (e.g. a task forked into its own copy of it): the mounts
-		 * of the namespace are set up by the task itself, so the
-		 * one asked for here is skipped.
-		 */
-		pr_warn("Can't switch to the mount namespace of %d: the mount is skipped\n", pid);
-		return 0;
+		if (nested_ns_enabled()) {
+			/*
+			 * The mount namespace of the task is owned by a user
+			 * namespace which the calling one is not an ancestor of
+			 * (e.g. a task forked into its own copy of it): the
+			 * mounts of the namespace are set up by the task
+			 * itself, so the one asked for here is skipped.
+			 */
+			pr_warn("Can't switch to the mount namespace of %d: the mount is skipped\n", pid);
+			return 0;
+		}
+		return -1;
 	}
 
 	err = mount(src, target, NULL, flags, NULL);
