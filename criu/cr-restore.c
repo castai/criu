@@ -1369,7 +1369,14 @@ static inline int fork_with_pid(struct pstree_item *item)
 			 * is forked from the criu one, so its pid can't be
 			 * specified in it.
 			 */
-			set_tid[0] = INIT_PID;
+			/*
+			 * The task is the init one of the new pid namespace,
+			 * unless it has entered the one of an inner
+			 * container at dump (e.g. a docker exec-ed process
+			 * of it): then it is restored with the pid it had
+			 * in it, the same one it sees itself at.
+			 */
+			set_tid[0] = item->own_ns_pid ? item->own_ns_pid : INIT_PID;
 			if (item != root_item) {
 				set_tid[1] = pid;
 				set_tid_size = 2;

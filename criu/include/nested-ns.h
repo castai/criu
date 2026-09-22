@@ -122,13 +122,6 @@ void nested_ns_fix_exec_userns(void);
 void nested_ns_patch_runc_states(void);
 
 /*
- * Re-parent the tasks which have entered the namespaces of an inner
- * container under the init one of it, so they inherit the namespaces
- * with the fork instead of creating their own copies.
- */
-void nested_ns_fix_exec_pstree(void);
-
-/*
  * Child task: wake up the parent, as we are dying before the maps of
  * our user namespace are written.
  */
