@@ -1084,15 +1084,6 @@ int prepare_pstree(void)
 
 	pid = getpid();
 
-	/*
-	 * Re-parent the tasks which have entered the namespaces of an
-	 * inner container (e.g. the docker exec-ed ones) under the init
-	 * one of it, before the clone flags are derived from the parent
-	 * relationships, so they are forked from it and inherit the
-	 * namespaces instead of creating their own copies of them.
-	 */
-	nested_ns_fix_exec_pstree();
-
 	if (!ret)
 		/*
 		 * Shell job may inherit sid/pgid from the current
