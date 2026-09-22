@@ -55,6 +55,22 @@ const char *test_author = "CAST AI";
  * namespace): the files of the test live on the regular filesystem,
  * the tmpfs of the child stays empty and is restored as a fresh one.
  */
+/*
+ * The namespace file descriptors of B, opened by the child living in
+ * it (the ones of its own namespaces and of the worker) and passed to
+ * the root one over a socketpair: the entering forking task, which
+ * lives in the parent user namespace, may not be allowed to open the
+ * ones of the tasks of B itself.
+ */
+static int join_ns_fd[5];
+static int ns_sock[2];
+
+#define NSFD_USER 0
+#define NSFD_UTS 1
+#define NSFD_MNT 2
+#define NSFD_NET 3
+#define NSFD_PID 4
+
 #define MARKER_FILE "userns_nested.dat"
 #define MARKER_DATA "userns_nested"
 #define WORKER_FILE "nested-worker-file"
@@ -233,29 +249,6 @@ static int check_task_in_nested_userns(int pid)
 		pr_err("Task %d is in the same user namespace as the root task\n", pid);
 		return -1;
 	}
-
-	return 0;
-}
-
-static int join_ns_of(int pid, const char *name, int cflag)
-{
-	char path[64];
-	int fd;
-
-	snprintf(path, sizeof(path), "/proc/%d/ns/%s", pid, name);
-
-	fd = open(path, O_RDONLY);
-	if (fd < 0) {
-		pr_perror("Can't open %s", path);
-		return -1;
-	}
-
-	if (setns(fd, cflag)) {
-		pr_perror("Can't setns %s", path);
-		close(fd);
-		return -1;
-	}
-	close(fd);
 
 	return 0;
 }
@@ -569,6 +562,53 @@ static int nested_child(void)
 	/* The pid of the worker in the root pid namespace, for setns() */
 	sh->worker_pid = worker;
 
+	/*
+	 * Pass the namespaces of ours to the root task: our own ones and
+	 * the pid namespace of the worker, the one we have created and it
+	 * lives in. The entering forking task of the root one may not be
+	 * allowed to open the ones of our tasks.
+	 */
+	{
+		int ns_fds[5];
+		struct msghdr msg = {};
+		int dummy = 0;
+		struct iovec iov = { &dummy, sizeof(dummy) };
+		char cmsgbuf[CMSG_SPACE(sizeof(ns_fds))];
+		struct cmsghdr *cmsg;
+		char path[64];
+		int i;
+
+		ns_fds[NSFD_USER] = open("/proc/self/ns/user", O_RDONLY);
+		ns_fds[NSFD_UTS] = open("/proc/self/ns/uts", O_RDONLY);
+		ns_fds[NSFD_MNT] = open("/proc/self/ns/mnt", O_RDONLY);
+		ns_fds[NSFD_NET] = open("/proc/self/ns/net", O_RDONLY);
+		snprintf(path, sizeof(path), "/proc/%d/ns/pid", worker);
+		ns_fds[NSFD_PID] = open(path, O_RDONLY);
+
+		for (i = 0; i < 5; i++) {
+			if (ns_fds[i] < 0) {
+				pr_perror("Can't open the namespace file %d", i);
+				goto err;
+			}
+		}
+
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
+		msg.msg_control = cmsgbuf;
+		msg.msg_controllen = sizeof(cmsgbuf);
+		cmsg = CMSG_FIRSTHDR(&msg);
+		cmsg->cmsg_level = SOL_SOCKET;
+		cmsg->cmsg_type = SCM_RIGHTS;
+		cmsg->cmsg_len = CMSG_LEN(sizeof(ns_fds));
+		memcpy(CMSG_DATA(cmsg), ns_fds, sizeof(ns_fds));
+
+		if (sendmsg(ns_sock[1], &msg, 0) != sizeof(dummy)) {
+			pr_perror("Can't send the namespace file descriptors");
+			goto err;
+		}
+		close(ns_sock[1]);
+	}
+
 	futex_set_and_wake(&sh->fstate, TEST_READY);
 	futex_wait_until(&sh->fstate, TEST_CHECK);
 
@@ -636,18 +676,18 @@ static int enterer_task(void);
 static int enterer_mid(void)
 {
 	pid_t enterer;
+	int i;
 
 	/* The user namespace of B first, then the ones owned by it */
-	if (join_ns_of(sh->worker_pid, "user", CLONE_NEWUSER))
-		return -1;
-	if (join_ns_of(sh->worker_pid, "uts", CLONE_NEWUTS))
-		return -1;
-	if (join_ns_of(sh->worker_pid, "mnt", CLONE_NEWNS))
-		return -1;
-	if (join_ns_of(sh->worker_pid, "net", CLONE_NEWNET))
-		return -1;
-	if (join_ns_of(sh->worker_pid, "pid", CLONE_NEWPID))
-		return -1;
+	for (i = 0; i < 5; i++) {
+		static const int cflags[5] = { CLONE_NEWUSER, CLONE_NEWUTS, CLONE_NEWNS,
+					       CLONE_NEWNET, CLONE_NEWPID };
+
+		if (setns(join_ns_fd[i], cflags[i])) {
+			pr_perror("Can't join the namespace fd %d", i);
+			return -1;
+		}
+	}
 
 	enterer = fork();
 	if (enterer < 0) {
@@ -754,13 +794,20 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, ns_sock)) {
+		pr_perror("Can't create the namespace socketpair");
+		exit(1);
+	}
+
 	pid = fork();
 	if (pid < 0) {
 		pr_perror("Can't fork");
 		exit(1);
 	} else if (pid == 0) {
+		close(ns_sock[0]);
 		exit(nested_child() ? 1 : 0);
 	}
+	close(ns_sock[1]);
 
 	futex_wait_while_lt(&sh->fstate, TEST_UNSHARED);
 
@@ -788,6 +835,31 @@ int main(int argc, char **argv)
 
 	futex_set_and_wake(&sh->fstate, TEST_MAPPED);
 	futex_wait_while_lt(&sh->fstate, TEST_READY);
+
+	/* Take the namespaces of B over from the child */
+	{
+		struct msghdr msg = {};
+		int dummy;
+		struct iovec iov = { &dummy, sizeof(dummy) };
+		char cmsgbuf[CMSG_SPACE(sizeof(join_ns_fd))];
+		struct cmsghdr *cmsg;
+
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
+		msg.msg_control = cmsgbuf;
+		msg.msg_controllen = sizeof(cmsgbuf);
+		if (recvmsg(ns_sock[0], &msg, 0) < 0) {
+			fail("Can't receive the namespace file descriptors");
+			exit(1);
+		}
+		cmsg = CMSG_FIRSTHDR(&msg);
+		if (!cmsg || cmsg->cmsg_len != CMSG_LEN(sizeof(join_ns_fd))) {
+			fail("Bad namespace file descriptors message");
+			exit(1);
+		}
+		memcpy(join_ns_fd, CMSG_DATA(cmsg), sizeof(join_ns_fd));
+		close(ns_sock[0]);
+	}
 
 	/* Check we really have a nested user namespace before C/R */
 	if (check_task_in_nested_userns(pid)) {

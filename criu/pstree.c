@@ -331,7 +331,7 @@ int dump_pstree(struct pstree_item *root_item)
 		 * lives with. Record it, so the restore forks it with the
 		 * pid at the level of its parent as well.
 		 */
-		{
+		if (nested_ns_enabled()) {
 			pid_t own = pid_at_own_level(item->pid->real, vpid(item));
 
 			if (own != vpid(item)) {
@@ -885,7 +885,7 @@ static unsigned long get_clone_mask(TaskKobjIdsEntry *i, TaskKobjIdsEntry *p)
 		mask |= CLONE_NEWIPC;
 	if (i->uts_ns_id != p->uts_ns_id)
 		mask |= CLONE_NEWUTS;
-	if (i->cgroup_ns_id != p->cgroup_ns_id)
+	if (nested_ns_enabled() && i->cgroup_ns_id != p->cgroup_ns_id)
 		mask |= CLONE_NEWCGROUP;
 	if (i->time_ns_id != p->time_ns_id)
 		mask |= CLONE_NEWTIME;
