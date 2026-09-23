@@ -155,18 +155,22 @@ static int resolve_in_parent(struct ns_id *pnsid, struct mount_info *mi, char *b
 static int nested_rootfs_path(struct ns_id *nsid, struct ns_id *pnsid, char *buf, size_t size)
 {
 	struct mount_info *root_mi = root_mount_of(nsid);
-	struct stat st;
 
 	if (!root_mi) {
 		pr_err("Can't find the root mount of the nested mntns %d\n", nsid->id);
 		return -1;
 	}
 
-	if (!resolve_in_parent(pnsid, root_mi, buf, size) && stat(buf, &st) == 0)
+	/*
+	 * The path is resolved against the root fd of the parent mount
+	 * namespace by the callers: it may not exist in the mount
+	 * namespace of the restoring criu, so it is not stat()ed here.
+	 */
+	if (!resolve_in_parent(pnsid, root_mi, buf, size))
 		return 0;
 
 	/* The source of the root mount might be its path in the parent's tree. */
-	if (root_mi->source && root_mi->source[0] == '/' && stat(root_mi->source, &st) == 0) {
+	if (root_mi->source && root_mi->source[0] == '/') {
 		snprintf(buf, size, "%s", root_mi->source);
 		return 0;
 	}

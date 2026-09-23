@@ -75,7 +75,14 @@ static bool can_dump_netlink_sk(int lfd, const struct fd_parms *p)
 
 	ret = fd_has_data(lfd);
 
-	if (nested_ns_real_pid_nested(p->pid)) {
+	/*
+	 * The tolerance is by the flag, not by the task: the daemons of
+	 * the outer container of a nested-ns dump (e.g. the dockerd and
+	 * the containerd of a docker-in-docker pod) are not in a nested
+	 * user namespace, but always hold the events of the containers
+	 * on their netlink sockets.
+	 */
+	if (nested_ns_enabled()) {
 		/*
 		 * The netlink sockets of the daemons of a nested container
 		 * runtime (e.g. a docker-in-docker) may hold the events of
