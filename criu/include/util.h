@@ -270,12 +270,6 @@ int cr_fchown(int fd, uid_t new_uid, gid_t new_gid);
 int cr_fchperm(int fd, uid_t new_uid, gid_t new_gid, mode_t new_mode);
 int cr_fchpermat(int dirfd, const char *path, uid_t new_uid, gid_t new_gid, mode_t new_mode, int flags);
 
-/*
- * Translate an id from the kernel view of the dump time user namespace
- * to the view of the one the current task is in (see cr_fchpermat).
- */
-void userns_view_id(unsigned int *id, bool is_uid);
-
 int fd_has_data(int lfd);
 
 int make_yard(char *path);

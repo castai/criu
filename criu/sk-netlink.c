@@ -69,13 +69,13 @@ int netlink_receive_one(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 	return sk_collect_one(m->ndiag_ino, PF_NETLINK, &sd->sd, ns);
 }
 
-static bool can_dump_netlink_sk(int lfd)
+static bool can_dump_netlink_sk(int lfd, const struct fd_parms *p)
 {
 	int ret;
 
 	ret = fd_has_data(lfd);
 
-	if (nested_ns_enabled()) {
+	if (nested_ns_real_pid_nested(p->pid)) {
 		/*
 		 * The netlink sockets of the daemons of a nested container
 		 * runtime (e.g. a docker-in-docker) may hold the events of
@@ -106,7 +106,7 @@ static int dump_one_netlink_fd(int lfd, u32 id, const struct fd_parms *p)
 	ne.id = id;
 	ne.ino = p->stat.st_ino;
 
-	if (!can_dump_netlink_sk(lfd))
+	if (!can_dump_netlink_sk(lfd, p))
 		goto err;
 
 	if (sk) {

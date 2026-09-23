@@ -33,6 +33,7 @@
 #include "net.h"
 #include "cgroup.h"
 #include "fdstore.h"
+#include "servicefd.h"
 #include "kerndat.h"
 #include "util-caps.h"
 
@@ -640,10 +641,23 @@ static int open_ns_fd(struct file_desc *d, int *new_fd)
 		return -1;
 	}
 
-	snprintf(path, sizeof(path) - 1, "/proc/%d/ns/%s", vpid(item), nd->str);
-	path[sizeof(path) - 1] = '\0';
+	if (nested_ns_pid_not_visible(item)) {
+		/*
+		 * The task is not reachable by its vpid in our /proc (a
+		 * nested pid namespace, or a pid which could not be set):
+		 * open the namespace file via the /proc of criu, where the
+		 * task is known by its real pid.
+		 */
+		int dfd = get_service_fd(CR_PROC_FD_OFF);
 
-	fd = open(path, nfi->nfe->flags);
+		snprintf(path, sizeof(path) - 1, "%d/ns/%s", item->pid->real, nd->str);
+		path[sizeof(path) - 1] = '\0';
+		fd = dfd < 0 ? -1 : openat(dfd, path, nfi->nfe->flags);
+	} else {
+		snprintf(path, sizeof(path) - 1, "/proc/%d/ns/%s", vpid(item), nd->str);
+		path[sizeof(path) - 1] = '\0';
+		fd = open(path, nfi->nfe->flags);
+	}
 	if (fd < 0) {
 		pr_perror("Can't open file %s on restore", path);
 		return fd;

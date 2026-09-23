@@ -9,6 +9,7 @@
 #include "sysctl.h"
 #include "uts_ns.h"
 #include "nested-ns.h"
+#include "pstree.h"
 
 #include "protobuf.h"
 #include "images/utsns.pb-c.h"
@@ -63,7 +64,7 @@ int prepare_utsns(int pid)
 	req[1].type = CTL_STR(strlen(ue->domainname));
 
 	ret = sysctl_op(req, ARRAY_SIZE(req), CTL_WRITE, CLONE_NEWUTS);
-	if (ret && nested_ns_enabled()) {
+	if (ret && nested_ns_task_nested(current)) {
 		/*
 		 * A task entering a nested user namespace might not have
 		 * the permission to write the hostname and domainname

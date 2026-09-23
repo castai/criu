@@ -4011,7 +4011,7 @@ static int collect_mntns(struct ns_id *ns, void *__arg)
 	if (arg->for_dump && ns->type != NS_CRIU)
 		arg->need_to_validate = true;
 
-	if (arg->for_dump && nested_ns_enabled() && ns->type == NS_OTHER) {
+	if (arg->for_dump && nested_ns_owned(ns)) {
 		/*
 		 * The sharing of the mounts can span the nested mount
 		 * namespaces of the inner containers of a nested container

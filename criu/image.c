@@ -19,6 +19,7 @@
 #include "proc_parse.h"
 #include "img-streamer.h"
 #include "namespaces.h"
+#include "nested-ns.h"
 
 bool ns_per_id = false;
 bool img_common_magic = true;
@@ -54,6 +55,9 @@ int check_img_inventory(bool restore)
 	}
 
 	ns_per_id = he->has_ns_per_id ? he->ns_per_id : false;
+
+	if (restore && nested_ns_check_restore(he->nested_ns, he->has_nested_ns))
+		goto out_close;
 
 	if (he->root_ids) {
 		root_ids = xmalloc(sizeof(*root_ids));
@@ -390,6 +394,12 @@ int prepare_inventory(InventoryEntry *he)
 	/* Save network lock method to reuse in restore */
 	he->has_network_lock_method = true;
 	he->network_lock_method = opts.network_lock_method;
+
+	/* The nested user namespaces need the option on restore as well */
+	if (opts.nested_ns) {
+		he->has_nested_ns = true;
+		he->nested_ns = true;
+	}
 
 	/**
 	 * This contains the criu_run_id during dumping of the process.

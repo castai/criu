@@ -331,8 +331,8 @@ int dump_pstree(struct pstree_item *root_item)
 		 * lives with. Record it, so the restore forks it with the
 		 * pid at the level of its parent as well.
 		 */
-		if (nested_ns_enabled()) {
-			pid_t own = pid_at_own_level(item->pid->real, vpid(item));
+		{
+			pid_t own = nested_ns_dump_own_pid(item->pid->real, vpid(item));
 
 			if (own != vpid(item)) {
 				e.own_pid = own;
@@ -979,7 +979,7 @@ static int prepare_pstree_kobj_ids(void)
 		 * namespace is the child reaper of the new one, even though
 		 * its vpid is not the INIT_PID of the root one.
 		 */
-		if (vpid(item) != INIT_PID && !(nested_ns_enabled() && item->ids && item->parent &&
+		if (vpid(item) != INIT_PID && !(nested_ns_task_nested(item) && item->parent && item->parent->ids &&
 						item->ids->pid_ns_id != item->parent->ids->pid_ns_id))
 			rsti(item)->clone_flags &= ~CLONE_NEWPID;
 
@@ -1010,7 +1010,7 @@ static int prepare_pstree_kobj_ids(void)
 	 * the docker exec-ed processes of an inner container) are forked
 	 * without CLONE_NEWUSER and join the created one instead.
 	 */
-	nested_ns_fix_exec_userns();
+	nested_ns_fixup_clone_flags();
 
 	pr_debug("NS mask to use %lx\n", root_ns_mask);
 	return 0;
@@ -1087,7 +1087,8 @@ int prepare_pstree(void)
 	 * relationships, so they are forked from it and inherit the
 	 * namespaces instead of creating their own copies of them.
 	 */
-	nested_ns_fix_exec_pstree();
+	if (!ret)
+		nested_ns_prepare_pstree();
 
 	if (!ret)
 		/*

@@ -417,7 +417,7 @@ static int tmpfs_dump(struct mount_info *pm)
 	if (root_ns_mask & CLONE_NEWUSER)
 		userns_pid = root_item->pid->real;
 
-	if (nested_ns_enabled())
+	if (nested_ns_tmpfs_plain(pm))
 		/*
 		 * The tmpfs content of a nested user namespace is extracted
 		 * by the task living in it, where only a busybox tar may be
@@ -464,8 +464,8 @@ static int tmpfs_restore(struct mount_info *pm)
 		return -1;
 	}
 
-	if (nested_ns_enabled())
-		/* See tmpfs_dump: the archives of the nested ones are not compressed. */
+	/* See tmpfs_dump: the archives of the nested ones are not compressed. */
+	if (tmpfs_img_is_gzip(img) == 0)
 		ret = cr_system(img_raw_fd(img), -1, -1, "tar",
 				(char *[]){ "tar", "--extract", "--no-unquote", "--no-wildcards", "--directory",
 					    service_mountpoint(pm), NULL },
