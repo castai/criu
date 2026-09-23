@@ -21,6 +21,11 @@
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <net/if.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/ipc.h>
+#include <sys/sem.h>
+#include <sys/types.h>
 
 #include "zdtmtst.h"
 #include "lock.h"
@@ -63,7 +68,7 @@ const char *test_author = "CAST AI";
  * lives in the parent user namespace, may not be allowed to open the
  * ones of the tasks of B itself.
  */
-static int join_ns_fd[5];
+static int join_ns_fd[7];
 static int ns_sock[2];
 
 #define NSFD_USER 0
@@ -71,6 +76,8 @@ static int ns_sock[2];
 #define NSFD_MNT  2
 #define NSFD_NET  3
 #define NSFD_PID  4
+#define NSFD_IPC  5
+#define NSFD_CGROUP 6
 
 #define MARKER_FILE "userns_nested.dat"
 #define MARKER_DATA "userns_nested"
@@ -125,6 +132,10 @@ struct shared {
 	/* The working directory of the test, for the tasks joining B's mount namespace */
 	char cwd[PATH_MAX];
 	pid_t enterer_pid_in_b; /* as seen from the pid namespace of B */
+	/* The cgroup path and the SysV semaphore of the ipc namespace of B */
+	char cgroup_before[256];
+	int sem_id;
+	int sem_val;
 } *sh;
 /* clang-format on */
 
@@ -318,6 +329,35 @@ static int bring_loopback_up(void)
 	return 0;
 }
 
+/*
+ * The address of the loopback is replayed from the network namespace
+ * image at restore: check it is the one it had at dump.
+ */
+static int loopback_addr_is_ours(void)
+{
+	struct ifreq ifr;
+	struct sockaddr_in *sin;
+	int sfd;
+
+	sfd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sfd < 0) {
+		pr_perror("Can't open socket");
+		return -1;
+	}
+
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, "lo", IFNAMSIZ - 1);
+	if (ioctl(sfd, SIOCGIFADDR, &ifr)) {
+		pr_perror("Can't get the lo address");
+		close(sfd);
+		return -1;
+	}
+	close(sfd);
+
+	sin = (struct sockaddr_in *)&ifr.ifr_addr;
+	return sin->sin_addr.s_addr == htonl(INADDR_LOOPBACK);
+}
+
 static int hostname_is_ours(void)
 {
 	struct utsname ubuf;
@@ -375,6 +415,37 @@ static int check_nested_ns_state(int marker_fd)
 
 	if (!loopback_is_up()) {
 		pr_err("lo is down after C/R\n");
+		return -1;
+	}
+
+	if (!loopback_addr_is_ours()) {
+		pr_err("The address of lo is not ours after C/R\n");
+		return -1;
+	}
+
+	/*
+	 * The cgroup of the task is restored as it was at dump: the path
+	 * of it, as seen through the cgroup namespace of B, is the same.
+	 */
+	{
+		char cg[256];
+
+		if (read_file_text("/proc/self/cgroup", cg, sizeof(cg))) {
+			pr_err("Can't read the cgroup after C/R\n");
+			return -1;
+		}
+		if (strcmp(cg, sh->cgroup_before)) {
+			pr_err("The cgroup changed after C/R: '%s' != '%s'\n", cg, sh->cgroup_before);
+			return -1;
+		}
+	}
+
+	/*
+	 * The SysV semaphore of the ipc namespace of B is restored with
+	 * its id and its value.
+	 */
+	if (semctl(sh->sem_id, 0, GETVAL) != sh->sem_val) {
+		pr_err("The semaphore %d of the ipc namespace is lost or changed after C/R\n", sh->sem_id);
 		return -1;
 	}
 
@@ -554,6 +625,17 @@ static int nested_child(void)
 	if (bring_loopback_up())
 		goto err;
 
+	/* our own ipc and cgroup namespaces, like an inner container has */
+	if (unshare(CLONE_NEWIPC)) {
+		pr_perror("Can't unshare ipc namespace");
+		goto err;
+	}
+
+	if (unshare(CLONE_NEWCGROUP)) {
+		pr_perror("Can't unshare cgroup namespace");
+		goto err;
+	}
+
 	futex_set_and_wake(&sh->fstate, TEST_UNSHARED);
 	futex_wait_until(&sh->fstate, TEST_MAPPED);
 
@@ -569,6 +651,21 @@ static int nested_child(void)
 	 */
 	if (mount(NULL, "/tmp", "tmpfs", 0, "size=1m")) {
 		pr_perror("Can't mount tmpfs on /tmp");
+		goto err;
+	}
+
+	/* Stash the cgroup path and the semaphore of the namespace to compare after C/R */
+	if (read_file_text("/proc/self/cgroup", sh->cgroup_before, sizeof(sh->cgroup_before)))
+		goto err;
+
+	sh->sem_id = semget(IPC_PRIVATE, 1, 0666);
+	if (sh->sem_id < 0) {
+		pr_perror("Can't create the semaphore");
+		goto err;
+	}
+	sh->sem_val = 0x5eed;
+	if (semctl(sh->sem_id, 0, SETVAL, sh->sem_val) < 0) {
+		pr_perror("Can't set the semaphore value");
 		goto err;
 	}
 
@@ -667,7 +764,7 @@ static int nested_child(void)
 	 * allowed to open the ones of our tasks.
 	 */
 	{
-		int ns_fds[5];
+		int ns_fds[7];
 		struct msghdr msg = {};
 		int dummy = 0;
 		struct iovec iov = { &dummy, sizeof(dummy) };
@@ -682,8 +779,10 @@ static int nested_child(void)
 		ns_fds[NSFD_NET] = open("/proc/self/ns/net", O_RDONLY);
 		snprintf(path, sizeof(path), "/proc/%d/ns/pid", worker);
 		ns_fds[NSFD_PID] = open(path, O_RDONLY);
+		ns_fds[NSFD_IPC] = open("/proc/self/ns/ipc", O_RDONLY);
+		ns_fds[NSFD_CGROUP] = open("/proc/self/ns/cgroup", O_RDONLY);
 
-		for (i = 0; i < 5; i++) {
+		for (i = 0; i < 7; i++) {
 			if (ns_fds[i] < 0) {
 				pr_perror("Can't open the namespace file %d", i);
 				goto err;
@@ -788,9 +887,9 @@ static int enterer_mid(void)
 	int i;
 
 	/* The user namespace of B first, then the ones owned by it */
-	for (i = 0; i < 5; i++) {
-		static const int cflags[5] = { CLONE_NEWUSER, CLONE_NEWUTS, CLONE_NEWNS,
-					       CLONE_NEWNET, CLONE_NEWPID };
+	for (i = 0; i < 7; i++) {
+		static const int cflags[7] = { CLONE_NEWUSER, CLONE_NEWUTS, CLONE_NEWNS,   CLONE_NEWNET, CLONE_NEWPID,
+					       CLONE_NEWIPC,	CLONE_NEWCGROUP };
 
 		if (setns(join_ns_fd[i], cflags[i])) {
 			pr_perror("Can't join the namespace fd %d", i);
