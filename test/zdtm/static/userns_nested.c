@@ -178,10 +178,14 @@ static int parse_map_extents(const char *path, struct id_extent *exts, int max)
 
 /*
  * Pick an id block of the root task's user namespace to be mapped
- * into the nested one. Prefer a block which is not mapped from zero,
- * like the sub-id blocks docker uses for user namespace remapping.
+ * into the nested one: the one the current id is in, so that the root
+ * of the nested namespace is the current user as well, and the files
+ * it creates in the working directory (which the current user owns)
+ * are writable by it. Fall back to the first block which is not
+ * mapped from zero, like the sub-id blocks docker uses for user
+ * namespace remapping.
  */
-static int pick_extent(const char *path, struct id_extent *ext)
+static int pick_extent(const char *path, unsigned int me, struct id_extent *ext)
 {
 	struct id_extent exts[32];
 	int nr, i;
@@ -196,6 +200,13 @@ static int pick_extent(const char *path, struct id_extent *ext)
 	}
 
 	*ext = exts[0];
+	for (i = 0; i < nr; i++) {
+		if (exts[i].first <= me && me - exts[i].first < exts[i].count) {
+			*ext = exts[i];
+			return 0;
+		}
+	}
+
 	for (i = 0; i < nr; i++) {
 		if (exts[i].first) {
 			*ext = exts[i];
@@ -920,12 +931,12 @@ int main(int argc, char **argv)
 	}
 
 	/* Pick sub-id blocks of our user namespace for the nested one */
-	if (pick_extent("/proc/self/uid_map", &sh->uid_ext)) {
+	if (pick_extent("/proc/self/uid_map", getuid(), &sh->uid_ext)) {
 		fail("Can't pick a uid extent");
 		exit(1);
 	}
 
-	if (pick_extent("/proc/self/gid_map", &sh->gid_ext)) {
+	if (pick_extent("/proc/self/gid_map", getgid(), &sh->gid_ext)) {
 		fail("Can't pick a gid extent");
 		exit(1);
 	}
