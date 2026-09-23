@@ -12,6 +12,7 @@
 #include "cr_options.h"
 #include "imgset.h"
 #include "namespaces.h"
+#include "nested-ns.h"
 #include "sysctl.h"
 #include "ipc_ns.h"
 #include "shmem.h"
@@ -605,8 +606,8 @@ static int prepare_ipc_sem_desc(struct cr_img *img, const IpcSemEntry *sem)
 	semid.sem_perm.uid = sem->desc->uid;
 	semid.sem_perm.gid = sem->desc->gid;
 
-	userns_view_id((unsigned int *)&semid.sem_perm.uid, true);
-	userns_view_id((unsigned int *)&semid.sem_perm.gid, false);
+	nested_ns_view_id((unsigned int *)&semid.sem_perm.uid, true);
+	nested_ns_view_id((unsigned int *)&semid.sem_perm.gid, false);
 
 	ret = semctl(id, sem->nsems, IPC_SET, &semid);
 	if (ret == -1) {
@@ -741,8 +742,8 @@ static int prepare_ipc_msg_queue(struct cr_img *img, const IpcMsgEntry *msq)
 	msqid.msg_perm.uid = msq->desc->uid;
 	msqid.msg_perm.gid = msq->desc->gid;
 
-	userns_view_id((unsigned int *)&msqid.msg_perm.uid, true);
-	userns_view_id((unsigned int *)&msqid.msg_perm.gid, false);
+	nested_ns_view_id((unsigned int *)&msqid.msg_perm.uid, true);
+	nested_ns_view_id((unsigned int *)&msqid.msg_perm.gid, false);
 
 	ret = msgctl(id, IPC_SET, &msqid);
 	if (ret == -1) {
@@ -888,8 +889,8 @@ static int prepare_ipc_shm_seg(struct cr_img *img, const IpcShmEntry *shm)
 	shmid.shm_perm.uid = shm->desc->uid;
 	shmid.shm_perm.gid = shm->desc->gid;
 
-	userns_view_id((unsigned int *)&shmid.shm_perm.uid, true);
-	userns_view_id((unsigned int *)&shmid.shm_perm.gid, false);
+	nested_ns_view_id((unsigned int *)&shmid.shm_perm.uid, true);
+	nested_ns_view_id((unsigned int *)&shmid.shm_perm.gid, false);
 
 	ret = shmctl(id, IPC_SET, &shmid);
 	if (ret == -1) {

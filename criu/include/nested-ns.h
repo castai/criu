@@ -10,186 +10,201 @@
 struct pstree_item;
 struct ns_desc;
 struct ns_id;
+struct mount_info;
+struct cr_img;
 
 /*
- * Support for nested user namespaces, e.g. a docker daemon running
- * containers with their own user namespaces inside a container being
- * checkpointed (docker-in-docker).
+ * Support for user namespaces nested inside the dumped tree, e.g. a
+ * docker daemon running containers with their own user namespaces
+ * inside a container being checkpointed (docker-in-docker with
+ * userns-remap).
  *
- * Everything in this file is only active when the --nested-ns option
- * is given. Without it criu behaves exactly as before, in particular
- * dumping a task in a nested user namespace fails with the
- * "Can't dump nested user namespace" error.
+ * Everything declared here is only active when the --nested-ns option
+ * is given. Without it every hook is a no-op and criu behaves exactly
+ * as before, in particular dumping a task in a nested user namespace
+ * fails with the "Can't dump nested user namespace" error.
+ *
+ * The code is split by concern:
+ *   nested-ns.c      option, ownership marks on the namespaces, the
+ *                    pid/sid/pgid arithmetic of nested pid namespaces
+ *   nested-userns.c  uid/gid maps: dump, restore handshake, id views
+ *   nested-pstree.c  fixups of the process tree before it is forked,
+ *                    the namespaces created by the tasks themselves
+ *   nested-mnt.c     mount namespaces assembled in place by the tasks
+ *   nested-runtime.c glue for the inner container runtimes (image
+ *                    permissions, runc state files)
+ *
+ * Only one level of nesting below the root task's user namespace is
+ * supported: the dump refuses deeper ones.
  */
 
 bool nested_ns_enabled(void);
 
 /*
+ * Whether the namespace is owned by a user namespace nested in the
+ * one of the root task. Valid on dump after the task ids are collected
+ * and on restore after prepare_pstree(). False without the option.
+ */
+bool nested_ns_owned(struct ns_id *nsid);
+
+/* Whether the task lives in a user namespace nested in the root one. */
+bool nested_ns_task_nested(struct pstree_item *item);
+
+/* The same, for a task known by its real pid (dump side). */
+bool nested_ns_real_pid_nested(pid_t real);
+
+/*
  * Dump side
  */
 
-/*
- * Whether a nested namespace of this type may be taken into the
- * image instead of failing with the "Can't dump nested namespace"
- * error. Currently only user namespaces.
- */
+/* Whether a nested namespace of this type may be taken into the image. */
 bool nested_ns_dump_ok(struct ns_desc *nd);
 
 /*
- * Dump the images of all the user namespaces: the one of the root
- * task, if it has its own one, and all the nested ones, each with its
- * own uid and gid mappings relative to its parent user namespace.
+ * Checks for a task living in a nested user namespace which have to
+ * hold for the restore to be possible; marks the namespaces it owns.
  */
+int nested_ns_check_task(struct pstree_item *item);
+
+/* Dump the images of the root and of all the nested user namespaces. */
 int nested_ns_collect_user_namespaces(void);
 
 /*
- * Checks for a task living in a nested user namespace, which have
- * to hold for the restore to be possible.
+ * The pid of a task at the level of the root task's pid namespace, the
+ * sid and pgid of it translated the same way, and the pid in its own
+ * (innermost) pid namespace. Without the option the fallbacks are
+ * returned untouched.
  */
-int nested_ns_check_task(struct pstree_item *item);
+pid_t nested_ns_dump_vpid(pid_t real, pid_t fallback);
+int nested_ns_dump_session(pid_t real, int *pgid, int *sid);
+pid_t nested_ns_dump_own_pid(pid_t real, pid_t fallback);
 
 /*
  * Restore side
  */
 
+/* Option/image/kernel consistency checks, called before the tree is read. */
+int nested_ns_check_restore(bool image_nested_ns, bool has_image_flag);
+
 /*
- * A full replacement of prepare_userns_creds() for the option:
- * entering the user namespace of the restored tree keeps the
- * capabilities, so that a task forking a child in a nested user
- * namespace can write its id maps.
+ * Process tree fixups before the clone flags are derived
+ * (re-parenting of the exec-entered tasks) and after them (a single
+ * creator per nested user namespace, ownership marks).
  */
+void nested_ns_prepare_pstree(void);
+void nested_ns_fixup_clone_flags(void);
+
+/* Whether the clone flags of a sub-task with a new user namespace are allowed. */
+bool nested_ns_cflags_ok(unsigned long cflags);
+
+/*
+ * The pids to request with clone3(set_tid): the one of the task in its
+ * own pid namespace and, for the init of a new one, its pid in the
+ * namespace of the forking task. Returns the number of entries, 0 when
+ * the pid can not be set at all.
+ */
+int nested_ns_set_tid(struct pstree_item *item, pid_t pid, pid_t *set_tid, int max);
+
+/* Whether the parent of the task can not set its pid (see nested-ns.c). */
+bool nested_ns_pid_can_not_be_set(struct pstree_item *item);
+
+/* Whether the vpid of the task can not be used to open its /proc entry. */
+bool nested_ns_pid_not_visible(struct pstree_item *item);
+
+/* Whether the pid the task got matches the one it expects. */
+bool nested_ns_pid_ok(struct pstree_item *item, pid_t pid);
+
+/* What setsid() has to return for a session leader. */
+pid_t nested_ns_expected_sid(struct pstree_item *item);
+
+/* Whether an inherited sid, differing from the dumped one, is fine. */
+bool nested_ns_inherited_sid_ok(struct pstree_item *item, pid_t sid);
+
+/*
+ * The pgid to set for the task: the dumped one translated into its own
+ * pid namespace. Returns false when it can not be set (the group
+ * leader lives outside of the pid namespace of the task).
+ */
+bool nested_ns_pgid(struct pstree_item *item, pid_t *pgid);
+
+/* A full replacement of prepare_userns_creds() with the option. */
 int nested_ns_prepare_userns_creds(void);
 
 /* Whether prepare_userns_creds() is needed for this task. */
 bool nested_ns_needs_prep_creds(struct pstree_item *item);
 
-/*
- * Parent task: initialize the per-child state before forking it into
- * a new user namespace.
- */
+/* Parent task: initialize the per-child state before forking it. */
 int nested_ns_child_init(struct pstree_item *item, unsigned long clone_flags);
 
 /*
- * Pin the root fds of the nested mount namespaces into the fdstore,
- * before any task of the tree is forked. To be called from the root
- * task, after the mount namespaces are assembled.
- */
-int nested_ns_pin_roots(void);
-
-/*
  * Parent task: after forking a child into a new user namespace, fill
- * in its uid and gid maps.
+ * in its uid and gid maps. real is the pid of the child in the pid
+ * namespace of the parent, as returned by clone().
  */
-int nested_ns_child_forked(struct pstree_item *item, unsigned long clone_flags, pid_t pid);
+int nested_ns_child_forked(struct pstree_item *item, unsigned long clone_flags, pid_t real);
 
-/*
- * Child task: after determining our pid, report it to the parent,
- * which is going to write the maps of our user namespace.
- */
+/* Child task: report the pid, wait for the maps, abort the handshake. */
 int nested_ns_child_report(struct pstree_item *item);
-
-/*
- * Child task: wait for the parent to write the maps of our user
- * namespace before applying the credentials.
- */
 int nested_ns_child_wait(struct pstree_item *item);
-
-/*
- * Whether the parent of the task can not set its pid: it lives in a
- * nested user namespace which has no capabilities in the one owning
- * the inherited pid namespace.
- */
-bool nested_ns_pid_can_not_be_set(struct pstree_item *item);
-
-/*
- * Whether the vpid of the task can not be used to open its /proc entry
- * (see nested_ns_pid_can_not_be_set).
- */
-bool nested_ns_pid_not_visible(struct pstree_item *item);
-
-/*
- * Child task: restore the content of the namespaces owned by our
- * nested user namespace (e.g. the hostname of our own uts one).
- */
-int nested_ns_child_namespaces(struct pstree_item *item);
+void nested_ns_child_abort(struct pstree_item *item);
 
 /*
  * Translate the ids of the credentials of a task living in a nested
- * user namespace from the view of the dumping criu process into the
- * one of the user namespace of the task.
+ * user namespace and drop the groups which are not mapped in it.
  */
 int nested_ns_fix_task_creds(struct pstree_item *item, CoreEntry *core);
 
 /*
- * Re-parent the tasks which have entered the namespaces of an inner
- * container (e.g. the docker exec-ed ones) under the init one of it,
- * before the clone flags are derived, so they are forked from it and
- * inherit the namespaces instead of creating their own copies of them.
+ * Translate an id from the view the images hold (the one of the root
+ * task's user namespace) to the view of the user namespace the current
+ * task is in. A no-op outside of the nested ones.
  */
-void nested_ns_fix_exec_pstree(void);
+void nested_ns_view_id(unsigned int *id, bool is_uid);
 
-/*
- * Strip the CLONE_NEWUSER flag from the tasks which have entered a nested
- * user namespace without creating it, so they are forked without it and
- * join the one of the creator (see nested_ns_child_namespaces).
- */
-void nested_ns_fix_exec_userns(void);
+/* Child task: restore the namespaces owned by our nested user namespace. */
+int nested_ns_child_namespaces(struct pstree_item *item);
 
-/*
- * Update the start time of the init processes in the state files of the
- * inner runtimes, which have recorded the one of the dump time.
- */
-void nested_ns_patch_runc_states(void);
-
-/*
- * Child task: wake up the parent, as we are dying before the maps of
- * our user namespace are written.
- */
-void nested_ns_child_abort(struct pstree_item *item);
-
-/*
- * Whether to skip the setns() into our network namespace, as we have
- * inherited it from the parent task and may have no capabilities in
- * the user namespace owning it.
- */
+/* Whether to skip the setns() into our net or mount namespace. */
 bool nested_ns_skip_netns(struct pstree_item *item);
-
-/*
- * Whether the mount namespace is owned by a nested user namespace,
- * i.e. it is assembled by the task which has entered it.
- */
-bool nested_ns_own_mntns(struct ns_id *nsid);
-
-/*
- * Whether the task was born in its own mount namespace, owned by
- * its nested user namespace, and has to skip the setns() into one.
- */
 bool nested_ns_skip_mntns(struct pstree_item *item);
 
-/*
- * Whether this task has to take the root fd of the given mount
- * namespace from the shared fdstore instead of opening
- * /proc/<pid>/root, as the latter is not allowed from a nested
- * user namespace.
- */
+/* Whether the mount namespace is assembled by the task entering it. */
+bool nested_ns_own_mntns(struct ns_id *nsid);
+
+/* Whether the net namespace is created by the task entering it. */
+bool nested_ns_own_netns(struct ns_id *nsid);
+
+/* Whether the root fd of the mount namespace has to come from the fdstore. */
 bool nested_ns_use_fdstore(struct ns_id *nsid);
 
-/*
- * Child task: fill in the mount namespace owned by our nested user
- * namespace from the image, in place.
- */
+/* Root task: pin the root fds of the nested mount namespaces. */
+int nested_ns_pin_roots(void);
+
+/* Child task: fill in the mount namespace of our nested user namespace. */
 int nested_ns_child_mntns(struct pstree_item *item);
 
 /*
- * Whether the network namespace has to be created by the task which
- * has entered a nested user namespace, and not by the root task.
+ * The tmpfs archives of the nested mount namespaces are made for a
+ * busybox tar (no GNU sparse format); whether an archive is gzip-ed is
+ * detected from its content on restore.
  */
-bool nested_ns_own_netns(struct ns_id *nsid);
+bool nested_ns_tmpfs_plain(struct mount_info *pm);
+int tmpfs_img_is_gzip(struct cr_img *img);
 
 /*
- * Whether the clone flags of a sub-task, which include the user
- * namespace one, are allowed.
+ * Runtime glue (nested-runtime.c): make the images readable by the
+ * remapped roots of the nested user namespaces for the time of the
+ * restore, and update the runc state files at the end of it.
  */
-bool nested_ns_cflags_ok(unsigned long cflags);
+int nested_ns_images_open(void);
+void nested_ns_images_restore(void);
+void nested_ns_patch_runc_states(void);
+
+/*
+ * Internal, between the nested-*.c files.
+ */
+void nested_ns_mark_owned(void);
+int nested_ns_read_userns_img(unsigned int id, UsernsEntry **e);
+int nested_ns_join_userns(struct pstree_item *item);
 
 #endif /* __CR_NESTED_NS_H__ */

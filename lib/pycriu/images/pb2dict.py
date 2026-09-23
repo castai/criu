@@ -7,6 +7,14 @@ from ipaddress import IPv4Address, IPv6Address, ip_address
 
 from google.protobuf.descriptor import FieldDescriptor as FD
 
+def _is_repeated(field):
+    """The label attribute is gone from the protobuf 7 descriptors."""
+    is_repeated = getattr(field, 'is_repeated', None)
+    if is_repeated is None:
+        return field.label == FD.LABEL_REPEATED
+    return is_repeated
+
+
 import opts_pb2
 
 if "encodebytes" not in dir(base64):
@@ -341,7 +349,7 @@ def pb2dict(pb, pretty=False, is_hex=False):
     """
     d = collections.OrderedDict() if pretty else {}
     for field, value in pb.ListFields():
-        if field.label == FD.LABEL_REPEATED:
+        if _is_repeated(field):
             d_val = []
             if pretty and _marked_as_ip(field):
                 if len(value) == 1:
@@ -417,7 +425,7 @@ def dict2pb(d, pb):
         if field.name not in d:
             continue
         value = d[field.name]
-        if field.label == FD.LABEL_REPEATED:
+        if _is_repeated(field):
             pb_val = getattr(pb, field.name, None)
             if is_string(value[0]) and _marked_as_ip(field):
                 val = ip_address(value[0])

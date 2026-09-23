@@ -226,7 +226,7 @@ int compel_wait_task(int pid, int ppid, int (*get_status)(int pid, struct seize_
 {
 	siginfo_t si;
 	int status, nr_stopsig;
-	int ret = 0, ret2, wait_errno = 0;
+	int ret = 0, ret2, wait_errno = 0, reseized = 0;
 
 	/*
 	 * It's ugly, but the ptrace API doesn't allow to distinguish
@@ -263,7 +263,8 @@ try_again:
 			 * a cgroup it creates elsewhere) is not traced yet: seize
 			 * it here, the same way the non-freezer mode does.
 			 */
-			if (ret < 0 && wait_errno == ECHILD && !compel_interrupt_task(pid)) {
+			if (ret < 0 && wait_errno == ECHILD && !reseized && !compel_interrupt_task(pid)) {
+				reseized = 1;
 				if (free_status)
 					free_status(pid, ss, data);
 				goto try_again;

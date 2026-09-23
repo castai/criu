@@ -18,6 +18,7 @@
 #include <compel/ptrace.h>
 #include "plugin.h"
 #include "proc_parse.h"
+#include "nested-ns.h"
 #include "seccomp.h"
 #include "seize.h"
 #include "stats.h"
@@ -1051,7 +1052,7 @@ int collect_pstree(void)
 	int ret, exit_code = -1;
 	struct proc_status_creds creds;
 
-	if (set_dump_pidns_level(pid))
+	if (nested_ns_enabled() && set_dump_pidns_level(pid))
 		goto err;
 
 	timing_start(TIME_FREEZING);

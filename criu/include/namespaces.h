@@ -116,6 +116,13 @@ struct ns_id {
 	 */
 	bool ns_populated;
 
+	/*
+	 * The namespace is owned by a user namespace nested in the
+	 * one of the root task (--nested-ns): its content is set up by
+	 * the task entering it, not by the root task.
+	 */
+	bool nested;
+
 	union {
 		struct {
 			struct mount_info *mntinfo_list;

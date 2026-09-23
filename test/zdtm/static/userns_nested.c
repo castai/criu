@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <sched.h>
 #include <grp.h>
@@ -66,16 +67,20 @@ static int join_ns_fd[5];
 static int ns_sock[2];
 
 #define NSFD_USER 0
-#define NSFD_UTS 1
-#define NSFD_MNT 2
-#define NSFD_NET 3
-#define NSFD_PID 4
+#define NSFD_UTS  1
+#define NSFD_MNT  2
+#define NSFD_NET  3
+#define NSFD_PID  4
 
 #define MARKER_FILE "userns_nested.dat"
 #define MARKER_DATA "userns_nested"
 #define WORKER_FILE "nested-worker-file"
 #define WORKER_DATA "nested-worker-data"
-#define HOSTNAME_B "nested-uts-host"
+#define HOSTNAME_B  "nested-uts-host"
+#define BIND_SRC    "nested-bind-src"
+#define BIND_DATA   "nested-bind-data"
+#define BIND_TARGET "/tmp/nested-bind-target"
+#define OWNED_FILE  "/tmp/nested-owned"
 
 enum {
 	TEST_FORKED,
@@ -117,6 +122,8 @@ struct shared {
 	char gid_map_before[256];
 	char parent_ns_before[64];
 	char child_ns_after[64];
+	/* The working directory of the test, for the tasks joining B's mount namespace */
+	char cwd[PATH_MAX];
 	pid_t enterer_pid_in_b; /* as seen from the pid namespace of B */
 } *sh;
 /* clang-format on */
@@ -321,12 +328,34 @@ static int hostname_is_ours(void)
 static int check_nested_ns_state(int marker_fd)
 {
 	char buf[256];
-	struct stat st2, st3;
+	struct stat st2, st3, st4;
+	int bfd;
 
 	if (getuid() != 0 || getgid() != 0) {
 		pr_err("Unexpected ids in the nested userns: uid=%d gid=%d\n", getuid(), getgid());
 		return -1;
 	}
+
+	if (stat(OWNED_FILE, &st4)) {
+		pr_perror("Can't stat %s after C/R", OWNED_FILE);
+		return -1;
+	}
+	if (st4.st_uid != 0 || st4.st_gid != 0) {
+		pr_err("%s is owned by %d:%d after C/R, not by our root\n", OWNED_FILE, st4.st_uid, st4.st_gid);
+		return -1;
+	}
+
+	bfd = open(BIND_TARGET, O_RDONLY);
+	if (bfd < 0) {
+		pr_perror("Can't open %s after C/R", BIND_TARGET);
+		return -1;
+	}
+	if (read(bfd, buf, sizeof(BIND_DATA)) != sizeof(BIND_DATA) || strncmp(buf, BIND_DATA, sizeof(BIND_DATA))) {
+		pr_err("Bad content of the bind mount %s after C/R\n", BIND_TARGET);
+		close(bfd);
+		return -1;
+	}
+	close(bfd);
 
 	if (!hostname_is_ours()) {
 		pr_err("Hostname lost after C/R\n");
@@ -471,6 +500,18 @@ static int nested_child(void)
 		goto err;
 	}
 
+	/*
+	 * The id switch clears the dumpable flag, which the tasks forked
+	 * below inherit: their /proc/<pid>/ns directories would then be
+	 * owned by the root of the outer user namespace, not by us, and
+	 * the namespace files of the worker could not be opened. Set it
+	 * back, like a container runtime does after switching its ids.
+	 */
+	if (prctl(PR_SET_DUMPABLE, 1, 0, 0, 0)) {
+		pr_perror("Can't set the dumpable flag");
+		goto err;
+	}
+
 	if (unshare(CLONE_NEWUSER)) {
 		pr_perror("Can't unshare user namespace");
 		goto err;
@@ -537,6 +578,52 @@ static int nested_child(void)
 		pr_perror("Can't write %s", MARKER_FILE);
 		close(fd);
 		goto err;
+	}
+
+	/*
+	 * A file of our tmpfs owned by our root: its owner is mapped
+	 * through our id maps at restore (the archive holds the ids of
+	 * the outer user namespace).
+	 */
+	{
+		int ofd = open(OWNED_FILE, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+
+		if (ofd < 0) {
+			pr_perror("Can't create %s", OWNED_FILE);
+			close(fd);
+			goto err;
+		}
+		close(ofd);
+	}
+
+	/*
+	 * A bind mount of a file of the parent's filesystem into our
+	 * tmpfs, like the /etc/hosts of an inner container: its source
+	 * is resolved through the parent's mount tree at restore.
+	 */
+	{
+		int bfd = open(BIND_SRC, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+
+		if (bfd < 0 || write(bfd, BIND_DATA, sizeof(BIND_DATA)) != sizeof(BIND_DATA)) {
+			pr_perror("Can't create %s", BIND_SRC);
+			close(fd);
+			goto err;
+		}
+		close(bfd);
+
+		bfd = open(BIND_TARGET, O_CREAT | O_WRONLY, 0644);
+		if (bfd < 0) {
+			pr_perror("Can't create %s", BIND_TARGET);
+			close(fd);
+			goto err;
+		}
+		close(bfd);
+
+		if (mount(BIND_SRC, BIND_TARGET, NULL, MS_BIND, NULL)) {
+			pr_perror("Can't bind %s to %s", BIND_SRC, BIND_TARGET);
+			close(fd);
+			goto err;
+		}
 	}
 
 	/*
@@ -639,8 +726,18 @@ static int nested_child(void)
 		goto err_collect;
 	}
 
-	/* Collect the worker and take its verdict into ours */
-	while (waitpid(worker, &status, 0) < 0 && errno == EINTR)
+	/* Let the worker check its own state and exit */
+	futex_set_and_wake(&sh->worker_fstate, WORKER_CHECK);
+
+	/*
+	 * Collect the worker and take its verdict into ours. It is our
+	 * only child, and it is waited for by any pid: its pid in our
+	 * pid namespace is not restored, as we live in a nested user
+	 * namespace without the capabilities to set it there (the init
+	 * of an inner container is forked by a runtime task of the
+	 * outer user namespace, which has them).
+	 */
+	while (waitpid(-1, &status, 0) < 0 && errno == EINTR)
 		;
 	if (!WIFEXITED(status) || WEXITSTATUS(status)) {
 		pr_err("The worker exited with status %d\n", status);
@@ -653,6 +750,7 @@ static int nested_child(void)
 	}
 
 	close(fd);
+	futex_set_and_wake(&sh->fstate, TEST_EXIT);
 	return 0;
 
 err_collect:
@@ -687,6 +785,28 @@ static int enterer_mid(void)
 			pr_perror("Can't join the namespace fd %d", i);
 			return -1;
 		}
+	}
+
+	/*
+	 * Our ids are the ones of A, which are not mapped in B: become
+	 * the root of B, like the runtime task of a docker exec does.
+	 */
+	if (setgroups(0, NULL) && errno != EPERM) {
+		pr_perror("Can't drop the groups in B");
+		return -1;
+	}
+	if (setresgid(0, 0, 0) || setresuid(0, 0, 0)) {
+		pr_perror("Can't become the root of B");
+		return -1;
+	}
+
+	/*
+	 * Joining a mount namespace puts us at its root: get back to the
+	 * directory of the test, where the marker file is.
+	 */
+	if (chdir(sh->cwd)) {
+		pr_perror("Can't chdir to %s in the mount namespace of B", sh->cwd);
+		return -1;
 	}
 
 	enterer = fork();
@@ -728,12 +848,23 @@ static int enterer_task(void)
 		goto err;
 	}
 
+	/* Our own process group, known by our pid in the pid namespace of B */
+	if (setpgid(0, 0)) {
+		pr_perror("Can't set the process group of the entering task");
+		goto err;
+	}
+
 	futex_set_and_wake(&sh->enterer_fstate, ENTERER_READY);
 	futex_wait_until(&sh->enterer_fstate, ENTERER_CHECK);
 
 	if (getpid() != sh->enterer_pid_in_b) {
 		pr_err("The pid of the entering task in the pid namespace of B changed: %d != %d\n",
 		       getpid(), sh->enterer_pid_in_b);
+		goto err;
+	}
+
+	if (getpgrp() != getpid()) {
+		pr_err("The process group of the entering task changed: %d != %d\n", getpgrp(), getpid());
 		goto err;
 	}
 
@@ -759,7 +890,7 @@ int main(int argc, char **argv)
 {
 	char buf[256];
 	int pid, status;
-	int ret = 0;
+	int ret = 0, child_reaped = 0;
 
 	sh = mmap(NULL, sizeof(struct shared), PROT_WRITE | PROT_READ, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 	if (sh == MAP_FAILED) {
@@ -772,6 +903,11 @@ int main(int argc, char **argv)
 	futex_set(&sh->enterer_fstate, ENTERER_FORKED);
 
 	test_init(argc, argv);
+
+	if (!getcwd(sh->cwd, sizeof(sh->cwd))) {
+		pr_perror("Can't get the working directory");
+		exit(1);
+	}
 
 	/*
 	 * The entering task is re-parented under us when its forking one
@@ -899,6 +1035,7 @@ int main(int argc, char **argv)
 	}
 
 	futex_wait_while_lt(&sh->enterer_fstate, ENTERER_READY);
+	futex_wait_while_lt(&sh->worker_fstate, WORKER_READY);
 
 	test_daemon();
 	test_waitsig();
@@ -914,9 +1051,32 @@ int main(int argc, char **argv)
 		ret = 1;
 	}
 
-	/* The entering task is collected by the worker after C/R */
+	/*
+	 * The entering task is collected by the worker after C/R (it is
+	 * re-parented under it at restore). Without C/R it is still
+	 * ours: reap it, or the init of the pid namespace (the worker)
+	 * can not exit while a zombie of its namespace is unreaped.
+	 */
 	futex_set_and_wake(&sh->fstate, TEST_CHECK);
 	futex_set_and_wake(&sh->enterer_fstate, ENTERER_CHECK);
+
+	/*
+	 * Without C/R the first child to exit is the entering one: the
+	 * child (and the worker) can not finish before it is reaped.
+	 * With C/R it is the child itself, whose status is kept.
+	 */
+	{
+		int st;
+		pid_t w;
+
+		while ((w = waitpid(-1, &st, 0)) < 0 && errno == EINTR)
+			;
+		test_msg("Reaped the child %d (status %d, the nested one is %d)\n", w, st, pid);
+		if (w == pid) {
+			status = st;
+			child_reaped = 1;
+		}
+	}
 
 	/*
 	 * Give the child (and the worker and the entering tasks below it)
@@ -924,9 +1084,11 @@ int main(int argc, char **argv)
 	 * the child. Its exit code tells whether the checks passed.
 	 */
 	futex_wait_until(&sh->fstate, TEST_EXIT);
+	test_msg("The nested child is done\n");
 
-	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
-		;
+	if (!child_reaped)
+		while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+			;
 	if (!WIFEXITED(status) || WEXITSTATUS(status)) {
 		pr_err("The child exited with status %d\n", status);
 		ret = 1;
@@ -945,6 +1107,8 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	unlink(MARKER_FILE);
+	unlink(BIND_SRC);
 	pass();
 	return 0;
 }

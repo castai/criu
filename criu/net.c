@@ -510,6 +510,19 @@ static int dump_one_netdev(int type, struct ifinfomsg *ifi, struct nlattr **tb, 
 		return -1;
 	}
 
+	/*
+	 * The network namespace of an inner container is re-created by
+	 * the task entering it on restore, which can not create the links
+	 * with a peer outside of it (e.g. the veth to the bridge of the
+	 * inner runtime): only the loopback is supported. The inner
+	 * networking is left out with --empty-ns net, which skips this.
+	 */
+	if (nested_ns_owned(ns) && type != ND_TYPE__LOOPBACK) {
+		pr_err("Can't dump the link %s of the nested netns %u: only the loopback of a nested network namespace can be restored, use --empty-ns net\n",
+		       tb[IFLA_IFNAME] ? (char *)RTA_DATA(tb[IFLA_IFNAME]) : "?", ns->id);
+		return -1;
+	}
+
 	netdev.type = type;
 	netdev.ifindex = ifi->ifi_index;
 	netdev.mtu = *(int *)RTA_DATA(tb[IFLA_MTU]);
@@ -2926,9 +2939,9 @@ int dump_net_ns(struct ns_id *ns)
 #endif
 		if (!ret)
 			ret = dump_netns_conf(ns, fds);
-	} else if (ns->type != NS_ROOT && !nested_ns_enabled()) {
+	} else if (ns->type != NS_ROOT && !nested_ns_owned(ns)) {
 		/*
-		 * With the nested user namespaces the non-root network ones
+		 * The network namespaces owned by the nested user namespaces
 		 * are created by the tasks entering them on restore, and their
 		 * content is not dumped, like the empty root one.
 		 */
@@ -3020,8 +3033,21 @@ static int prepare_net_ns_second_stage(struct ns_id *ns)
 			ret = restore_route(nsid);
 		if (!ret)
 			ret = restore_rule(nsid);
-		if (!ret)
+		if (!ret) {
 			ret = restore_iptables(nsid);
+			/*
+			 * The iptables of a nested network namespace are
+			 * restored by the task living in it, inside the root
+			 * filesystem of the inner container, which may lack
+			 * the tool: the rules of the inner container are not
+			 * critical for the restore, the ones of the outer one
+			 * (its bridge, NAT) live in the parent namespace.
+			 */
+			if (ret && nested_ns_owned(ns)) {
+				pr_warn("Can't restore the iptables of the nested netns %u\n", nsid);
+				ret = 0;
+			}
+		}
 		if (!ret)
 			ret = restore_nftables(nsid);
 	}

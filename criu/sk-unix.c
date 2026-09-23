@@ -539,7 +539,7 @@ static int dump_one_unix_fd(int lfd, uint32_t id, const struct fd_parms *p)
 			 * anyway: losing the queued data is fine, as a
 			 * connection without it is.
 			 */
-			if (!nested_ns_enabled()) {
+			if (!nested_ns_real_pid_nested(p->pid)) {
 				pr_err("Non-empty write queue on an in-flight socket %#x\n", ue->ino);
 				goto err;
 			}

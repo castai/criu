@@ -84,7 +84,7 @@ struct rst_info {
 
 	/*
 	 * Set when the uid and gid maps of the user namespace this
-	 * task was born in are written, see prepare_userns_child().
+	 * task was born in are written, see nested_ns_child_forked().
 	 */
 	futex_t userns_maps;
 

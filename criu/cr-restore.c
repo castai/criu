@@ -404,19 +404,17 @@ static int populate_root_fd_off(void)
 
 static int populate_pid_proc(void)
 {
-	if (open_pid_proc(vpid(current)) < 0) {
-		if (nested_ns_pid_not_visible(current)) {
-			/*
-			 * A task in a nested pid namespace might not be visible
-			 * by its vpid in the /proc of the mount namespace copy,
-			 * or is restored with a random pid, as its parent can
-			 * not set it: only the /proc/self one is used.
-			 */
-			pr_debug("pid not visible in /proc, using /proc/self only\n");
-		} else {
-			pr_err("Can't open PROC_SELF\n");
-			return -1;
-		}
+	/*
+	 * A task in a nested pid namespace is not visible by its vpid in
+	 * the /proc of its mount namespace, nor is one restored with a
+	 * random pid, as its parent could not set it: only the /proc/self
+	 * entry is used for those.
+	 */
+	if (nested_ns_pid_not_visible(current))
+		pr_debug("pid not visible in /proc, using /proc/self only\n");
+	else if (open_pid_proc(vpid(current)) < 0) {
+		pr_err("Can't open PROC_SELF\n");
+		return -1;
 	}
 	if (open_pid_proc(PROC_SELF) < 0) {
 		pr_err("Can't open PROC_SELF\n");
@@ -606,6 +604,10 @@ static int open_cores(int pid, CoreEntry *leader_core)
 		if (tpid == pid)
 			cores[i] = leader_core;
 		else if (open_core(tpid, &cores[i]))
+			goto err;
+
+		/* The ids of a thread of a nested user namespace, like the leader's ones */
+		if (tpid != pid && nested_ns_fix_task_creds(current, cores[i]))
 			goto err;
 	}
 
@@ -1275,7 +1277,7 @@ static inline int fork_with_pid(struct pstree_item *item)
 	if (!(ca.clone_flags & CLONE_NEWPID)) {
 		lock_last_pid();
 
-		if (!kdat.has_clone3_set_tid && !pid_not_set) {
+		if (!kdat.has_clone3_set_tid) {
 			if (external_pidns) {
 				/*
 				 * Restoring into another namespace requires a helper
@@ -1292,51 +1294,29 @@ static inline int fork_with_pid(struct pstree_item *item)
 				goto err_unlock;
 			}
 		}
+	} else if (!nested_ns_enabled()) {
+		if (!external_pidns) {
+			if (pid != INIT_PID) {
+				pr_err("First PID in a PID namespace needs to be %d and not %d\n", INIT_PID, pid);
+				return -1;
+			}
+		}
 	}
 
 	if (kdat.has_clone3_set_tid) {
 		pid_t set_tid[2];
-		size_t set_tid_size = 1;
+		int set_tid_size;
 
-		set_tid[0] = pid;
-		if (ca.clone_flags & CLONE_NEWPID) {
-			/*
-			 * The task is the init one of the new pid namespace,
-			 * with the pid it had in it: the one it sees itself
-			 * at, which its own kin knows it by. For a task below
-			 * the root one its pid in the namespace of the forking
-			 * task is kept as well, e.g. for a docker-in-docker
-			 * inner container which is tracked by its pid by the
-			 * inner containerd-shim. The root task is forked from
-			 * the criu one, so its pid can't be specified in it.
-			 */
-			set_tid[0] = item->own_ns_pid ? item->own_ns_pid : INIT_PID;
-			if (item != root_item) {
-				set_tid[1] = pid;
-				set_tid_size = 2;
-			}
-		} else if (item->own_ns_pid && item->own_ns_pid != pid) {
-			/*
-			 * The task is forked by a one living in a nested pid
-			 * namespace: its pid in it differs from the one in the
-			 * root one. It is restored with the one of its own
-			 * namespace, which its own kin, e.g. the task which
-			 * has forked it, knows it by. The one of the root
-			 * namespace is not settable by its parent: setting a
-			 * pid at an outer level needs a capability in the user
-			 * namespace owning it, which a task of a nested one
-			 * does not have. Nothing outside of the inner one
-			 * tracks a task by its pid in the root one, except for
-			 * the init task of an inner container, which is forked
-			 * by its tracker with the pid in the root namespace as
-			 * well (see the CLONE_NEWPID branch above).
-			 */
-			set_tid[0] = item->own_ns_pid;
-		}
+		/*
+		 * The pids to request: the one of the task, or, in a
+		 * nested pid namespace, the one at each level the forking
+		 * task can set (see nested_ns_set_tid()).
+		 */
+		set_tid_size = nested_ns_set_tid(item, pid, set_tid, ARRAY_SIZE(set_tid));
 
 		ret = clone3_with_pids_noasan(restore_task_with_children, &ca,
 					      (ca.clone_flags & ~(CLONE_NEWNET | CLONE_NEWCGROUP | CLONE_NEWTIME)),
-					      SIGCHLD, pid_not_set ? NULL : set_tid, pid_not_set ? 0 : set_tid_size);
+					      SIGCHLD, set_tid_size ? set_tid : NULL, set_tid_size);
 	} else {
 		/*
 		 * Some kernel modules, such as network packet generator
@@ -1367,7 +1347,8 @@ static inline int fork_with_pid(struct pstree_item *item)
 		pr_debug("PID: real %d virt %d\n", item->pid->real, vpid(item));
 	}
 
-	if (nested_ns_child_forked(item, ca.clone_flags, pid)) {
+	/* ret is the pid of the child in our pid namespace */
+	if (nested_ns_child_forked(item, ca.clone_flags, ret)) {
 		ret = -1;
 		goto err_unlock;
 	}
@@ -1494,66 +1475,25 @@ static void restore_sid(void)
 	 */
 
 	if (vpid(current) == current->sid) {
-		pid_t expected;
+		/* In a nested pid namespace setsid() returns the pid of the task in it */
+		pid_t expected = nested_ns_expected_sid(current);
 
 		pr_info("Restoring %d to %d sid\n", vpid(current), current->sid);
 		sid = setsid();
-		/*
-		 * A task forked with CLONE_NEWPID is the init one of its new pid
-		 * namespace, so setsid() returns its pid in it, and not the
-		 * vpid from the root pid namespace. The same for a task of a
-		 * nested one: setsid() returns its own pid in it, which its
-		 * own kin, the members of the session of it, know it by.
-		 */
-		expected = current->own_ns_pid ? current->own_ns_pid : current->sid;
-		if (sid != expected && !(rsti(current)->clone_flags & CLONE_NEWPID && sid == INIT_PID)) {
-			pr_perror("Can't restore sid (%d), expected %d, vpid %d, cflags %lx", sid, expected, vpid(current),
-				  rsti(current)->clone_flags);
+		if (sid != expected) {
+			pr_err("Can't restore sid (%d), expected %d\n", sid, expected);
 			exit(1);
 		}
 	} else {
-		struct pstree_item *leader = pstree_item_by_virt(current->sid);
-
 		sid = getsid(0);
-		/*
-		 * The session id is the pid of its leader: the own one of
-		 * it in its pid namespace, which the members of the session
-		 * are restored to see it at.
-		 */
-		if (leader && leader->own_ns_pid) {
-			if (sid == leader->own_ns_pid)
-				goto sid_ok;
-			/*
-			 * A task in a nested pid namespace (created by an
-			 * ancestor forked with CLONE_NEWPID) inherits the sid
-			 * of the init one of that namespace, and not the one
-			 * from the root pid namespace.
-			 */
-			if (sid == INIT_PID && current->ids && root_item->ids &&
-			    current->ids->pid_ns_id != root_item->ids->pid_ns_id)
-				goto sid_ok;
-			pr_err("Requested sid %d doesn't match inherited %d\n", leader->own_ns_pid, sid);
-			exit(1);
-		}
-		if (sid != current->sid) {
+		if (sid != current->sid && !nested_ns_inherited_sid_ok(current, sid)) {
 			/* Skip the root task if it's not init */
 			if (current == root_item && vpid(root_item) != INIT_PID)
 				return;
-			/*
-			 * A task in a nested pid namespace (created by an
-			 * ancestor forked with CLONE_NEWPID) inherits the sid
-			 * of the init one of that namespace, and not the one
-			 * from the root pid namespace.
-			 */
-			if (sid == INIT_PID && current->ids && root_item->ids &&
-			    current->ids->pid_ns_id != root_item->ids->pid_ns_id)
-				goto sid_ok;
 			pr_err("Requested sid %d doesn't match inherited %d\n", current->sid, sid);
 			exit(1);
 		}
 	}
-
-sid_ok:;
 }
 
 static void restore_pgid(void)
@@ -1567,23 +1507,21 @@ static void restore_pgid(void)
 	 * We do this _before_ finishing the forking stage to make sure
 	 * helpers are still with us.
 	 */
-	pid_t pgid, my_pgid;
+	pid_t pgid, my_pgid = current->pgid, set_pgid;
 
 	/*
-	 * The pgid of a task in a nested pid namespace is set by the
-	 * fork, and its value in it differs from the root pid namespace.
+	 * In a nested pid namespace the group is known by the pid of
+	 * its leader in it; a group led from outside of the namespace
+	 * can not be joined, the inherited one is kept.
 	 */
-	if (nested_ns_enabled() && current->ids && root_item->ids &&
-	    current->ids->pid_ns_id != root_item->ids->pid_ns_id)
+	if (!nested_ns_pgid(current, &set_pgid))
 		return;
-
-	my_pgid = current->pgid;
 
 	pr_info("Restoring %d to %d pgid\n", vpid(current), my_pgid);
 
 	pgid = getpgrp();
-	if (my_pgid == pgid)
-		return;
+	if (set_pgid == pgid)
+		goto done;
 
 	if (my_pgid != vpid(current)) {
 		struct pstree_item *leader;
@@ -1602,23 +1540,18 @@ static void restore_pgid(void)
 	}
 
 	pr_info("\twill call setpgid, mine pgid is %d\n", pgid);
-	/*
-	 * A task forked with CLONE_NEWPID is the init one of its new pid
-	 * namespace: it is its own session and process group leader after
-	 * setsid(), and setpgid() on a session leader always fails.
-	 */
-	if (nested_ns_enabled() && (rsti(current)->clone_flags & CLONE_NEWPID))
-		goto skip_setpgid;
-	if (setpgid(0, my_pgid) != 0) {
+	if (setpgid(0, set_pgid) != 0) {
 		pr_perror("Can't restore pgid (%d/%d->%d)", vpid(current), pgid, current->pgid);
 		exit(1);
 	}
 
+done:
+	/*
+	 * The leader of the group lets the members join it, also when
+	 * it is in the group already (e.g. the init of a nested pid
+	 * namespace, its own group after setsid()).
+	 */
 	if (my_pgid == vpid(current))
-		futex_set_and_wake(&rsti(current)->pgrp_set, 1);
-
-skip_setpgid:
-	if (nested_ns_enabled() && (rsti(current)->clone_flags & CLONE_NEWPID))
 		futex_set_and_wake(&rsti(current)->pgrp_set, 1);
 }
 
@@ -1736,30 +1669,11 @@ static int __restore_task_with_children(void *_arg)
 	}
 
 	pid = getpid();
-	/*
-	 * A task forked with CLONE_NEWPID is the init one of its new pid
-	 * namespace, so getpid() returns INIT_PID in it, and not the vpid
-	 * from the root pid namespace. A task forked by a one living in a
-	 * nested user namespace gets a random pid, as its parent can not
-	 * set it in the inherited pid namespace. A task living in a nested
-	 * pid namespace is seen by its own kin at its own pid in it, not
-	 * by the one of the root namespace.
-	 */
-	if (!nested_ns_enabled()) {
-		if (vpid(current) != pid) {
-			pr_err("Pid %d do not match expected %d\n", pid, vpid(current));
-			set_task_cr_err(EEXIST);
-			goto err;
-		}
-	} else {
-		pid_t expected = current->own_ns_pid ? current->own_ns_pid : vpid(current);
-
-		if (expected != pid && !(rsti(current)->clone_flags & CLONE_NEWPID && pid == INIT_PID) &&
-		    !nested_ns_pid_can_not_be_set(current)) {
-			pr_err("Pid %d do not match expected %d\n", pid, expected);
-			set_task_cr_err(EEXIST);
-			goto err;
-		}
+	/* In a nested pid namespace the task sees itself at its pid in it */
+	if (!nested_ns_pid_ok(current, pid)) {
+		pr_err("Pid %d do not match expected %d\n", pid, vpid(current));
+		set_task_cr_err(EEXIST);
+		goto err;
 	}
 
 	if (log_init_by_pid(vpid(current)))
@@ -1857,6 +1771,14 @@ static int __restore_task_with_children(void *_arg)
 		 * first task of it, which pins its root too late for them.
 		 */
 		if (nested_ns_pin_roots())
+			goto err;
+
+		/*
+		 * The tasks of the nested user namespaces run as the
+		 * remapped users: let them read the images, from here
+		 * until the end of the restore (nested_ns_images_restore()).
+		 */
+		if (nested_ns_images_open())
 			goto err;
 
 		if (restore_finish_ns_stage(CR_STATE_PREPARE_NAMESPACES, CR_STATE_FORKING) < 0)
@@ -2540,6 +2462,8 @@ skip_ns_bouncing:
 	/* This has the effect of dismissing the image streamer */
 	close_image_dir();
 
+	nested_ns_images_restore();
+
 	ret = run_scripts(ACT_POST_RESUME);
 	if (ret != 0)
 		pr_err("Post-resume script ret code %d\n", ret);
@@ -2575,6 +2499,7 @@ out_kill:
 	}
 
 out:
+	nested_ns_images_restore();
 	depopulate_roots_yard(mnt_ns_fd, true);
 	stop_usernsd();
 	__restore_switch_stage(CR_STATE_FAIL);

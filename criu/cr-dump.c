@@ -1530,7 +1530,7 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 		goto err_cure;
 	}
 
-	item->pid->ns[0].virt = nested_ns_enabled() ? pid_at_dump_level(pid, misc.pid) : misc.pid;
+	item->pid->ns[0].virt = nested_ns_dump_vpid(pid, misc.pid);
 
 	mdc.pre_dump = true;
 	mdc.lazy = false;
@@ -1671,28 +1671,13 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
-	item->pid->ns[0].virt = nested_ns_enabled() ? pid_at_dump_level(pid, misc.pid) : misc.pid;
+	item->pid->ns[0].virt = nested_ns_dump_vpid(pid, misc.pid);
 	pstree_insert_pid(item->pid);
-	/*
-	 * The sid and the pgid from the parasite are in the pid
-	 * namespace of the task. Translate them into the one of the
-	 * root task, the same way as the pid itself: the
-	 * /proc/<pid>/stat ones are already in the pid namespace
-	 * of the reading process.
-	 */
-	if (nested_ns_enabled()) {
-		int pgid, sid;
-
-		if (parse_pid_session(pid, &pgid, &sid)) {
-			pr_err("Can't read the session of %d\n", pid);
-			goto err_cure;
-		}
-		item->sid = sid;
-		item->pgid = pgid;
-	} else {
-		item->sid = misc.sid;
-		item->pgid = misc.pgid;
-	}
+	item->sid = misc.sid;
+	item->pgid = misc.pgid;
+	/* The sid and the pgid of a task in a nested pid namespace need a translation */
+	if (nested_ns_dump_session(pid, &item->pgid, &item->sid))
+		goto err_cure;
 
 	pr_info("sid=%d pgid=%d pid=%d\n", item->sid, item->pgid, vpid(item));
 
