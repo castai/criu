@@ -24,6 +24,7 @@
 #include "servicefd.h"
 #include "util.h"
 #include "util-caps.h"
+#include "fault-injection.h"
 
 #include "common/lock.h"
 
@@ -625,6 +626,16 @@ int nested_ns_child_report(struct pstree_item *item)
 {
 	if (!handshake_active(item))
 		return 0;
+
+	/*
+	 * The fault: a child dying before the handshake, e.g. killed by
+	 * the OOM killer. The parent must notice it and fail the restore
+	 * instead of waiting for the report forever.
+	 */
+	if (fault_injected(FI_NESTED_NS_CHILD_KILL)) {
+		pr_err("fault: the child %d dies before the user namespace handshake\n", vpid(item));
+		kill(getpid(), SIGKILL);
+	}
 
 	/*
 	 * Report our pid to the parent task, which is going to

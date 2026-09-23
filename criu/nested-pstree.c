@@ -229,9 +229,13 @@ int nested_ns_child_namespaces(struct pstree_item *item)
 
 		if (parent && nested_ns_task_nested(item) && item->ids->user_ns_id != parent->ids->user_ns_id)
 			return nested_ns_join_userns(item);
-		return 0;
 	}
 
+	/*
+	 * The uts, ipc and cgroup namespaces below are the ones a task
+	 * has unshared by itself, with or without a user namespace of its
+	 * own: the classic restore never creates them for a sub-task.
+	 */
 	if (rsti(item)->clone_flags & CLONE_NEWUTS) {
 		if (prepare_utsns(item->ids->uts_ns_id))
 			return -1;
@@ -279,12 +283,14 @@ int nested_ns_child_namespaces(struct pstree_item *item)
 		close(self_fd);
 	}
 
-	if (rsti(item)->clone_flags & CLONE_NEWNET) {
+	if ((rsti(item)->clone_flags & (CLONE_NEWUSER | CLONE_NEWNET)) == (CLONE_NEWUSER | CLONE_NEWNET)) {
 		/*
 		 * Create our own network namespace, which is owned by
 		 * our user namespace, and fill it in from its image,
 		 * as the ones created by the root task are owned by
-		 * its user namespace.
+		 * its user namespace. A network namespace of a task
+		 * without a user namespace of its own is created and
+		 * filled in by the root task, the classic way.
 		 */
 		nsid = lookup_ns_by_id(item->ids->net_ns_id, &net_ns_desc);
 		if (!nsid) {
