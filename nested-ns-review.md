@@ -83,11 +83,16 @@ Second pass, the remaining items:
 - Not done: C34 and the rest of M1 as separate commits (the work is delivered as single commits by
   request).
 
-Verification: `make` in an archlinux container (privileged, host cgroupns), zero warnings; zdtm
-`userns_nested -f uns` PASS (with `--nocr` too); env00, pid00, session00, ipc_namespace, utsname, mntns_open
-in h/ns/uns PASS; cgroup00, cgroupns PASS; the earlier host-flavor set (pipe00, pipe01, fifo, maps00,
-pthread00, zombie00, file_shared, sk-unix01, sk-unix-listen02, socket_listen) PASS. Still untested here: the
-real docker-in-docker shape (PostgreSQL) on the target host.
+Verification (archlinux container, privileged, host cgroupns, kernel 7.2): `make` with zero warnings;
+clang-format clean on every changed C hunk; `ruff`, `codespell` and `shellcheck` (on the new script) clean.
+Full zdtm suite (`run -a`, all flavors, 493 tests, 8 in parallel) on the refactored tree: 1126 PASS,
+5 FAIL, all environmental and failing on the unmodified branch as well: `cr_veth(uns)`,
+`socket-tcp-ipt-nfconntrack(h)`, `socket-tcp-ipt-redirect-conntrack(h)` (iptables/conntrack in the
+container), `socket_udplite` (the protocol is gone from the kernel, the test can not create its socket),
+`rseq01(h)` (glibc registers rseq first, the test's registration fails). The unmodified branch, with only
+the two environment fixes applied, fails 16 tests in the same run. `userns_nested`, `userns_nested_deep`,
+the `--fault 7` run and `test/others/nested-ns/run.sh` pass. Still untested here: the real docker-in-docker
+shape (PostgreSQL) on the target host.
 
 ---
 

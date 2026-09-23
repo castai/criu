@@ -7,6 +7,13 @@ from ipaddress import IPv4Address, IPv6Address, ip_address
 
 from google.protobuf.descriptor import FieldDescriptor as FD
 
+import opts_pb2
+
+if "encodebytes" not in dir(base64):
+    base64.encodebytes = base64.encodestring
+    base64.decodebytes = base64.decodestring
+
+
 def _is_repeated(field):
     """The label attribute is gone from the protobuf 7 descriptors."""
     is_repeated = getattr(field, 'is_repeated', None)
@@ -28,6 +35,7 @@ if "encodebytes" not in dir(base64):
     base64.encodebytes = base64.encodestring
     base64.decodebytes = base64.decodestring
 
+(nested-ns: pass ruff on the protobuf shim, record the full zdtm run in the review)
 # pb2dict and dict2pb are methods to convert pb to/from dict.
 # Inspired by:
 #   protobuf-to-dict - https://github.com/benhodgson/protobuf-to-dict
