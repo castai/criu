@@ -271,6 +271,33 @@ static int check_nested_user_ns(struct pstree_item *item)
 	return 0;
 }
 
+/*
+ * A task which has entered a nested user namespace without creating
+ * it (its parent task lives outside of it, and the namespace was
+ * created by another task: the first one met in the walk of the
+ * tree, parents before children) is restored as a child of the
+ * creator, so it inherits the namespaces (see
+ * nested_ns_prepare_pstree()). Its parent of the dump time loses it:
+ * announce it.
+ */
+static void check_entered_task(struct pstree_item *item)
+{
+	struct pstree_item *parent = item->parent;
+	struct ns_id *uns;
+
+	while (parent && !parent->ids)
+		parent = parent->parent;
+	if (!parent || parent->ids->user_ns_id == item->ids->user_ns_id)
+		return;
+
+	uns = lookup_ns_by_id(item->ids->user_ns_id, &user_ns_desc);
+	if (!uns || uns->ns_pid == item->pid->real)
+		return;
+
+	pr_warn("The task %d has entered the user namespace created by %d: it is restored as a child of that task, its parent %d loses it\n",
+		item->pid->real, uns->ns_pid, parent->pid->real);
+}
+
 int nested_ns_check_task(struct pstree_item *item)
 {
 	if (!nested_ns_enabled() || !item->parent)
@@ -280,6 +307,7 @@ int nested_ns_check_task(struct pstree_item *item)
 		if (check_nested_user_ns(item))
 			return -1;
 		mark_task_namespaces(item);
+		check_entered_task(item);
 	}
 
 	return 0;

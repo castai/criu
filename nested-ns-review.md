@@ -67,10 +67,21 @@ pid since its outer pid is not restorable) and extended it with a process group 
 namespace, a bind mount from the parent's tree into B's tmpfs, and a tmpfs file whose owner goes through
 the id maps. It passes with and without C/R; the exclusion from the LIVE workflows is reverted.
 
-Not done (needs a decision or more work): C14 exec re-parenting (kept, warned per task, documented in the
-man page), C22, C24 (hostname failure still tolerated for nested tasks; it restores fine in the test),
-C29, C30, C33 (chroot kept), C34 and the rest of M1 as separate commits, tests for the image flag mismatch,
-the three-level refusal and a child killed during the handshake.
+Second pass, the remaining items:
+- C14: kept as designed (the entered task is restored under the creator of the namespace); the dump now
+  announces every such task with the parent which loses it, and the man page documents it.
+- C22: the uts, ipc and cgroup namespaces unshared by a task without a user namespace of its own are
+  filled in / created by that task too (`nested_ns_child_namespaces()` no longer returns early).
+- C24: the tolerated hostname failure logs its errno; it restores fine in the test (through usernsd).
+- C29, C30: documented in the man page (nsfs mounts and cgroupfs watches are not restored).
+- C33: the chroot vs. mount namespace root note is at the top of `nested_ns_child_mntns()`.
+- Tests: `userns_nested_deep` (crfail) checks that a user namespace two levels down is refused at dump;
+  `FI_NESTED_NS_CHILD_KILL` (fault 7) kills the child before the handshake, the parent notices the abort
+  and the restore fails in milliseconds (`zdtm.py run --fault 7 -t zdtm/static/userns_nested -f uns`
+  passes: faulted restore fails, the retry succeeds); `test/others/nested-ns/run.sh` checks that an image
+  dumped with `--nested-ns` is refused by a restore without it and accepted with it.
+- Not done: C34 and the rest of M1 as separate commits (the work is delivered as single commits by
+  request).
 
 Verification: `make` in an archlinux container (privileged, host cgroupns), zero warnings; zdtm
 `userns_nested -f uns` PASS (with `--nocr` too); env00, pid00, session00, ipc_namespace, utsname, mntns_open

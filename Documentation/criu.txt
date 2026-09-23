@@ -706,8 +706,11 @@ are not adequate, but this can be suppressed by using *--cpu-cap=none*.
    restored as a child of the init of the container, so its original
    parent loses it; a task forked by one of a nested user namespace
    into a pid namespace owned by an outer user namespace gets a random
-   pid. The images dumped with this option need it on restore as well,
-   and the restore needs a kernel with *clone3()* *set_tid* (5.5+).
+   pid. The nsfs bind mounts (the namespace handles of an inner
+   runtime, e.g. /run/docker/netns) and the inotify watches on the
+   cgroup filesystems are not restored. The images dumped with this
+   option need it on restore as well, and the restore needs a kernel
+   with *clone3()* *set_tid* (5.5+).
 
 *--lazy-pages*::
    Restore the processes without filling out the entire memory

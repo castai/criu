@@ -555,6 +555,11 @@ static int open_own_root(void)
  * locked in the user namespace, so the root can not be pivoted or
  * stacked over), the essential filesystems are mounted fresh in it,
  * and the bind mounts are replayed from fds opened before the chroot.
+ *
+ * As it is a chroot and not a root of the namespace, the tasks of the
+ * inner container have a /proc/<pid>/root which is not the root of
+ * their mount namespace: the root fd of the namespace is taken from
+ * the fdstore (see nested_ns_use_fdstore()), never from there.
  */
 int nested_ns_child_mntns(struct pstree_item *item)
 {

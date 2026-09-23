@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <sys/utsname.h>
 #include <string.h>
+#include <errno.h>
 #include <sched.h>
 
 #include "util.h"
@@ -72,7 +73,7 @@ int prepare_utsns(int pid)
 		 * The hostname of the inner containers is not critical for
 		 * the restore.
 		 */
-		pr_warn("Can't restore the hostname of a nested uts namespace\n");
+		pr_warn("Can't restore the hostname of a nested uts namespace: %s\n", strerror(errno));
 		ret = 0;
 	}
 	utsns_entry__free_unpacked(ue, NULL);
