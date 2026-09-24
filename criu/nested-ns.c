@@ -318,6 +318,11 @@ pid_t nested_ns_dump_vpid(pid_t real, pid_t fallback)
 	if (!nested_ns_enabled())
 		return fallback;
 
+	/*
+	 * A negative return means the task is not a member of the pid
+	 * namespace of the root task: the callers refuse the dump (a
+	 * wrong-level pid in the image would break the restore).
+	 */
 	return pid_at_dump_level(real, fallback);
 }
 
@@ -328,13 +333,25 @@ pid_t nested_ns_dump_vpid(pid_t real, pid_t fallback)
  */
 int nested_ns_dump_session(pid_t real, int *pgid, int *sid)
 {
+	int ret;
+
 	if (!nested_ns_enabled())
 		return 0;
 
-	if (parse_pid_session(real, pgid, sid)) {
+	ret = parse_pid_session(real, pgid, sid);
+	if (ret < 0) {
 		pr_err("Can't read the session of %d\n", real);
 		return -1;
 	}
+	if (ret > 0)
+		/*
+		 * The session or the group leader is not visible anymore
+		 * (it exited and was reaped, e.g. the exec-ed shell of a
+		 * runtime exec): the ids of the task itself (the ones of
+		 * its own pid namespace, reported by the parasite) are
+		 * kept, they are left untouched by this call.
+		 */
+		return 0;
 
 	return 0;
 }
@@ -350,6 +367,55 @@ pid_t nested_ns_dump_own_pid(pid_t real, pid_t fallback)
 /*
  * Restore side
  */
+
+/*
+ * The tasks of the inner containers are forked with random pids in the
+ * root pid namespace: their parents live in a nested user namespace,
+ * which has no capabilities to set them (see
+ * nested_ns_pid_can_not_be_set). The kernel assigns the random ones
+ * from the pid counter of the namespace, which the earlier forks of
+ * the tasks with the requested ones leave just below those, so a
+ * random one can collide with the next requested one: the fork of it
+ * fails with EEXIST and the restore with it. Move the counter above
+ * every requested pid before any task is forked: the random ones are
+ * taken from above them all.
+ */
+int nested_ns_seed_pid_counter(void)
+{
+	char buf[32];
+	unsigned long max = 0;
+	struct pstree_item *item;
+	int fd, len;
+
+	if (!nested_ns_enabled())
+		return 0;
+
+	/* The highest pid requested by any task of the tree. */
+	for_each_pstree_item(item) {
+		if (vpid(item) > (pid_t)max)
+			max = vpid(item);
+		if (item->own_ns_pid > (pid_t)max)
+			max = item->own_ns_pid;
+	}
+
+	len = snprintf(buf, sizeof(buf), "%lu", max + 1000);
+
+	fd = open("/proc/sys/kernel/ns_last_pid", O_WRONLY);
+	if (fd < 0) {
+		pr_perror("Can't open the pid namespace counter");
+		return -1;
+	}
+
+	if (write(fd, buf, len) != len) {
+		pr_perror("Can't seed the pid namespace counter to %s", buf);
+		close(fd);
+		return -1;
+	}
+	close(fd);
+
+	pr_debug("Seeded the pid namespace counter above %lu\n", max);
+	return 0;
+}
 
 int nested_ns_check_restore(bool image_nested_ns, bool has_image_flag)
 {
@@ -510,7 +576,21 @@ int nested_ns_set_tid(struct pstree_item *item, pid_t pid, pid_t *set_tid, int m
 	 * namespace owning it, which a task of a nested one does not
 	 * have.
 	 */
-	if (item->own_ns_pid && item->own_ns_pid != pid)
+	/*
+	 * The pid of the own namespace can be requested only when the
+	 * fork happens in it, i.e. the forking parent is a real member
+	 * of the same pid namespace (it has the capabilities to set it
+	 * there). The tasks which have entered the namespaces of an
+	 * inner container may have ended up under a session helper of
+	 * an ancestor one (a synthetic task carrying the ids of the
+	 * container, but forked in the ancestor one): their pid at the
+	 * level of the helper one is requested instead, as it is the
+	 * one settable by it.
+	 */
+	if (item->own_ns_pid && item->own_ns_pid != pid &&
+	    item->parent && item->parent->ids &&
+	    item->parent->pid->state != TASK_HELPER &&
+	    item->parent->ids->pid_ns_id == item->ids->pid_ns_id)
 		set_tid[0] = item->own_ns_pid;
 
 	return 1;
@@ -530,9 +610,17 @@ bool nested_ns_pid_ok(struct pstree_item *item, pid_t pid)
 	 * A task forked with CLONE_NEWPID is the init one of its new pid
 	 * namespace, so getpid() returns INIT_PID in it, and not the vpid
 	 * from the root pid namespace. A task living in a nested pid
-	 * namespace is seen by its own kin at its own pid in it.
+	 * namespace is seen by its own kin at its own pid in it — unless
+	 * it was forked under a session helper of an ancestor one (see
+	 * nested_ns_set_tid): it sees itself at its pid of the helper
+	 * one, the vpid.
 	 */
-	expected = item->own_ns_pid ? item->own_ns_pid : vpid(item);
+	if (item->own_ns_pid && item->parent && item->parent->ids &&
+	    item->parent->pid->state != TASK_HELPER &&
+	    item->parent->ids->pid_ns_id == item->ids->pid_ns_id)
+		expected = item->own_ns_pid;
+	else
+		expected = vpid(item);
 	if (expected == pid)
 		return true;
 

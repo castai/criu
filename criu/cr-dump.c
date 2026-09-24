@@ -1384,6 +1384,8 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 	}
 
 	item->pid->ns[0].virt = nested_ns_dump_vpid(pid, misc.pid);
+	if (item->pid->ns[0].virt < 0)
+		goto err_cure;
 
 	mdc.pre_dump = true;
 	mdc.lazy = false;
@@ -1519,6 +1521,8 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	}
 
 	item->pid->ns[0].virt = nested_ns_dump_vpid(pid, misc.pid);
+	if (item->pid->ns[0].virt < 0)
+		goto err_cure;
 	pstree_insert_pid(item->pid);
 	item->sid = misc.sid;
 	item->pgid = misc.pgid;

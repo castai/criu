@@ -145,6 +145,14 @@ int nested_ns_child_forked(struct pstree_item *item, unsigned long clone_flags, 
 
 /* Child task: report the pid, wait for the maps, abort the handshake. */
 int nested_ns_child_report(struct pstree_item *item);
+/*
+ * Root task: move the pid counter of the root pid namespace above every
+ * requested pid, so the random pids of the tasks of the inner
+ * containers (which their nested user namespace parents can not set)
+ * can not collide with them. To be called before any task is forked.
+ */
+int nested_ns_seed_pid_counter(void);
+
 int nested_ns_child_wait(struct pstree_item *item);
 void nested_ns_child_abort(struct pstree_item *item);
 

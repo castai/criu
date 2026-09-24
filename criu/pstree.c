@@ -1110,6 +1110,17 @@ int prepare_pstree(void)
 		ret = prepare_pstree_ids(pid);
 	if (!ret)
 		/*
+		 * The session helpers above stack the tasks with a dead
+		 * leader under a task of the root pid namespace: the ones
+		 * which have entered the namespaces of an inner container
+		 * (e.g. the docker exec-ed ones) are re-parented under the
+		 * init one of it again, so they are forked from it (the
+		 * clone flags of them were derived from it before the
+		 * helpers ran).
+		 */
+		nested_ns_prepare_pstree();
+	if (!ret)
+		/*
 		 * We need to alloc shared buffers for RseqEntry'es
 		 * arrays (one RseqEntry per pstree item thread).
 		 *

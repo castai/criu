@@ -1159,8 +1159,12 @@ pid_t pid_at_own_level(pid_t pid, pid_t fallback)
 
 /*
  * The pid of a task at the level of the pid namespace of the root task
- * of the dump. With a fallback for when the NSpid chain of the task is
- * shorter than that level.
+ * of the dump. A task whose NSpid chain is shorter than that level is
+ * not a member of the pid namespace of the root task (e.g. a process
+ * exec-ed into the container by the runtime, which runs in a pid
+ * namespace of its own): its pid there does not exist, so the dump is
+ * refused with a clear error instead of recording a wrong-level one,
+ * which the restore can not fork (the image would be silently broken).
  */
 pid_t pid_at_dump_level(pid_t pid, pid_t fallback)
 {
@@ -1179,10 +1183,21 @@ pid_t pid_at_dump_level(pid_t pid, pid_t fallback)
 
 	while (fgets(buf, sizeof(buf), f)) {
 		char *p;
-		int level;
+		int level, count = 0;
 
 		if (strncmp(buf, "NSpid:", 6))
 			continue;
+
+		for (p = buf; (p = strchr(p, '\t')) != NULL; p++)
+			count++;
+
+		if (count < target + 1) {
+			pr_err("Task %d is not in the pid namespace of the root task (its NSpid chain is %d levels, the root one is at %d)\n",
+			       pid, count, target);
+			fclose(f);
+			return -1;
+		}
+
 		p = buf;
 		for (level = 0; level <= target; level++) {
 			p = strchr(p, '\t');
@@ -1203,7 +1218,10 @@ pid_t pid_at_dump_level(pid_t pid, pid_t fallback)
  * Read the pgid and the sid of a task, translated into the pid namespace
  * of the root task of the dump. The /proc/<pid>/stat values are in the
  * pid namespace of the reading process (the node one for criu), so the
- * leaders are looked up to read their NSpid chains.
+ * leaders are looked up to read their NSpid chains. Returns 1 when a
+ * leader is not visible anymore (it exited and was reaped, e.g. the
+ * exec-ed shell of a runtime exec): its pid can not be translated, so
+ * the caller keeps the ids of the task itself.
  */
 int parse_pid_session(pid_t pid, int *pgid, int *sid)
 {
@@ -1234,6 +1252,20 @@ int parse_pid_session(pid_t pid, int *pgid, int *sid)
 
 		if (sscanf(p, "%c %d %d %d", &state, &ppid_, &pgid_real, &sid_real) != 4)
 			goto out;
+	}
+
+	snprintf(path, sizeof(path), "/proc/%d/status", sid_real);
+	if (access(path, F_OK)) {
+		pr_debug("The session leader %d of %d is gone\n", sid_real, pid);
+		ret = 1;
+		goto out;
+	}
+
+	snprintf(path, sizeof(path), "/proc/%d/status", pgid_real);
+	if (access(path, F_OK)) {
+		pr_debug("The group leader %d of %d is gone\n", pgid_real, pid);
+		ret = 1;
+		goto out;
 	}
 
 	*sid = pid_at_dump_level(sid_real, sid_real);
