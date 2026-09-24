@@ -1203,6 +1203,26 @@ err:
  * Find first executable VMA that would fit the initial
  * syscall injection.
  */
+/*
+ * The area the syscall instruction is injected into has to be writable
+ * through ptrace: a shared sealed mapping (e.g. the memfd holding the
+ * packed binary of upx, which maps it read-only sealed) rejects even
+ * the forced writes of ptrace. Probe the area with a write of the word
+ * it holds: the ones which reject it are skipped, the next executable
+ * one is used instead.
+ */
+static bool executable_area_writable(pid_t pid, unsigned long addr)
+{
+	unsigned long word;
+
+	errno = 0;
+	word = ptrace(PTRACE_PEEKDATA, pid, addr, 0);
+	if (errno != 0)
+		return false;
+
+	return ptrace(PTRACE_POKEDATA, pid, addr, (void *)word) == 0;
+}
+
 static unsigned long find_executable_area(int pid)
 {
 	char aux[128];
@@ -1224,6 +1244,11 @@ static unsigned long find_executable_area(int pid)
 		/* f now points at " rwx" (yes, with space) part */
 		if (f[3] == 'x') {
 			BUG_ON(end - start < PARASITE_START_AREA_MIN);
+			if (!executable_area_writable(pid, start)) {
+				pr_debug("Skipping the non-writable executable area %lx-%lx of %d\n",
+					 start, end, pid);
+				continue;
+			}
 			ret = start;
 			break;
 		}

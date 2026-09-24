@@ -1645,6 +1645,15 @@ static int __restore_task_with_children(void *_arg)
 
 	current = ca->item;
 
+	/*
+	 * The root task: the pid counter of the namespace has to be
+	 * above every requested pid before the first task with a random
+	 * one (see nested_ns_seed_pid_counter) is forked by the tasks
+	 * below.
+	 */
+	if (current == root_item && nested_ns_seed_pid_counter())
+		goto err;
+
 	if (current != root_item) {
 		char buf[12];
 		int fd;
