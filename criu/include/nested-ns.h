@@ -215,4 +215,12 @@ void nested_ns_mark_owned(void);
 int nested_ns_read_userns_img(unsigned int id, UsernsEntry **e);
 int nested_ns_join_userns(struct pstree_item *item);
 
+/*
+ * Re-create the inner networking (the bridge and the veth pairs of
+ * the containers of an inner runtime, e.g. a docker-in-docker) in the
+ * network namespace of the container, called by the restore service
+ * after the tree is restored. Returns 0 when there is nothing to do.
+ */
+int nested_ns_restore_inner_network(void);
+
 #endif /* __CR_NESTED_NS_H__ */
