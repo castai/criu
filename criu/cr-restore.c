@@ -2358,6 +2358,10 @@ skip_ns_bouncing:
 	if (ret < 0)
 		goto out_kill;
 
+	ret = nested_ns_restore_inner_network();
+	if (ret < 0)
+		goto out_kill;
+
 	ret = prepare_cgroup_properties();
 	if (ret < 0)
 		goto out_kill;

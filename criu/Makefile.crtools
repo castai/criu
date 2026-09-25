@@ -48,6 +48,7 @@ obj-y			+= nested-ns.o
 obj-y			+= nested-userns.o
 obj-y			+= nested-pstree.o
 obj-y			+= nested-mnt.o
+obj-y			+= nested-net.o
 obj-y			+= nested-runtime.o
 obj-y			+= netfilter.o
 obj-y			+= net.o

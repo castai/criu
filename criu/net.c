@@ -510,19 +510,6 @@ static int dump_one_netdev(int type, struct ifinfomsg *ifi, struct nlattr **tb, 
 		return -1;
 	}
 
-	/*
-	 * The network namespace of an inner container is re-created by
-	 * the task entering it on restore, which can not create the links
-	 * with a peer outside of it (e.g. the veth to the bridge of the
-	 * inner runtime): only the loopback is supported. The inner
-	 * networking is left out with --empty-ns net, which skips this.
-	 */
-	if (nested_ns_owned(ns) && type != ND_TYPE__LOOPBACK) {
-		pr_err("Can't dump the link %s of the nested netns %u: only the loopback of a nested network namespace can be restored, use --empty-ns net\n",
-		       tb[IFLA_IFNAME] ? (char *)RTA_DATA(tb[IFLA_IFNAME]) : "?", ns->id);
-		return -1;
-	}
-
 	netdev.type = type;
 	netdev.ifindex = ifi->ifi_index;
 	netdev.mtu = *(int *)RTA_DATA(tb[IFLA_MTU]);
@@ -2900,7 +2887,17 @@ int dump_net_ns(struct ns_id *ns)
 		ret = pb_write_one(img_from_set(fds, CR_FD_NETNS), &netns, PB_NETNS);
 		if (ret)
 			goto out;
-	} else if (!(opts.empty_ns & CLONE_NEWNET)) {
+	} else if (!(opts.empty_ns & CLONE_NEWNET) || nested_ns_owned(ns)) {
+		/*
+		 * The content of a nested network namespace is dumped
+		 * even with --empty-ns net: the runtime (e.g. runc)
+		 * always passes it, as it does not manage the network
+		 * devices itself, while the links of an inner container
+		 * (e.g. the veth of the bridge of a docker-in-docker)
+		 * are re-created on restore by the root task, which
+		 * has the capabilities in both the network namespace of
+		 * the container and the one its peer lives in.
+		 */
 		int sk;
 
 		sk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
@@ -2931,8 +2928,11 @@ int dump_net_ns(struct ns_id *ns)
 			ret = dump_route(fds);
 		if (!ret)
 			ret = dump_rule(fds);
-		if (!ret)
-			ret = dump_iptables(fds);
+		ret = dump_iptables(fds);
+		if (ret && nested_ns_owned(ns)) {
+			pr_warn("Can't dump the iptables of the nested netns %u\n", ns->id);
+			ret = 0;
+		}
 #if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
 		if (!ret)
 			ret = dump_nftables(fds);
@@ -2941,9 +2941,9 @@ int dump_net_ns(struct ns_id *ns)
 			ret = dump_netns_conf(ns, fds);
 	} else if (ns->type != NS_ROOT && !nested_ns_owned(ns)) {
 		/*
-		 * The network namespaces owned by the nested user namespaces
-		 * are created by the tasks entering them on restore, and their
-		 * content is not dumped, like the empty root one.
+		 * The network namespaces owned by the nested user
+		 * namespaces are dumped even with --empty-ns net, as
+		 * their content is re-created on restore (see above).
 		 */
 		pr_err("Unable to dump more than one netns if the --emptyns is set\n");
 		ret = -1;
@@ -3121,32 +3121,20 @@ int nested_ns_child_netns(struct ns_id *nsid)
 		return -1;
 	nsid->net.ns_fd = fd;
 
-	if (prepare_net_ns_first_stage(nsid))
+	/*
+	 * The namespace is left empty (the loopback above): its links,
+	 * addresses and routes are created by the root task (see
+	 * nested_ns_restore_inner_network) — a pair of a veth has its
+	 * peer in the network namespace of the container, which the
+	 * task entering this one has no capabilities in. The addresses
+	 * and the routes are not restored by the tools of the iproute2
+	 * suite either: they may not exist in the filesystem of the
+	 * inner container, the root task applies them via netlink.
+	 */
+	nsid->net.nsfd_id = fdstore_add(fd);
+	close(fd);
+	if (nsid->net.nsfd_id < 0)
 		return -1;
-
-	nsid->net.nlsk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
-	if (nsid->net.nlsk < 0) {
-		pr_perror("Can't create nlk socket");
-		return -1;
-	}
-
-	{
-		int nrcreated = 0, nrlinks = 0;
-
-		if (__restore_links(nsid, &nrlinks, &nrcreated))
-			return -1;
-
-		/* The links with peers in other namespaces are not supported yet */
-		if (nrcreated != nrlinks) {
-			pr_err("Can't fully restore the links of the nested netns %u\n", nsid->id);
-			return -1;
-		}
-	}
-
-	if (prepare_net_ns_second_stage(nsid))
-		return -1;
-
-	close_safe(&nsid->net.nlsk);
 
 	return 0;
 }
