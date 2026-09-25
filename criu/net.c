@@ -2770,6 +2770,17 @@ out:
 	return ret;
 }
 
+/*
+ * The sysctls of a nested network namespace, applied by the restore
+ * service in the context of it (see nested_ns_restore_inner_network):
+ * the task entering the namespace is done with the network of it
+ * before the service gets to it.
+ */
+int nested_ns_restore_conf(struct ns_id *ns)
+{
+	return restore_netns_conf(ns);
+}
+
 static int mount_ns_sysfs(void)
 {
 	char sys_mount[] = "crtools-sys.XXXXXX";

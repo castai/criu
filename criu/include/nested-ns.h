@@ -223,4 +223,11 @@ int nested_ns_join_userns(struct pstree_item *item);
  */
 int nested_ns_restore_inner_network(void);
 
+/*
+ * The sysctls of a nested network namespace from its image, applied
+ * in the context of the caller (the network namespace of it): used by
+ * the restore service for the ones the tasks entering them leave out.
+ */
+int nested_ns_restore_conf(struct ns_id *ns);
+
 #endif /* __CR_NESTED_NS_H__ */
