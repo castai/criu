@@ -439,6 +439,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	if (req->has_unprivileged)
 		opts.unprivileged = req->unprivileged;
 
+	if (req->has_nested_ns)
+		opts.nested_ns = req->nested_ns;
+
 	if (log_keep_err()) {
 		pr_perror("Can't tune log");
 		goto err;

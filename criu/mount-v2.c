@@ -13,6 +13,7 @@
 #include "util.h"
 #include "filesystems.h"
 #include "mount.h"
+#include "nested-ns.h"
 #include "mount-v2.h"
 #include "namespaces.h"
 #include "fs-magic.h"
@@ -715,6 +716,12 @@ static int do_mount_one_v2(struct mount_info *mi)
 {
 	int ret;
 
+	/* The mounts of a namespace owned by a nested user namespace
+	 * are mounted in place by the task which has entered it.
+	 */
+	if (mi->nsid && nested_ns_own_mntns(mi->nsid))
+		return 0;
+
 	if (mi->mounted)
 		return 0;
 
@@ -1192,6 +1199,11 @@ static int pre_create_mount_namespaces(void)
 		if (nsid->nd != &mnt_ns_desc)
 			continue;
 
+		if (nested_ns_own_mntns(nsid)) {
+			/* created at fork by the task in the nested user namespace */
+			continue;
+		}
+
 		if (switch_ns_by_fd(empty_mntns, &mnt_ns_desc, orig_nsfd == -1 ? &orig_nsfd : NULL))
 			goto err;
 
@@ -1244,6 +1256,11 @@ static int assemble_mount_namespaces(void)
 	for (nsid = ns_ids; nsid != NULL; nsid = nsid->next) {
 		if (nsid->nd != &mnt_ns_desc)
 			continue;
+
+		if (nested_ns_own_mntns(nsid)) {
+			/* assembled in place by the task in the nested user namespace */
+			continue;
+		}
 
 		nsfd = fdstore_get(nsid->mnt.nsfd_id);
 		if (nsfd < 0)

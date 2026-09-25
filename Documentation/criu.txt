@@ -689,6 +689,29 @@ are not adequate, but this can be suppressed by using *--cpu-cap=none*.
    to restore on an older kernel, or a kernel configured without some
    options.
 
+*--nested-ns*::
+   Dump and restore the tasks living in user namespaces nested inside
+   the one of the root task, together with the uts, ipc, pid, network,
+   mount and cgroup namespaces owned by them (e.g. the containers of a
+   docker daemon running inside the dumped container). One level of
+   nesting is supported. The user namespace is re-created by the task
+   which has created it at dump, whose parent writes its id maps; the
+   mount namespace of an inner container is assembled in place by that
+   task, chroot-ed into the root filesystem of the container found in
+   the parent's mount tree. Limitations: the network namespace of an
+   inner container gets its loopback only (dump the tree with
+   *--empty-ns net*, the links of a nested network namespace are
+   refused otherwise); a task which has entered the namespaces of an
+   inner container without creating them (an exec into it) is
+   restored as a child of the init of the container, so its original
+   parent loses it; a task forked by one of a nested user namespace
+   into a pid namespace owned by an outer user namespace gets a random
+   pid. The nsfs bind mounts (the namespace handles of an inner
+   runtime, e.g. /run/docker/netns) and the inotify watches on the
+   cgroup filesystems are not restored. The images dumped with this
+   option need it on restore as well, and the restore needs a kernel
+   with *clone3()* *set_tid* (5.5+).
+
 *--lazy-pages*::
    Restore the processes without filling out the entire memory
    contents. When this option is used, *restore* sets up the

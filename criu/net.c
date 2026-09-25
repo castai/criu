@@ -14,6 +14,7 @@
 #include <sys/mount.h>
 #include <sys/types.h>
 #include <net/if.h>
+#include <sys/ioctl.h>
 #include <linux/sockios.h>
 #include <libnl3/netlink/attr.h>
 #include <libnl3/netlink/msg.h>
@@ -31,6 +32,7 @@
 
 #include "imgset.h"
 #include "namespaces.h"
+#include "nested-ns.h"
 #include "net.h"
 #include "net-clm-conntrack.h"
 #include "libnetlink.h"
@@ -1954,6 +1956,9 @@ static int restore_links(void)
 			if (nsid->nd != &net_ns_desc)
 				continue;
 
+			if (nested_ns_own_netns(nsid))
+				continue;
+
 			if (switch_ns_by_fd(nsid->net.ns_fd, &net_ns_desc, NULL))
 				return -1;
 
@@ -2765,6 +2770,17 @@ out:
 	return ret;
 }
 
+/*
+ * The sysctls of a nested network namespace, applied by the restore
+ * service in the context of it (see nested_ns_restore_inner_network):
+ * the task entering the namespace is done with the network of it
+ * before the service gets to it.
+ */
+int nested_ns_restore_conf(struct ns_id *ns)
+{
+	return restore_netns_conf(ns);
+}
+
 static int mount_ns_sysfs(void)
 {
 	char sys_mount[] = "crtools-sys.XXXXXX";
@@ -2882,7 +2898,17 @@ int dump_net_ns(struct ns_id *ns)
 		ret = pb_write_one(img_from_set(fds, CR_FD_NETNS), &netns, PB_NETNS);
 		if (ret)
 			goto out;
-	} else if (!(opts.empty_ns & CLONE_NEWNET)) {
+	} else if (!(opts.empty_ns & CLONE_NEWNET) || nested_ns_owned(ns)) {
+		/*
+		 * The content of a nested network namespace is dumped
+		 * even with --empty-ns net: the runtime (e.g. runc)
+		 * always passes it, as it does not manage the network
+		 * devices itself, while the links of an inner container
+		 * (e.g. the veth of the bridge of a docker-in-docker)
+		 * are re-created on restore by the root task, which
+		 * has the capabilities in both the network namespace of
+		 * the container and the one its peer lives in.
+		 */
 		int sk;
 
 		sk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
@@ -2913,15 +2939,23 @@ int dump_net_ns(struct ns_id *ns)
 			ret = dump_route(fds);
 		if (!ret)
 			ret = dump_rule(fds);
-		if (!ret)
-			ret = dump_iptables(fds);
+		ret = dump_iptables(fds);
+		if (ret && nested_ns_owned(ns)) {
+			pr_warn("Can't dump the iptables of the nested netns %u\n", ns->id);
+			ret = 0;
+		}
 #if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
 		if (!ret)
 			ret = dump_nftables(fds);
 #endif
 		if (!ret)
 			ret = dump_netns_conf(ns, fds);
-	} else if (ns->type != NS_ROOT) {
+	} else if (ns->type != NS_ROOT && !nested_ns_owned(ns)) {
+		/*
+		 * The network namespaces owned by the nested user
+		 * namespaces are dumped even with --empty-ns net, as
+		 * their content is re-created on restore (see above).
+		 */
 		pr_err("Unable to dump more than one netns if the --emptyns is set\n");
 		ret = -1;
 	}
@@ -3010,8 +3044,21 @@ static int prepare_net_ns_second_stage(struct ns_id *ns)
 			ret = restore_route(nsid);
 		if (!ret)
 			ret = restore_rule(nsid);
-		if (!ret)
+		if (!ret) {
 			ret = restore_iptables(nsid);
+			/*
+			 * The iptables of a nested network namespace are
+			 * restored by the task living in it, inside the root
+			 * filesystem of the inner container, which may lack
+			 * the tool: the rules of the inner container are not
+			 * critical for the restore, the ones of the outer one
+			 * (its bridge, NAT) live in the parent namespace.
+			 */
+			if (ret && nested_ns_owned(ns)) {
+				pr_warn("Can't restore the iptables of the nested netns %u\n", nsid);
+				ret = 0;
+			}
+		}
 		if (!ret)
 			ret = restore_nftables(nsid);
 	}
@@ -3033,6 +3080,74 @@ static int prepare_net_ns_second_stage(struct ns_id *ns)
 	ns->ns_populated = true;
 
 	return ret;
+}
+
+/*
+ * Create the network namespace owned by the nested user namespace
+ * of the calling task and fill it in from its image, called by the
+ * task which has entered the user namespace. The ones created by
+ * the root task are owned by its user namespace, which the tasks
+ * below can not enter.
+ */
+int nested_ns_child_netns(struct ns_id *nsid)
+{
+	int fd;
+
+	if (unshare(CLONE_NEWNET)) {
+		pr_perror("Can't unshare net namespace");
+		return -1;
+	}
+
+	/*
+	 * The content of the namespace is not dumped (see dump_net_ns):
+	 * nothing brings the loopback interface up, while the runtime of
+	 * the inner container had it up, e.g. the database of a CI runner
+	 * is reached on 127.0.0.1 by the builds. Bring it up the way the
+	 * runtime does it: it is the task of the namespace, which has the
+	 * capabilities of it.
+	 */
+	{
+		struct ifreq ifr;
+		int sk;
+
+		sk = socket(AF_INET, SOCK_DGRAM, 0);
+		if (sk < 0) {
+			pr_perror("Can't open a socket for the loopback up");
+			return -1;
+		}
+
+		memset(&ifr, 0, sizeof(ifr));
+		strncpy(ifr.ifr_name, "lo", IFNAMSIZ - 1);
+		ifr.ifr_flags = IFF_UP | IFF_RUNNING;
+		if (ioctl(sk, SIOCSIFFLAGS, &ifr) < 0) {
+			pr_perror("Can't bring the loopback up");
+			close(sk);
+			return -1;
+		}
+		close(sk);
+	}
+
+	fd = open_proc(PROC_SELF, "ns/net");
+	if (fd < 0)
+		return -1;
+	nsid->net.ns_fd = fd;
+
+	/*
+	 * The namespace is left empty (the loopback above): its links,
+	 * addresses and routes are created by the root task (see
+	 * nested_ns_restore_inner_network) — a pair of a veth has its
+	 * peer in the network namespace of the container, which the
+	 * task entering this one has no capabilities in. The addresses
+	 * and the routes are not restored by the tools of the iproute2
+	 * suite either: they may not exist in the filesystem of the
+	 * inner container, the root task applies them via netlink.
+	 */
+	nsid->net.nsfd_id = fdstore_add(fd);
+	close(fd);
+	if (nsid->net.nsfd_id < 0)
+		return -1;
+
+	return 0;
 }
 
 static int open_net_ns(struct ns_id *nsid)
@@ -3085,6 +3200,9 @@ static int __prepare_net_namespaces(void *unused)
 
 		if (nsid->type == NS_ROOT) {
 			nsid->net.ns_fd = root_ns;
+		} else if (nested_ns_own_netns(nsid)) {
+			/* created by the task in the nested user namespace */
+			continue;
 		} else {
 			if (do_create_net_ns(nsid))
 				goto err;
@@ -3093,6 +3211,9 @@ static int __prepare_net_namespaces(void *unused)
 
 	for (nsid = ns_ids; nsid != NULL; nsid = nsid->next) {
 		if (nsid->nd != &net_ns_desc)
+			continue;
+
+		if (nested_ns_own_netns(nsid))
 			continue;
 
 		if (switch_ns_by_fd(nsid->net.ns_fd, &net_ns_desc, NULL))
@@ -3113,6 +3234,9 @@ static int __prepare_net_namespaces(void *unused)
 
 	for (nsid = ns_ids; nsid != NULL; nsid = nsid->next) {
 		if (nsid->nd != &net_ns_desc)
+			continue;
+
+		if (nested_ns_own_netns(nsid))
 			continue;
 
 		if (switch_ns_by_fd(nsid->net.ns_fd, &net_ns_desc, NULL))
@@ -3165,6 +3289,9 @@ int restore_task_net_ns(struct pstree_item *current)
 	if (current->ids && current->ids->has_net_ns_id) {
 		unsigned int id = current->ids->net_ns_id;
 		struct ns_id *nsid;
+
+		if (nested_ns_skip_netns(current))
+			return 0;
 
 		nsid = lookup_ns_by_id(id, &net_ns_desc);
 		if (nsid == NULL) {

@@ -8,4 +8,11 @@ message pstree_entry {
 	required uint32			pgid		= 3;
 	required uint32			sid		= 4;
 	repeated uint32			threads		= 5;
+
+	// CAST AI fields
+	/* The pid of the task in its own (the innermost) pid namespace,
+	 * when it differs from the one of the root task of the dump. The
+	 * high number keeps the field from colliding with the ones the
+	 * upstream criu keeps adding to this message. */
+	optional uint32			own_pid		= 1000;
 }

@@ -48,6 +48,7 @@
 #include "string.h"
 #include "kerndat.h"
 #include "fdstore.h"
+#include "nested-ns.h"
 #include "bpfmap.h"
 #include "pidfd.h"
 
@@ -582,10 +583,26 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 	}
 
 	if (S_ISFIFO(p.stat.st_mode)) {
-		if (p.fs_type == PIPEFS_MAGIC)
+		if (p.fs_type == PIPEFS_MAGIC) {
 			ops = &pipe_dump_ops;
-		else
+		} else if (p.flags & O_PATH) {
+			/*
+			 * An O_PATH fd of a fifo (e.g. a docker-in-docker daemon
+			 * holding the stdio of its inner containers via a symlink)
+			 * can't be used to drain the pipe data: fcntl fails with
+			 * EBADF on O_PATH fds. Dump it as a path to the fifo.
+			 */
+			if (fill_fdlink(lfd, &p, &link))
+				return -1;
+
+			p.link = &link;
+			if (link.name[1] != '/')
+				return dump_unsupp_fd(&p, lfd, "reg", link.name + 1, e);
+
+			ops = &regfile_dump_ops;
+		} else {
 			ops = &fifo_dump_ops;
+		}
 
 		return do_dump_gen_file(&p, lfd, ops, e);
 	}
@@ -799,6 +816,7 @@ static struct fdinfo_list_entry *alloc_fle(int pid, FdinfoEntry *fe)
 	fle->received = 0;
 	fle->fake = 0;
 	fle->stage = FLE_INITIALIZED;
+	fle->fdstore_id = -1;
 	fle->task = pstree_item_by_virt(pid);
 	if (!fle->task) {
 		pr_err("Can't find task with pid %d\n", pid);
@@ -1008,6 +1026,20 @@ static int recv_fd_from_peer(struct fdinfo_list_entry *fle)
 	if (fle->received)
 		return 0;
 
+	/*
+	 * The fd has been put into the fdstore by the sender: our
+	 * network namespaces differ, the transport socket of the peer
+	 * is not reachable from ours.
+	 */
+	if (fle->fdstore_id >= 0) {
+		fd = fdstore_get(fle->fdstore_id);
+		if (fd < 0)
+			return -1;
+		if (plant_fd(fle, fd))
+			return -1;
+		return 0;
+	}
+
 	tsock = get_service_fd(TRANSPORT_FD_OFF);
 	do {
 		ret = __recv_fds(tsock, &fd, 1, (void *)&tmp, sizeof(struct fdinfo_list_entry *), MSG_DONTWAIT);
@@ -1038,8 +1070,28 @@ static int send_fd_to_peer(int fd, struct fdinfo_list_entry *fle)
 	transport_name_gen(&saddr, &len, fle->pid);
 	pr_info("\t\tSend fd %d to %s\n", fd, saddr.sun_path + 1);
 	ret = send_fds(sock, &saddr, len, &fd, 1, (void *)&fle, sizeof(struct fdinfo_list_entry *));
-	if (ret < 0)
+	if (ret < 0) {
+		if (errno == ECONNREFUSED && nested_ns_enabled()) {
+			int id;
+
+			/*
+			 * The peer lives in another network namespace:
+			 * its transport socket is not reachable from ours,
+			 * the abstract unix socket names are scoped by the
+			 * network one. Deliver the fd with the fdstore:
+			 * its socket is inherited by all the tasks with the
+			 * forks, so it is reachable from any namespace.
+			 */
+			id = fdstore_add(fd);
+			if (id < 0)
+				return -1;
+
+			fle->fdstore_id = id;
+			pr_debug("Sent fd %d to %d via fdstore id %d\n", fd, fle->pid, id);
+			return set_fds_event(fle->pid);
+		}
 		return -1;
+	}
 	return set_fds_event(fle->pid);
 }
 
@@ -1095,10 +1147,11 @@ static int serve_out_fd(int pid, int fd, struct file_desc *d)
 	pr_info("\t\tCreate fd for %d\n", fd);
 
 	list_for_each_entry(fle, &d->fd_info_head, desc_list) {
-		if (pid == fle->pid)
+		if (pid == fle->pid) {
 			ret = send_fd_to_self(fd, fle);
-		else
+		} else {
 			ret = send_fd_to_peer(fd, fle);
+		}
 
 		if (ret) {
 			pr_err("Can't sent fd %d to %d\n", fd, fle->pid);

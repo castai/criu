@@ -1,4 +1,9 @@
+# CAST AI: the binary is linked statically in the production flavor
+# only (CASTAI_STATIC=y, see the top Makefile), which also disables
+# the gnutls support: the rest of the builds keeps the original way.
+ifeq ($(CASTAI_STATIC),y)
 LDFLAGS         += -static
+endif
 WRAPFLAGS       += -Wl,--wrap=__strlcpy
 
 # here is a workaround for a bug in libnl-3:

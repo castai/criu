@@ -39,6 +39,7 @@
 #include "vma.h"
 #include "mem.h"
 #include "namespaces.h"
+#include "nested-ns.h"
 #include "criu-log.h"
 #include "util-caps.h"
 
@@ -1008,6 +1009,10 @@ int cr_fchpermat(int dirfd, const char *path, uid_t new_uid, gid_t new_gid, mode
 {
 	struct stat st;
 	int ret;
+
+	/* A task of a nested user namespace sees the ids through its maps */
+	nested_ns_view_id((unsigned int *)&new_uid, true);
+	nested_ns_view_id((unsigned int *)&new_gid, false);
 
 	if (fchownat(dirfd, path, new_uid, new_gid, flags) < 0 && errno != EPERM) {
 		int errno_cpy = errno;

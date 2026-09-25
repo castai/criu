@@ -28,6 +28,7 @@
 #include "mem.h"
 #include "bfd.h"
 #include "proc_parse.h"
+#include "nested-ns.h"
 #include "fdinfo.h"
 #include "parasite.h"
 #include "cr_options.h"
@@ -1084,6 +1085,197 @@ static int cap_parse(char *str, unsigned int *res)
 	return 0;
 }
 
+/*
+ * The level of the pid namespace of the root task of the dump in the
+ * NSpid list of a task, as it is seen from the pid namespace of the
+ * dumping process. -1 if not known, in which case the innermost pid
+ * is used.
+ */
+static int dump_pidns_level = -1;
+
+int set_dump_pidns_level(pid_t root)
+{
+	char path[64], buf[1024];
+	FILE *f;
+	int count = -1;
+
+	snprintf(path, sizeof(path), "/proc/%d/status", root);
+	f = fopen(path, "r");
+	if (!f)
+		return -1;
+
+	while (fgets(buf, sizeof(buf), f)) {
+		char *p;
+
+		if (strncmp(buf, "NSpid:", 6))
+			continue;
+		count = 0;
+		for (p = buf; (p = strchr(p, '\t')) != NULL; p++)
+			count++;
+		break;
+	}
+	fclose(f);
+
+	if (count < 1) {
+		pr_err("Can't read the NSpid of %d\n", root);
+		return -1;
+	}
+
+	dump_pidns_level = count - 1;
+	pr_debug("The pid namespace of the root task is at level %d\n", dump_pidns_level);
+	return 0;
+}
+
+/*
+ * The pid of a task in its own (the innermost) pid namespace: the one
+ * its own kin, e.g. the task which has forked it, sees it as.
+ */
+pid_t pid_at_own_level(pid_t pid, pid_t fallback)
+{
+	char path[64], buf[1024];
+	FILE *f;
+	pid_t ret = fallback;
+
+	snprintf(path, sizeof(path), "/proc/%d/status", pid);
+	f = fopen(path, "r");
+	if (!f)
+		return fallback;
+
+	while (fgets(buf, sizeof(buf), f)) {
+		char *p, *last = NULL;
+
+		if (strncmp(buf, "NSpid:", 6))
+			continue;
+		for (p = buf; (p = strchr(p, '\t')) != NULL; p++)
+			last = p;
+		if (last)
+			ret = atoi(last);
+		break;
+	}
+	fclose(f);
+
+	return ret;
+}
+
+/*
+ * The pid of a task at the level of the pid namespace of the root task
+ * of the dump. A task whose NSpid chain is shorter than that level is
+ * not a member of the pid namespace of the root task (e.g. a process
+ * exec-ed into the container by the runtime, which runs in a pid
+ * namespace of its own): its pid there does not exist, so the dump is
+ * refused with a clear error instead of recording a wrong-level one,
+ * which the restore can not fork (the image would be silently broken).
+ */
+pid_t pid_at_dump_level(pid_t pid, pid_t fallback)
+{
+	char path[64], buf[1024];
+	FILE *f;
+	pid_t ret = fallback;
+	int target = dump_pidns_level;
+
+	if (target < 0)
+		return fallback;
+
+	snprintf(path, sizeof(path), "/proc/%d/status", pid);
+	f = fopen(path, "r");
+	if (!f)
+		return fallback;
+
+	while (fgets(buf, sizeof(buf), f)) {
+		char *p;
+		int level, count = 0;
+
+		if (strncmp(buf, "NSpid:", 6))
+			continue;
+
+		for (p = buf; (p = strchr(p, '\t')) != NULL; p++)
+			count++;
+
+		if (count < target + 1) {
+			pr_err("Task %d is not in the pid namespace of the root task (its NSpid chain is %d levels, the root one is at %d)\n",
+			       pid, count, target);
+			fclose(f);
+			return -1;
+		}
+
+		p = buf;
+		for (level = 0; level <= target; level++) {
+			p = strchr(p, '\t');
+			if (!p)
+				break;
+			p++;
+		}
+		if (p && sscanf(p, "%d", &ret) != 1)
+			ret = fallback;
+		break;
+	}
+	fclose(f);
+
+	return ret;
+}
+
+/*
+ * Read the pgid and the sid of a task, translated into the pid namespace
+ * of the root task of the dump. The /proc/<pid>/stat values are in the
+ * pid namespace of the reading process (the node one for criu), so the
+ * leaders are looked up to read their NSpid chains. Returns 1 when a
+ * leader is not visible anymore (it exited and was reaped, e.g. the
+ * exec-ed shell of a runtime exec): its pid can not be translated, so
+ * the caller keeps the ids of the task itself.
+ */
+int parse_pid_session(pid_t pid, int *pgid, int *sid)
+{
+	char path[64], buf[4096];
+	FILE *f;
+	char *p, *comm_end;
+	int ret = -1;
+	int pgid_real, sid_real;
+
+	snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+	f = fopen(path, "r");
+	if (!f)
+		return -1;
+
+	if (!fgets(buf, sizeof(buf), f))
+		goto out;
+
+	/* Skip the pid and the comm (which can contain spaces) */
+	comm_end = strrchr(buf, ')');
+	if (!comm_end)
+		goto out;
+	p = comm_end + 2; /* skip ") " */
+
+	/* Fields: state ppid pgrp session ... */
+	{
+		char state;
+		int ppid_;
+
+		if (sscanf(p, "%c %d %d %d", &state, &ppid_, &pgid_real, &sid_real) != 4)
+			goto out;
+	}
+
+	snprintf(path, sizeof(path), "/proc/%d/status", sid_real);
+	if (access(path, F_OK)) {
+		pr_debug("The session leader %d of %d is gone\n", sid_real, pid);
+		ret = 1;
+		goto out;
+	}
+
+	snprintf(path, sizeof(path), "/proc/%d/status", pgid_real);
+	if (access(path, F_OK)) {
+		pr_debug("The group leader %d of %d is gone\n", pgid_real, pid);
+		ret = 1;
+		goto out;
+	}
+
+	*sid = pid_at_dump_level(sid_real, sid_real);
+	*pgid = pid_at_dump_level(pgid_real, pgid_real);
+	ret = 0;
+out:
+	fclose(f);
+	return ret;
+}
+
 int parse_pid_status(pid_t pid, struct seize_task_status *ss, void *data)
 {
 	struct proc_status_creds *cr = container_of(ss, struct proc_status_creds, s);
@@ -1129,11 +1321,32 @@ int parse_pid_status(pid_t pid, struct seize_task_status *ss, void *data)
 		}
 
 		if (!strncmp(str, "NSpid:", 6)) {
-			/* Get a thread ID in the thread PID namespace. */
+			/*
+			 * Get a thread ID in the thread PID namespace. With a
+			 * nested pid namespace (e.g. the one of a docker-in-docker
+			 * inner container) the ID is the one from the pid namespace
+			 * of the root task of the dump, which is not necessarily
+			 * the innermost one.
+			 */
 			char *last;
+			int count = 0, level, target;
 
-			last = strrchr(str, '\t');
-			if (!last || sscanf(last, "%d", &cr->s.vpid) != 1) {
+			for (last = str; (last = strchr(last, '\t')) != NULL; last++)
+				count++;
+
+			target = count - 1;
+			if (dump_pidns_level >= 0 && target > dump_pidns_level)
+				target = dump_pidns_level;
+
+			last = str;
+			for (level = 0; level <= target; level++) {
+				last = strchr(last, '\t');
+				if (!last)
+					goto err_parse;
+				last++;
+			}
+
+			if (sscanf(last, "%d", &cr->s.vpid) != 1) {
 				pr_err("Unable to parse: %s\n", str);
 				goto err_parse;
 			}
@@ -1712,6 +1925,20 @@ struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid, bool for_dump)
 		 */
 		if (for_dump && should_skip_mount(new->ns_mountpoint)) {
 			pr_info("\tskip %s @ %s\n", fsname, new->ns_mountpoint);
+			mnt_entry_free(new);
+			new = NULL;
+			goto end;
+		}
+
+		/*
+		 * The nsfs bind mounts are handles for the namespaces of a
+		 * nested container runtime, e.g. the /run/docker/netns files
+		 * of a docker-in-docker. The namespaces themselves are dumped
+		 * as the nested ones, and the files are re-created by the inner
+		 * runtime when it runs its containers, so they are skipped.
+		 */
+		if (for_dump && nested_ns_enabled() && !strcmp(fsname, "nsfs")) {
+			pr_info("\tskip nsfs mount %s @ %s\n", new->source, new->ns_mountpoint);
 			mnt_entry_free(new);
 			new = NULL;
 			goto end;

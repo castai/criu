@@ -147,6 +147,13 @@ message criu_opts {
 	optional bool			log_to_stderr		= 71;
 	optional bool			allow_uprobes		= 72;
 	optional bool			keep_network_lock	= 73;
+
+	// CAST AI fields
+	/* The support for the user namespaces nested inside the restored
+	 * ones (e.g. the containers of a docker-in-docker). The high number
+	 * keeps the field from colliding with the ones the upstream criu
+	 * keeps adding to this message. */
+	optional bool			nested_ns		= 1000;
 /*	optional bool			check_mounts		= 128;	*/
 }
 

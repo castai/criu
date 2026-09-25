@@ -2,12 +2,15 @@
 #include <fcntl.h>
 #include <sys/utsname.h>
 #include <string.h>
+#include <errno.h>
 #include <sched.h>
 
 #include "util.h"
 #include "namespaces.h"
 #include "sysctl.h"
 #include "uts_ns.h"
+#include "nested-ns.h"
+#include "pstree.h"
 
 #include "protobuf.h"
 #include "images/utsns.pb-c.h"
@@ -62,6 +65,17 @@ int prepare_utsns(int pid)
 	req[1].type = CTL_STR(strlen(ue->domainname));
 
 	ret = sysctl_op(req, ARRAY_SIZE(req), CTL_WRITE, CLONE_NEWUTS);
+	if (ret && nested_ns_task_nested(current)) {
+		/*
+		 * A task entering a nested user namespace might not have
+		 * the permission to write the hostname and domainname
+		 * sysctls, which are owned by the parent user namespace.
+		 * The hostname of the inner containers is not critical for
+		 * the restore.
+		 */
+		pr_warn("Can't restore the hostname of a nested uts namespace: %s\n", strerror(errno));
+		ret = 0;
+	}
 	utsns_entry__free_unpacked(ue, NULL);
 out:
 	close_image(img);

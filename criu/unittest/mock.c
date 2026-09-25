@@ -12,6 +12,14 @@ int add_external(char *key)
 	return 0;
 }
 
+/*
+ * The ids are not translated through the id maps of a nested user
+ * namespace in the unit tests.
+ */
+void nested_ns_view_id(unsigned int *id, bool is_uid)
+{
+}
+
 int irmap_scan_path_add(char *path)
 {
 	return 0;

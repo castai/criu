@@ -41,6 +41,7 @@
 #include "ptrace-compat.h"
 #include "util.h"
 #include "namespaces.h"
+#include "nested-ns.h"
 #include "image.h"
 #include "proc_parse.h"
 #include "parasite.h"
@@ -1529,7 +1530,9 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 		goto err_cure;
 	}
 
-	item->pid->ns[0].virt = misc.pid;
+	item->pid->ns[0].virt = nested_ns_dump_vpid(pid, misc.pid);
+	if (item->pid->ns[0].virt < 0)
+		goto err_cure;
 
 	mdc.pre_dump = true;
 	mdc.lazy = false;
@@ -1670,10 +1673,15 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
-	item->pid->ns[0].virt = misc.pid;
+	item->pid->ns[0].virt = nested_ns_dump_vpid(pid, misc.pid);
+	if (item->pid->ns[0].virt < 0)
+		goto err_cure;
 	pstree_insert_pid(item->pid);
 	item->sid = misc.sid;
 	item->pgid = misc.pgid;
+	/* The sid and the pgid of a task in a nested pid namespace need a translation */
+	if (nested_ns_dump_session(pid, &item->pgid, &item->sid))
+		goto err_cure;
 
 	pr_info("sid=%d pgid=%d pid=%d\n", item->sid, item->pgid, vpid(item));
 
