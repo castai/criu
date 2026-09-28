@@ -888,6 +888,17 @@ int read_img_buf_eof(struct cr_img *img, void *ptr, int size)
  *	1  on success
  *	-1 on error or EOF (error message is printed)
  */
+/*
+ * Read the raw bytes of the image, unlike read_img_buf_eof() which
+ * only tells whether the whole size was read: the images of the
+ * dumps of the tools of the iproute2 suite are walked by their own
+ * lengths, so the count of the bytes read is needed.
+ */
+int read_img_data(struct cr_img *img, void *ptr, int size)
+{
+	return bread(&img->_x, ptr, size);
+}
+
 int read_img_buf(struct cr_img *img, void *ptr, int size)
 {
 	int ret;
