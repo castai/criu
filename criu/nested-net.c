@@ -972,7 +972,7 @@ int nested_ns_restore_inner_network(void)
 	}
 
 	for (in = inss; in; in = in->next) {
-		if (getenv("ZDTM_NO_CONF") == NULL && setup_container_conf(in, root_fd))
+		if (setup_container_conf(in, root_fd))
 			goto out;
 
 		for (v = in->veths; v; v = v->next) {

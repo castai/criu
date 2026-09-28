@@ -343,6 +343,9 @@ static int bring_loopback_up(void)
 #define LO_ADDR    "10.0.0.1"
 #define LO_NETMASK "255.255.255.0"
 #define LO_ROUTE_NET "10.99.0.0"
+#define LO_ROUTE_NETMASK "255.255.0.0"
+#define LO_ROUTE_ADDR "10.99.0.1"
+#define LO_ROUTE_ADDR_NETMASK "255.255.255.0"
 #define LO_ROUTE_PROBE "10.99.5.5"
 #define LO_ADDR6   "fd00:db8::1"
 
@@ -380,8 +383,11 @@ static int add_loopback_extras(void)
 		char buf[64];
 	} areq;
 	struct in6_addr a6;
+	struct in_addr a4;
 	int sfd, nfd, idx;
-	struct sockaddr_nl nl;
+	struct sockaddr_nl nl = {
+		.nl_family = AF_NETLINK,
+	};
 	struct iovec iov = { &areq, sizeof(areq) };
 	struct msghdr msg = { &nl, sizeof(nl), &iov, 1, NULL, 0, 0 };
 	struct nlmsghdr *ack = (struct nlmsghdr *)areq.buf;
@@ -418,11 +424,18 @@ static int add_loopback_extras(void)
 	idx = ifr.ifr_ifindex;
 
 	/* The route of the network of the extra address, through lo */
+	/*
+	 * The address of the routed network on the loopback is added
+	 * with a netlink request below, together with the IPv6 one:
+	 * a connection through the route needs a source address of
+	 * it, and the probe one is outside of the connected /24, so
+	 * it can only be reached through the /16 route below.
+	 */
 	memset(&rt, 0, sizeof(rt));
 	rdst->sin_family = AF_INET;
 	rdst->sin_addr.s_addr = inet_addr(LO_ROUTE_NET);
 	rmask->sin_family = AF_INET;
-	rmask->sin_addr.s_addr = inet_addr(LO_NETMASK);
+	rmask->sin_addr.s_addr = inet_addr(LO_ROUTE_NETMASK);
 	rt.rt_flags = RTF_UP;
 	rt.rt_dev = "lo";
 	if (ioctl(sfd, SIOCADDRT, &rt)) {
@@ -432,7 +445,15 @@ static int add_loopback_extras(void)
 	close(sfd);
 	sfd = -1;
 
-	/* The IPv6 address of the loopback, with a netlink request */
+	/*
+	 * The extra address of the routed network and the IPv6 one,
+	 * with netlink requests of our own: the ioctls set the
+	 * primary address of an interface only.
+	 */
+	if (inet_pton(AF_INET, LO_ROUTE_ADDR, &a4) != 1) {
+		pr_err("Can't parse the %s address\n", LO_ROUTE_ADDR);
+		goto out;
+	}
 	if (inet_pton(AF_INET6, LO_ADDR6, &a6) != 1) {
 		pr_err("Can't parse the %s address\n", LO_ADDR6);
 		goto out;
@@ -444,33 +465,52 @@ static int add_loopback_extras(void)
 		goto out;
 	}
 
-	memset(&areq, 0, sizeof(areq));
-	areq.n.nlmsg_len = NLMSG_LENGTH(sizeof(areq.a));
-	areq.n.nlmsg_type = RTM_NEWADDR;
-	areq.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
-	areq.n.nlmsg_seq = 42;
-	areq.a.ifa_family = AF_INET6;
-	areq.a.ifa_prefixlen = 128;
-	areq.a.ifa_index = idx;
-	if (addattr_l(&areq.n, sizeof(areq), IFA_LOCAL, &a6, sizeof(a6)) ||
-	    addattr_l(&areq.n, sizeof(areq), IFA_ADDRESS, &a6, sizeof(a6))) {
-		pr_err("Can't build the address request\n");
-		goto out;
-	}
+	{
+		const struct {
+			int family;
+			int prefixlen;
+			const void *addr;
+			int alen;
+		} addrs[] = {
+			{ AF_INET, 24, &a4, sizeof(a4) },
+			{ AF_INET6, 128, &a6, sizeof(a6) },
+		};
+		int i;
 
-	if (sendmsg(nfd, &msg, 0) < 0) {
-		pr_perror("Can't send the address request");
-		goto out;
-	}
+		for (i = 0; i < (int)ARRAY_SIZE(addrs); i++) {
+			memset(&areq, 0, sizeof(areq));
+			areq.n.nlmsg_len = NLMSG_LENGTH(sizeof(areq.a));
+			areq.n.nlmsg_type = RTM_NEWADDR;
+			areq.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+			areq.n.nlmsg_seq = 42;
+			areq.a.ifa_family = addrs[i].family;
+			areq.a.ifa_prefixlen = addrs[i].prefixlen;
+			areq.a.ifa_index = idx;
+			if (addattr_l(&areq.n, sizeof(areq), IFA_LOCAL, addrs[i].addr, addrs[i].alen) ||
+			    addattr_l(&areq.n, sizeof(areq), IFA_ADDRESS, addrs[i].addr, addrs[i].alen)) {
+				pr_err("Can't build the address request\n");
+				goto out;
+			}
 
-	rlen = recvmsg(nfd, &rmsg, 0);
-	if (rlen < 0) {
-		pr_perror("Can't recv the address reply");
-		goto out;
-	}
-	if (ack->nlmsg_type != NLMSG_ERROR || ((struct nlmsgerr *)NLMSG_DATA(ack))->error) {
-		pr_err("The address request was rejected\n");
-		goto out;
+			iov.iov_len = areq.n.nlmsg_len;
+			if (sendmsg(nfd, &msg, 0) < 0) {
+				pr_perror("Can't send the address request");
+				goto out;
+			}
+
+			rlen = recvmsg(nfd, &rmsg, 0);
+			if (rlen < 0) {
+				pr_perror("Can't recv the address reply");
+				goto out;
+			}
+			ack = (struct nlmsghdr *)rbuf;
+			if (ack->nlmsg_type != NLMSG_ERROR || ((struct nlmsgerr *)NLMSG_DATA(ack))->error) {
+				pr_err("The address request was rejected (%d)\n",
+				       ack->nlmsg_type == NLMSG_ERROR ?
+					       ((struct nlmsgerr *)NLMSG_DATA(ack))->error : 0);
+				goto out;
+			}
+		}
 	}
 	close(nfd);
 
