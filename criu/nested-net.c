@@ -7,10 +7,6 @@
 #include <net/if.h>
 #include <linux/rtnetlink.h>
 #include <linux/if_link.h>
-#include <linux/if_ether.h>
-#include <libnl3/netlink/attr.h>
-#include <libnl3/netlink/msg.h>
-#include <libnl3/netlink/netlink.h>
 
 #include "types.h"
 #include "log.h"
@@ -20,7 +16,6 @@
 #include "fdstore.h"
 #include "files.h"
 #include "image.h"
-#include "bfd.h"
 #include "libnetlink.h"
 #include "cr_options.h"
 #include "nested-ns.h"
@@ -152,7 +147,10 @@ static int inner_dump_foreach(int type, unsigned int nsid,
 		return 0;
 	}
 
-	/* The lazy ones are opened here: their magic is not read yet. */
+	/*
+	 * The lazy ones are opened by the raw fd of the image: their
+	 * magic is not read yet, so it is skipped by hand here.
+	 */
 	if (img_raw_fd(img) < 0) {
 		close_image(img);
 		return -1;
@@ -160,22 +158,24 @@ static int inner_dump_foreach(int type, unsigned int nsid,
 	{
 		u32 magic;
 
-		if (bread(&img->_x, &magic, sizeof(magic)) != sizeof(magic)) {
+		if (read_img_data(img, &magic, sizeof(magic)) != sizeof(magic)) {
 			close_image(img);
 			return -1;
 		}
 	}
 
-	while ((len = bread(&img->_x, buf, sizeof(buf))) > 0) {
+	while ((len = read_img_data(img, buf, sizeof(buf))) > 0) {
 		struct nlmsghdr *h;
 		size_t rem = (size_t)len;
 
 		for (h = (struct nlmsghdr *)buf; NLMSG_OK(h, rem); h = NLMSG_NEXT(h, rem)) {
-			if (cb(h, arg))
-				goto out;
+			if (cb(h, arg)) {
+				close_image(img);
+				return -1;
+			}
 		}
 	}
-out:
+
 	close_image(img);
 	return 0;
 }
@@ -337,6 +337,28 @@ static int inner_route_cb(struct nlmsghdr *h, void *arg)
 	return 0;
 }
 
+static void free_inner_ns(struct inner_ns *in)
+{
+	while (in->veths) {
+		struct inner_veth *v = in->veths->next;
+
+		while (in->veths->addrs) {
+			struct inner_addr *a = in->veths->addrs->next;
+			xfree(in->veths->addrs);
+			in->veths->addrs = a;
+		}
+		while (in->veths->routes) {
+			struct inner_route *r = in->veths->routes->next;
+			xfree(in->veths->routes);
+			in->veths->routes = r;
+		}
+		xfree(in->veths);
+		in->veths = v;
+	}
+	close(in->nsfd);
+	xfree(in);
+}
+
 static int collect_inner_ns(struct inner_ns **head, struct ns_id *ns)
 {
 	struct inner_ns *in, *t;
@@ -357,6 +379,7 @@ static int collect_inner_ns(struct inner_ns **head, struct ns_id *ns)
 
 	img = open_image(CR_FD_NETDEV, O_RSTR, ns->id);
 	if (!img) {
+		close(in->nsfd);
 		xfree(in);
 		return -1;
 	}
@@ -376,11 +399,8 @@ static int collect_inner_ns(struct inner_ns **head, struct ns_id *ns)
 			 * applied from the images below.
 			 */
 			v = xzalloc(sizeof(*v));
-			if (!v) {
-				close_image(img);
-				xfree(in);
-				return -1;
-			}
+			if (!v)
+				goto err;
 			v->ns_id = ns->id;
 			v->nsfd = in->nsfd;
 			strncpy(v->name, "lo", IFNAMSIZ - 1);
@@ -402,12 +422,27 @@ static int collect_inner_ns(struct inner_ns **head, struct ns_id *ns)
 			continue;
 		}
 
-		v = xzalloc(sizeof(*v));
-		if (!v) {
-			close_image(img);
-			xfree(in);
-			return -1;
+		if (nde->has_peer_nsid) {
+			struct ns_id *peer_ns = lookup_ns_by_id(nde->peer_nsid, &net_ns_desc);
+
+			/*
+			 * The peer of the pair is in the network namespace
+			 * of the container (the root one, external) only if
+			 * that is the one recorded: the pairs with the peer
+			 * in another restored namespace are created by the
+			 * regular restore of the links, which knows both
+			 * ends of them.
+			 */
+			if (peer_ns != net_get_root_ns()) {
+				pr_warn("The %s veth of the nested netns %u with the peer in the netns %u is left to the regular restore\n",
+					nde->name, ns->id, nde->peer_nsid);
+				continue;
+			}
 		}
+
+		v = xzalloc(sizeof(*v));
+		if (!v)
+			goto err;
 		v->ns_id = ns->id;
 		v->nsfd = in->nsfd;
 		strncpy(v->name, nde->name, IFNAMSIZ - 1);
@@ -436,6 +471,10 @@ static int collect_inner_ns(struct inner_ns **head, struct ns_id *ns)
 	}
 
 	return 0;
+err:
+	close_image(img);
+	free_inner_ns(in);
+	return -1;
 }
 
 static int link_index_by_name(int sk, const char *name)
@@ -906,7 +945,7 @@ static struct inner_bridge *build_bridge_groups(struct inner_ns *inss)
 
 			b = xzalloc(sizeof(*b));
 			if (!b)
-				return NULL;
+				goto err;
 			b->has_addr = true;
 			b->addr = v->gw4;
 			b->prefixlen = v->v4prefix ? v->v4prefix : 16;
@@ -936,7 +975,7 @@ static struct inner_bridge *build_bridge_groups(struct inner_ns *inss)
 		 */
 		b = xzalloc(sizeof(*b));
 		if (!b)
-			return NULL;
+			goto err;
 		strncpy(b->name, "docker0", sizeof(b->name) - 1);
 		return b;
 	}
@@ -955,15 +994,22 @@ static struct inner_bridge *build_bridge_groups(struct inner_ns *inss)
 			snprintf(b->name, sizeof(b->name), "br-criu%u", (unsigned)(i++ % 100000));
 
 	return bridges;
+err:
+	while (bridges) {
+		b = bridges->next;
+		xfree(bridges);
+		bridges = b;
+	}
+	return NULL;
 }
 
 int nested_ns_restore_inner_network(void)
 {
 	struct ns_id *root_ns, *ns;
-	struct inner_ns *inss = NULL, *in, *int2;
+	struct inner_ns *inss = NULL, *in;
 	struct inner_veth *v;
 	struct inner_bridge *bridges = NULL, *b, *b2;
-	int root_fd = -1, sk = -1, pod_idx, ret = -1;
+	int root_fd = -1, self_fd = -1, sk = -1, pod_idx, ret = -1;
 
 	if (!nested_ns_enabled())
 		return 0;
@@ -990,6 +1036,9 @@ int nested_ns_restore_inner_network(void)
 			pr_err("Can't get the fd of the root netns from the fdstore\n");
 			return -1;
 		}
+	} else {
+		pr_err("Can't find the network namespace of the container\n");
+		return -1;
 	}
 
 	/* The veths of the images, per their network namespace */
@@ -1016,6 +1065,10 @@ int nested_ns_restore_inner_network(void)
 	bridges = build_bridge_groups(inss);
 
 	if (bridges) {
+		self_fd = open_proc(PROC_SELF, "ns/net");
+		if (self_fd < 0)
+			goto out;
+
 		if (setns(root_fd, CLONE_NEWNET)) {
 			pr_perror("Can't enter the network namespace of the container");
 			goto out;
@@ -1078,31 +1131,24 @@ int nested_ns_restore_inner_network(void)
 	ret = 0;
 out:
 	close_safe(&sk);
+	if (self_fd >= 0) {
+		/* Back to the network namespace of the service itself */
+		if (setns(self_fd, CLONE_NEWNET)) {
+			pr_perror("Can't return to the network namespace of the service");
+			ret = -1;
+		}
+		close(self_fd);
+	}
 	if (root_fd >= 0)
 		close(root_fd);
 	for (b = bridges; b; b = b2) {
 		b2 = b->next;
 		xfree(b);
 	}
-	for (in = inss; in; in = int2) {
-		int2 = in->next;
-		while (in->veths) {
-			v = in->veths->next;
-			while (in->veths->addrs) {
-				struct inner_addr *a = in->veths->addrs->next;
-				xfree(in->veths->addrs);
-				in->veths->addrs = a;
-			}
-			while (in->veths->routes) {
-				struct inner_route *r = in->veths->routes->next;
-				xfree(in->veths->routes);
-				in->veths->routes = r;
-			}
-			xfree(in->veths);
-			in->veths = v;
-		}
-		close(in->nsfd);
-		xfree(in);
+	while (inss) {
+		in = inss->next;
+		free_inner_ns(inss);
+		inss = in;
 	}
 	return ret;
 }

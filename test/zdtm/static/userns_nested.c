@@ -22,6 +22,9 @@
 #include <sys/socket.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#include <linux/if_link.h>
+
+#define NLMSG_TAIL(n) ((struct rtattr *)((char *)(n) + NLMSG_ALIGN((n)->nlmsg_len)))
 #include <net/if.h>
 #include <net/route.h>
 #include <arpa/inet.h>
@@ -349,6 +352,20 @@ static int bring_loopback_up(void)
 #define LO_ROUTE_PROBE "10.99.5.5"
 #define LO_ADDR6   "fd00:db8::1"
 
+/*
+ * The sysctl of the interfaces of the namespace: a distinctive value
+ * of it is set up before the dump, to check the ones of the image are
+ * applied at restore (the veth pairs and the bridges of the inner
+ * networks, whose ends live in the network namespace of the
+ * container — not migrated — can not be set up in this test: a
+ * network namespace with no tasks in it is destroyed at the dump, and
+ * holding one with a file descriptor breaks it; the e2e test of the
+ * live migration suite covers them instead, with the one of the pod
+ * of a docker-in-docker).
+ */
+#define SYSCTL_CONF  "/proc/sys/net/ipv4/conf/all/rp_filter"
+#define SYSCTL_VAL   "2"
+
 static int addattr_l(struct nlmsghdr *n, int maxlen, int type, const void *data, int alen)
 {
 	int len = 4 + alen;
@@ -513,6 +530,26 @@ static int add_loopback_extras(void)
 		}
 	}
 	close(nfd);
+
+	/*
+	 * A distinctive value of a per-netns sysctl of the interfaces,
+	 * to check the ones of the namespace are applied from its image
+	 * at restore.
+	 */
+	{
+		int fd = open(SYSCTL_CONF, O_WRONLY);
+
+		if (fd < 0) {
+			pr_perror("Can't open %s", SYSCTL_CONF);
+			return -1;
+		}
+		if (write(fd, SYSCTL_VAL, sizeof(SYSCTL_VAL) - 1) != sizeof(SYSCTL_VAL) - 1) {
+			pr_perror("Can't set %s", SYSCTL_CONF);
+			close(fd);
+			return -1;
+		}
+		close(fd);
+	}
 
 	return 0;
 out:
@@ -691,6 +728,25 @@ static int check_nested_ns_state(int marker_fd)
 		pr_err("The network of the namespace is not restored after C/R\n");
 		return -1;
 	}
+
+	/*
+	 * The sysctl of the namespace is the one set up before the dump:
+	 * the ones of the image are applied at restore.
+	 */
+	{
+		char v[64];
+
+		if (read_file_text(SYSCTL_CONF, v, sizeof(v))) {
+			pr_err("Can't read %s after C/R\n", SYSCTL_CONF);
+			return -1;
+		}
+		if (atoi(v) != atoi(SYSCTL_VAL)) {
+			pr_err("The %s is not ours after C/R ('%s')\n", SYSCTL_CONF, v);
+			return -1;
+		}
+	}
+
+
 
 	/*
 	 * The cgroup of the task is restored as it was at dump: the path
@@ -897,6 +953,7 @@ static int nested_child(void)
 	/* The extra network of the namespace, restored from its images */
 	if (add_loopback_extras())
 		goto err;
+
 
 	/* our own ipc and cgroup namespaces, like an inner container has */
 	if (unshare(CLONE_NEWIPC)) {
