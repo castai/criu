@@ -20,7 +20,10 @@
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <net/if.h>
+#include <net/route.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/ipc.h>
@@ -30,7 +33,7 @@
 #include "zdtmtst.h"
 #include "lock.h"
 
-const char *test_doc = "Check C/R of a process in a nested user namespace";
+const char *test_doc = "Check C/R of a process in a nested user namespace, its network included";
 const char *test_author = "CAST AI";
 
 /*
@@ -330,6 +333,227 @@ static int bring_loopback_up(void)
 }
 
 /*
+ * The extra addresses and the route of the loopback of the network
+ * namespace of B, set up before the dump and replayed from the images
+ * of it at restore: the address of the loopback which is not the
+ * standard one, a route to a network through it, and an IPv6 address
+ * of it, like the ones of the network of an inner container set up by
+ * its runtime.
+ */
+#define LO_ADDR    "10.0.0.1"
+#define LO_NETMASK "255.255.255.0"
+#define LO_ROUTE_NET "10.99.0.0"
+#define LO_ROUTE_PROBE "10.99.5.5"
+#define LO_ADDR6   "fd00:db8::1"
+
+static int addattr_l(struct nlmsghdr *n, int maxlen, int type, const void *data, int alen)
+{
+	int len = 4 + alen;
+	struct rtattr *rta;
+
+	if (NLMSG_ALIGN(n->nlmsg_len) + len > maxlen)
+		return -1;
+	rta = (struct rtattr *)((char *)n + NLMSG_ALIGN(n->nlmsg_len));
+	rta->rta_type = type;
+	rta->rta_len = len;
+	memcpy((char *)rta + 4, data, alen);
+	n->nlmsg_len = NLMSG_ALIGN(n->nlmsg_len) + len;
+	return 0;
+}
+
+/*
+ * The setup is done in-process, with ioctls and a netlink request of
+ * our own: the tasks of the nested user namespace are root in it
+ * only, and the root of the outer one has no capabilities in it, so
+ * an exec-ed helper would lose the ones of the namespace.
+ */
+static int add_loopback_extras(void)
+{
+	struct ifreq ifr;
+	struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
+	struct rtentry rt;
+	struct sockaddr_in *rdst = (struct sockaddr_in *)&rt.rt_dst;
+	struct sockaddr_in *rmask = (struct sockaddr_in *)&rt.rt_genmask;
+	struct {
+		struct nlmsghdr n;
+		struct ifaddrmsg a;
+		char buf[64];
+	} areq;
+	struct in6_addr a6;
+	int sfd, nfd, idx;
+	struct sockaddr_nl nl;
+	struct iovec iov = { &areq, sizeof(areq) };
+	struct msghdr msg = { &nl, sizeof(nl), &iov, 1, NULL, 0, 0 };
+	struct nlmsghdr *ack = (struct nlmsghdr *)areq.buf;
+	char rbuf[512];
+	struct iovec riov = { rbuf, sizeof(rbuf) };
+	struct msghdr rmsg = { &nl, sizeof(nl), &riov, 1, NULL, 0, 0 };
+	ssize_t rlen;
+
+	sfd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sfd < 0) {
+		pr_perror("Can't open socket");
+		return -1;
+	}
+
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, "lo", IFNAMSIZ - 1);
+	sin->sin_family = AF_INET;
+	sin->sin_addr.s_addr = inet_addr(LO_ADDR);
+	if (ioctl(sfd, SIOCSIFADDR, &ifr)) {
+		pr_perror("Can't set the %s address of lo", LO_ADDR);
+		goto out;
+	}
+
+	sin->sin_addr.s_addr = inet_addr(LO_NETMASK);
+	if (ioctl(sfd, SIOCSIFNETMASK, &ifr)) {
+		pr_perror("Can't set the netmask of lo");
+		goto out;
+	}
+
+	if (ioctl(sfd, SIOCGIFINDEX, &ifr)) {
+		pr_perror("Can't get the index of lo");
+		goto out;
+	}
+	idx = ifr.ifr_ifindex;
+
+	/* The route of the network of the extra address, through lo */
+	memset(&rt, 0, sizeof(rt));
+	rdst->sin_family = AF_INET;
+	rdst->sin_addr.s_addr = inet_addr(LO_ROUTE_NET);
+	rmask->sin_family = AF_INET;
+	rmask->sin_addr.s_addr = inet_addr(LO_NETMASK);
+	rt.rt_flags = RTF_UP;
+	rt.rt_dev = "lo";
+	if (ioctl(sfd, SIOCADDRT, &rt)) {
+		pr_perror("Can't add the %s route of lo", LO_ROUTE_NET);
+		goto out;
+	}
+	close(sfd);
+	sfd = -1;
+
+	/* The IPv6 address of the loopback, with a netlink request */
+	if (inet_pton(AF_INET6, LO_ADDR6, &a6) != 1) {
+		pr_err("Can't parse the %s address\n", LO_ADDR6);
+		goto out;
+	}
+
+	nfd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+	if (nfd < 0) {
+		pr_perror("Can't open a netlink socket");
+		goto out;
+	}
+
+	memset(&areq, 0, sizeof(areq));
+	areq.n.nlmsg_len = NLMSG_LENGTH(sizeof(areq.a));
+	areq.n.nlmsg_type = RTM_NEWADDR;
+	areq.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+	areq.n.nlmsg_seq = 42;
+	areq.a.ifa_family = AF_INET6;
+	areq.a.ifa_prefixlen = 128;
+	areq.a.ifa_index = idx;
+	if (addattr_l(&areq.n, sizeof(areq), IFA_LOCAL, &a6, sizeof(a6)) ||
+	    addattr_l(&areq.n, sizeof(areq), IFA_ADDRESS, &a6, sizeof(a6))) {
+		pr_err("Can't build the address request\n");
+		goto out;
+	}
+
+	if (sendmsg(nfd, &msg, 0) < 0) {
+		pr_perror("Can't send the address request");
+		goto out;
+	}
+
+	rlen = recvmsg(nfd, &rmsg, 0);
+	if (rlen < 0) {
+		pr_perror("Can't recv the address reply");
+		goto out;
+	}
+	if (ack->nlmsg_type != NLMSG_ERROR || ((struct nlmsgerr *)NLMSG_DATA(ack))->error) {
+		pr_err("The address request was rejected\n");
+		goto out;
+	}
+	close(nfd);
+
+	return 0;
+out:
+	if (sfd >= 0)
+		close(sfd);
+	return -1;
+}
+
+/*
+ * The network of the namespace of B is restored from its images: the
+ * extra address of the loopback is there again (a socket of it can be
+ * bound to it), the route of it resolves (a socket of it can be
+ * connected through it), and the IPv6 address of it is bound as well.
+ */
+static int network_is_restored(void)
+{
+	struct sockaddr_in a4;
+	struct sockaddr_in6 a6;
+	int fd, one = 1;
+
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		pr_perror("Can't open an IPv4 socket");
+		return -1;
+	}
+	memset(&a4, 0, sizeof(a4));
+	a4.sin_family = AF_INET;
+	a4.sin_port = htons(4242);
+	a4.sin_addr.s_addr = inet_addr(LO_ADDR);
+	if (bind(fd, (struct sockaddr *)&a4, sizeof(a4))) {
+		pr_perror("Can't bind to the %s address of lo", LO_ADDR);
+		close(fd);
+		return -1;
+	}
+	close(fd);
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		pr_perror("Can't open an UDP socket");
+		return -1;
+	}
+	memset(&a4, 0, sizeof(a4));
+	a4.sin_family = AF_INET;
+	a4.sin_port = htons(9);
+	a4.sin_addr.s_addr = inet_addr(LO_ROUTE_PROBE);
+	if (connect(fd, (struct sockaddr *)&a4, sizeof(a4))) {
+		pr_perror("Can't reach %s, the route of lo is lost", LO_ROUTE_PROBE);
+		close(fd);
+		return -1;
+	}
+	close(fd);
+
+	fd = socket(AF_INET6, SOCK_STREAM, 0);
+	if (fd < 0) {
+		pr_perror("Can't open an IPv6 socket");
+		return -1;
+	}
+	if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one))) {
+		pr_perror("Can't set IPV6_V6ONLY");
+		close(fd);
+		return -1;
+	}
+	memset(&a6, 0, sizeof(a6));
+	a6.sin6_family = AF_INET6;
+	a6.sin6_port = htons(4243);
+	if (inet_pton(AF_INET6, LO_ADDR6, &a6.sin6_addr) != 1) {
+		pr_err("Can't parse the %s address\n", LO_ADDR6);
+		close(fd);
+		return -1;
+	}
+	if (bind(fd, (struct sockaddr *)&a6, sizeof(a6))) {
+		pr_perror("Can't bind to the %s address of lo", LO_ADDR6);
+		close(fd);
+		return -1;
+	}
+	close(fd);
+
+	return 0;
+}
+
+/*
  * The address of the loopback is replayed from the network namespace
  * image at restore: check it is the one it had at dump.
  */
@@ -420,6 +644,11 @@ static int check_nested_ns_state(int marker_fd)
 
 	if (!loopback_addr_is_ours()) {
 		pr_err("The address of lo is not ours after C/R\n");
+		return -1;
+	}
+
+	if (network_is_restored()) {
+		pr_err("The network of the namespace is not restored after C/R\n");
 		return -1;
 	}
 
@@ -623,6 +852,10 @@ static int nested_child(void)
 	}
 
 	if (bring_loopback_up())
+		goto err;
+
+	/* The extra network of the namespace, restored from its images */
+	if (add_loopback_extras())
 		goto err;
 
 	/* our own ipc and cgroup namespaces, like an inner container has */

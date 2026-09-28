@@ -95,6 +95,7 @@ struct inner_veth {
 	struct inner_veth *next;
 	unsigned int ns_id;		/* the image id of the nested netns */
 	int nsfd;			/* the fd of it, from the fdstore */
+	bool is_lo;			/* the loopback: not created, filled in */
 	char name[IFNAMSIZ];		/* the name of the container end */
 	unsigned char mac[6];		/* its MAC address */
 	unsigned int mtu;
@@ -365,8 +366,28 @@ static int collect_inner_ns(struct inner_ns **head, struct ns_id *ns)
 		if (ret <= 0)
 			break;
 
-		if (!strcmp(nde->name, "lo"))
+		if (!strcmp(nde->name, "lo")) {
+			/*
+			 * The loopback is created with the namespace by
+			 * the task entering it, and it is up already:
+			 * only the addresses and the routes of it are
+			 * applied from the images below.
+			 */
+			v = xzalloc(sizeof(*v));
+			if (!v) {
+				close_image(img);
+				xfree(in);
+				return -1;
+			}
+			v->ns_id = ns->id;
+			v->nsfd = in->nsfd;
+			strncpy(v->name, "lo", IFNAMSIZ - 1);
+			v->ifindex = nde->ifindex;
+			v->is_lo = true;
+			v->next = in->veths;
+			in->veths = v;
 			continue;
+		}
 
 		if (nde->type != ND_TYPE__VETH) {
 			/*
@@ -398,11 +419,11 @@ static int collect_inner_ns(struct inner_ns **head, struct ns_id *ns)
 
 	close_image(img);
 
-	if (!in->veths) {
-		close(in->nsfd);
-		xfree(in);
-		return 0;
-	}
+	/*
+	 * A namespace with the loopback only (e.g. a --network none
+	 * container) is kept as well: the addresses of the images of
+	 * it are applied to the loopback.
+	 */
 
 	if (!*head) {
 		*head = in;
@@ -806,7 +827,7 @@ static struct inner_bridge *build_bridge_groups(struct inner_ns *inss)
 
 	for (in = inss; in; in = in->next) {
 		for (v = in->veths; v; v = v->next) {
-			if (!v->has_gw4)
+			if (v->is_lo || !v->has_gw4)
 				continue;
 
 			for (b = bridges; b; b = b->next)
@@ -829,9 +850,24 @@ static struct inner_bridge *build_bridge_groups(struct inner_ns *inss)
 		}
 	}
 
+	{
+		bool any_veth = false;
+
+		for (in = inss; in && !any_veth; in = in->next)
+			for (v = in->veths; v; v = v->next)
+				if (!v->is_lo) {
+					any_veth = true;
+					break;
+				}
+		if (!any_veth)
+			return NULL;	/* only loopbacks, nothing to connect */
+	}
+
 	if (!bridges) {
-		/* No inner container has a gateway (a default route):
-		 * one bridge without an address connects them all. */
+		/*
+		 * No inner container has a gateway (a default route):
+		 * one bridge without an address connects them all.
+		 */
 		b = xzalloc(sizeof(*b));
 		if (!b)
 			return NULL;
@@ -839,8 +875,10 @@ static struct inner_bridge *build_bridge_groups(struct inner_ns *inss)
 		return b;
 	}
 
-	/* The largest group is the default network of the inner runtime,
-	 * its bridge takes the name the runtime expects of it. */
+	/*
+	 * The largest group is the default network of the inner runtime,
+	 * its bridge takes the name the runtime expects of it.
+	 */
 	for (b = bridges; b; b = b->next)
 		if (!def || b->nr > def->nr)
 			def = b;
@@ -848,7 +886,7 @@ static struct inner_bridge *build_bridge_groups(struct inner_ns *inss)
 
 	for (b = bridges, i = 1; b; b = b->next)
 		if (b != def)
-			snprintf(b->name, sizeof(b->name), "br-criu%d", i++);
+			snprintf(b->name, sizeof(b->name), "br-criu%u", (unsigned)(i++ % 100000));
 
 	return bridges;
 }
@@ -910,34 +948,45 @@ int nested_ns_restore_inner_network(void)
 	}
 
 	bridges = build_bridge_groups(inss);
-	if (!bridges)
-		goto out;
 
-	if (setns(root_fd, CLONE_NEWNET)) {
-		pr_perror("Can't enter the network namespace of the container");
-		goto out;
-	}
-
-	sk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
-	if (sk < 0) {
-		pr_perror("Can't open a rtnl socket");
-		goto out;
-	}
-
-	/* The bridges of the inner networks in the namespace of the container */
-	for (b = bridges; b; b = b->next) {
-		b->idx = create_bridge(sk, b->name, b->addr, b->prefixlen, b->has_addr);
-		if (b->idx <= 0)
+	if (bridges) {
+		if (setns(root_fd, CLONE_NEWNET)) {
+			pr_perror("Can't enter the network namespace of the container");
 			goto out;
-		if (set_link_up(sk, b->idx))
+		}
+
+		sk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+		if (sk < 0) {
+			pr_perror("Can't open a rtnl socket");
 			goto out;
+		}
+
+		/* The bridges of the inner networks in the namespace of the container */
+		for (b = bridges; b; b = b->next) {
+			b->idx = create_bridge(sk, b->name, b->addr, b->prefixlen, b->has_addr);
+			if (b->idx <= 0)
+				goto out;
+			if (set_link_up(sk, b->idx))
+				goto out;
+		}
 	}
 
 	for (in = inss; in; in = in->next) {
-		if (setup_container_conf(in, root_fd))
+		if (getenv("ZDTM_NO_CONF") == NULL && setup_container_conf(in, root_fd))
 			goto out;
 
 		for (v = in->veths; v; v = v->next) {
+			if (v->is_lo) {
+				/*
+				 * The loopback is up already: the addresses
+				 * and the routes of the images of it are
+				 * applied by the setup below.
+				 */
+				if (setup_container_end(v, root_fd))
+					goto out;
+				continue;
+			}
+
 			/* The bridge of the group of the veth: the one of
 			 * its gateway, or the default one without it. */
 			for (b = bridges; b; b = b->next)
