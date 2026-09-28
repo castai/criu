@@ -575,6 +575,7 @@ static int network_is_restored(void)
 		pr_perror("Can't open an IPv4 socket");
 		return -1;
 	}
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 	memset(&a4, 0, sizeof(a4));
 	a4.sin_family = AF_INET;
 	a4.sin_port = htons(4242);
@@ -591,6 +592,8 @@ static int network_is_restored(void)
 		pr_perror("Can't open an UDP socket");
 		return -1;
 	}
+	/* The connect only resolves the route, nothing is sent: the
+	 * ephemeral port of it does not clash with the listener below. */
 	memset(&a4, 0, sizeof(a4));
 	a4.sin_family = AF_INET;
 	a4.sin_port = htons(9);
@@ -607,6 +610,7 @@ static int network_is_restored(void)
 		pr_perror("Can't open an IPv6 socket");
 		return -1;
 	}
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 	if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one))) {
 		pr_perror("Can't set IPV6_V6ONLY");
 		close(fd);
