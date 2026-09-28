@@ -1,6 +1,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sched.h>
 #include <arpa/inet.h>
 #include <net/if.h>
@@ -64,13 +65,14 @@ enum {
  * the runtime of the inner containers keeps working after the
  * restore.
  *
- * The identifiers of the other network namespaces, the rules of the
- * policy routing and the iptables of the inner containers are not
- * restored: the first are needed for the pairs with both ends in
- * the dumped tree only, the other two are rare in a container (the
- * ones of the inner runtime live in the network namespace of the
- * container, which is not migrated, so the masquerade of the
- * outgoing traffic of the containers is lost with it).
+ * The masquerade rules of the outgoing traffic of the inner
+ * containers are re-created per the bridge of them (see
+ * setup_bridge_outbound), so they keep reaching the services
+ * outside of the pod after the restore. The identifiers of the
+ * other network namespaces, the rules of the policy routing and
+ * the iptables of the inner containers are not restored: the first
+ * are needed for the pairs with both ends in the dumped tree only,
+ * the other two are rare in a container.
  */
 
 struct inner_addr {
@@ -779,6 +781,70 @@ out_ns:
 }
 
 /*
+ * The outgoing traffic of the inner containers: the forwarding and
+ * the masquerade rules of the inner runtime (the ones it sets up in
+ * the network namespace of the container for its bridges) are lost
+ * with the namespace itself, as it is not migrated. Without them the
+ * containers of an inner runtime can not reach anything outside of
+ * their bridge after the restore. The forwarding is enabled and the
+ * rules are re-created the way the runtime sets them up, so a CI
+ * runner of a dind pod keeps pulling images and talking to the
+ * services outside of the pod. The rules are added with a check for
+ * the one already there first, so a retry of the restore of the
+ * same tree into the same namespace does not duplicate them.
+ */
+static int setup_bridge_outbound(struct inner_bridge *b)
+{
+	char subnet[32];
+	char cmd[512];
+	int ret, fd;
+
+	if (!b->has_addr)
+		return 0;
+
+	if (!inet_ntop(AF_INET, &b->addr, subnet, sizeof(subnet)))
+		return -1;
+
+	fd = open("/proc/sys/net/ipv4/ip_forward", O_WRONLY);
+	if (fd < 0) {
+		pr_perror("Can't open the ip_forward sysctl");
+		return -1;
+	}
+	ret = write(fd, "1", 1) != 1 ? -1 : 0;
+	close(fd);
+	if (ret) {
+		pr_perror("Can't enable the ip_forward sysctl");
+		return -1;
+	}
+
+	snprintf(cmd, sizeof(cmd),
+		 "iptables -w -t nat -C POSTROUTING -s %s/%u ! -o %s -j MASQUERADE 2>/dev/null || "
+		 "iptables -w -t nat -A POSTROUTING -s %s/%u ! -o %s -j MASQUERADE",
+		 subnet, b->prefixlen, b->name, subnet, b->prefixlen, b->name);
+	ret = cr_system(-1, -1, -1, "sh", (char *[]){ "sh", "-c", cmd, NULL }, 0);
+	if (ret)
+		pr_warn("Can't set the masquerade rule of the %s bridge (is iptables there?)\n", b->name);
+
+	snprintf(cmd, sizeof(cmd),
+		 "iptables -w -C FORWARD -i %s ! -o %s -j ACCEPT 2>/dev/null || "
+		 "iptables -w -A FORWARD -i %s ! -o %s -j ACCEPT",
+		 b->name, b->name, b->name, b->name);
+	ret = cr_system(-1, -1, -1, "sh", (char *[]){ "sh", "-c", cmd, NULL }, 0);
+	if (ret)
+		pr_warn("Can't set the forward rule of the %s bridge (is iptables there?)\n", b->name);
+
+	snprintf(cmd, sizeof(cmd),
+		 "iptables -w -C FORWARD -o %s ! -i %s -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || "
+		 "iptables -w -A FORWARD -o %s ! -i %s -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT",
+		 b->name, b->name, b->name, b->name);
+	ret = cr_system(-1, -1, -1, "sh", (char *[]){ "sh", "-c", cmd, NULL }, 0);
+	if (ret)
+		pr_warn("Can't set the reply forward rule of the %s bridge (is iptables there?)\n", b->name);
+
+	return 0;
+}
+
+/*
  * The sysctls of the network namespace (the conf of the interfaces
  * and the ones of the protocols), the way the restore of a regular
  * one applies them: a failure of one is not fatal for the restore,
@@ -967,6 +1033,8 @@ int nested_ns_restore_inner_network(void)
 			if (b->idx <= 0)
 				goto out;
 			if (set_link_up(sk, b->idx))
+				goto out;
+			if (setup_bridge_outbound(b))
 				goto out;
 		}
 	}
