@@ -209,6 +209,23 @@ void nested_ns_images_restore(void);
 void nested_ns_patch_runc_states(void);
 
 /*
+ * The helpers of the pid namespaces of the nested user namespaces
+ * (implemented in nested-ns.c).
+ */
+int set_dump_pidns_level(pid_t root);
+int nested_ns_dump_pidns_level(void);
+pid_t pid_at_dump_level(pid_t pid, pid_t fallback);
+pid_t pid_at_own_level(pid_t pid, pid_t fallback);
+int parse_pid_session(pid_t pid, int *pgid, int *sid);
+
+/*
+ * The network namespace owned by the nested user namespace of the
+ * calling task, created empty by the one entering it (the rest of
+ * the network of it is set up by nested_ns_restore_inner_network).
+ */
+int nested_ns_child_netns(struct ns_id *nsid);
+
+/*
  * Internal, between the nested-*.c files.
  */
 void nested_ns_mark_owned(void);
