@@ -214,6 +214,7 @@ void nested_ns_patch_runc_states(void);
  */
 int set_dump_pidns_level(pid_t root);
 int nested_ns_dump_pidns_level(void);
+void nested_ns_discover(pid_t pid);
 pid_t pid_at_dump_level(pid_t pid, pid_t fallback);
 pid_t pid_at_own_level(pid_t pid, pid_t fallback);
 int parse_pid_session(pid_t pid, int *pgid, int *sid);

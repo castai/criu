@@ -464,6 +464,8 @@ static unsigned int generate_ns_id(int pid, unsigned int kid, struct ns_desc *nd
 			pr_info("Will take %s namespace in the image\n", nd->str);
 			root_ns_mask |= nd->cflag;
 			type = NS_ROOT;
+		} else if (nd == &user_ns_desc) {
+			nested_ns_discover(pid);
 		} else if ((nd->cflag & ~CLONE_SUBNS) && !nested_ns_dump_ok(nd)) {
 			pr_err("Can't dump nested %s namespace for %d\n", nd->str, pid);
 			return 0;
@@ -701,6 +703,10 @@ int predump_task_ns_ids(struct pstree_item *item)
 {
 	int pid = item->pid->real;
 
+	/* The user namespace first, see dump_task_ns_ids() */
+	if (!get_ns_id(pid, &user_ns_desc, NULL))
+		return -1;
+
 	if (!__get_ns_id(pid, &net_ns_desc, NULL, &dmpi(item)->netns))
 		return -1;
 
@@ -714,6 +720,18 @@ int dump_task_ns_ids(struct pstree_item *item)
 {
 	int pid = item->pid->real;
 	TaskKobjIdsEntry *ids = item->ids;
+
+	/*
+	 * The user namespace goes first: a task living in a nested one
+	 * turns the nested namespaces support on (see generate_ns_id),
+	 * which the collection of the other namespaces of it needs.
+	 */
+	ids->has_user_ns_id = true;
+	ids->user_ns_id = get_ns_id(pid, &user_ns_desc, NULL);
+	if (!ids->user_ns_id) {
+		pr_err("Can't make userns id\n");
+		return -1;
+	}
 
 	ids->has_pid_ns_id = true;
 	ids->pid_ns_id = get_ns_id(pid, &pid_ns_desc, NULL);
@@ -766,13 +784,6 @@ int dump_task_ns_ids(struct pstree_item *item)
 	ids->mnt_ns_id = get_ns_id(pid, &mnt_ns_desc, NULL);
 	if (!ids->mnt_ns_id) {
 		pr_err("Can't make mntns id\n");
-		return -1;
-	}
-
-	ids->has_user_ns_id = true;
-	ids->user_ns_id = get_ns_id(pid, &user_ns_desc, NULL);
-	if (!ids->user_ns_id) {
-		pr_err("Can't make userns id\n");
 		return -1;
 	}
 

@@ -419,15 +419,35 @@ int nested_ns_seed_pid_counter(void)
 	return 0;
 }
 
+/*
+ * A task whose user namespace is not the root task's one: the nested
+ * namespaces support is turned on by it, the dump and the restore of
+ * the tree take the shape of it from this moment on. Called while the
+ * ids of the tasks are collected (the user namespace of a task is the
+ * first one of them, so the others of the task are collected with the
+ * support already on).
+ */
+void nested_ns_discover(pid_t pid)
+{
+	if (!nested_ns_enabled())
+		pr_info("The task %d lives in a nested user namespace: the nested namespaces support is on\n", pid);
+	opts.nested_ns = true;
+}
+
 int nested_ns_check_restore(bool image_nested_ns, bool has_image_flag)
 {
-	if (has_image_flag && image_nested_ns && !nested_ns_enabled()) {
-		pr_err("The images were dumped with --nested-ns: the restore needs it too\n");
-		return -1;
+	/*
+	 * The images carry the flag of the dump: the restore takes the
+	 * shape of the tree from them, the option is turned on by them.
+	 */
+	if (has_image_flag && image_nested_ns) {
+		if (!nested_ns_enabled())
+			pr_info("The images were dumped with the nested namespaces support: it is on for the restore\n");
+		opts.nested_ns = true;
 	}
 
 	if (nested_ns_enabled() && !kdat.has_clone3_set_tid) {
-		pr_err("--nested-ns needs clone3() with set_tid (a 5.5+ kernel)\n");
+		pr_err("The nested namespaces support needs clone3() with set_tid (a 5.5+ kernel)\n");
 		return -1;
 	}
 
