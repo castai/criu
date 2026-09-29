@@ -13,6 +13,7 @@
 #include "common/list.h"
 #include "xmalloc.h"
 #include "cgroup.h"
+#include "nested-ns.h"
 #include "cgroup-props.h"
 #include "cr_options.h"
 #include "pstree.h"
@@ -1117,6 +1118,16 @@ bool is_special_property(const char *prop)
 	return false;
 }
 
+/*
+ * The request of a move into a cgroup: the pid to write, or 0 for the
+ * one of the caller (as the executor of the call sees it), and the
+ * path of the cgroup.procs file in the yard.
+ */
+struct cg_move_req {
+	pid_t pid;
+	char path[0];
+};
+
 static int userns_move(void *arg, int fd, pid_t pid)
 {
 	char pidbuf[32];
@@ -1209,14 +1220,29 @@ static int prepare_cgns(CgSetEntry *se)
 	return 0;
 }
 
-static int move_in_cgroup(CgSetEntry *se)
+static int userns_move_pid(void *arg, int fd, pid_t pid)
+{
+	struct cg_move_req *req = arg;
+
+	return userns_move(req->path, fd, req->pid ? req->pid : pid);
+}
+
+/*
+ * Move the task with the given pid (0 for the calling one) into the
+ * cgroups of the set. With the usernsd running, the pid is the one the
+ * daemon sees (the pid namespace of criu), otherwise the one of the
+ * caller's pid namespace.
+ */
+static int move_in_cgroup(CgSetEntry *se, pid_t pid)
 {
 	int i;
 
-	pr_info("Move into %d\n", se->id);
+	pr_info("Move %d into %d\n", pid, se->id);
 
 	for (i = 0; i < se->n_ctls; i++) {
-		char aux[PATH_MAX];
+		char buf[sizeof(struct cg_move_req) + PATH_MAX];
+		struct cg_move_req *req = (struct cg_move_req *)buf;
+		char *aux = req->path;
 		int fd = -1, err, j, aux_off;
 		CgMemberEntry *ce = se->ctls[i];
 		CgControllerEntry *ctrl = NULL;
@@ -1234,7 +1260,8 @@ static int move_in_cgroup(CgSetEntry *se)
 			return -1;
 		}
 
-		aux_off = ctrl_dir_and_opt(ctrl, aux, sizeof(aux), NULL, 0);
+		req->pid = pid;
+		aux_off = ctrl_dir_and_opt(ctrl, aux, PATH_MAX, NULL, 0);
 
 		/* Note that unshare(CLONE_NEWCGROUP) doesn't change the view
 		 * of previously mounted cgroupfses; since we're restoring via
@@ -1242,9 +1269,12 @@ static int move_in_cgroup(CgSetEntry *se)
 		 * the root cgns, we still want to use the full path here when
 		 * we move into the cgroup.
 		 */
-		snprintf(aux + aux_off, sizeof(aux) - aux_off, "/%s/cgroup.procs", ce->path);
+		snprintf(aux + aux_off, PATH_MAX - aux_off, "/%s/cgroup.procs", ce->path);
 		pr_debug("  `-> %s\n", aux);
-		err = userns_call(userns_move, 0, aux, strlen(aux) + 1, -1);
+		if (pid)
+			err = userns_call(userns_move_pid, 0, req, sizeof(*req) + strlen(aux) + 1, -1);
+		else
+			err = userns_call(userns_move, 0, aux, strlen(aux) + 1, -1);
 		if (err < 0) {
 			pr_perror("Can't move into %s (%d/%d)", aux, err, fd);
 			return -1;
@@ -1303,6 +1333,14 @@ int restore_task_cgroup(struct pstree_item *me)
 	if (!rsti(me)->cg_set)
 		return 0;
 
+	/*
+	 * A task entering a nested user namespace has no permissions
+	 * over the cgroups, which are owned by the parent user namespace:
+	 * it is moved by its parent task (see restore_child_cgroup()).
+	 */
+	if (nested_ns_enabled() && (rsti(me)->clone_flags & CLONE_NEWUSER))
+		return 0;
+
 	/* Zombies and helpers can have cg_set == 0 so we skip them */
 	while (parent && !rsti(parent)->cg_set)
 		parent = parent->parent;
@@ -1323,7 +1361,47 @@ int restore_task_cgroup(struct pstree_item *me)
 		return -1;
 	}
 
-	return move_in_cgroup(se);
+	return move_in_cgroup(se, 0);
+}
+
+/*
+ * Move a just forked child into its cgroups from the parent task:
+ * used for the children entering a nested user namespace, which can
+ * not do it by themselves. pid is the one of the child in the pid
+ * namespace of the caller (as clone() has returned it).
+ */
+int restore_child_cgroup(struct pstree_item *child, pid_t pid)
+{
+	struct pstree_item *parent = child->parent;
+	CgSetEntry *se;
+	u32 current_cgset;
+
+	if (opts.manage_cgroups == CG_MODE_IGNORE)
+		return 0;
+
+	if (!rsti(child)->cg_set)
+		return 0;
+
+	while (parent && !rsti(parent)->cg_set)
+		parent = parent->parent;
+
+	current_cgset = parent ? rsti(parent)->cg_set : root_cg_set;
+	if (rsti(child)->cg_set == current_cgset) {
+		pr_info("Cgroups %d of %d inherited from parent\n", current_cgset, vpid(child));
+		return 0;
+	}
+
+	se = find_rst_set_by_id(rsti(child)->cg_set);
+	if (!se) {
+		pr_err("No set %d found\n", rsti(child)->cg_set);
+		return -1;
+	}
+
+	/* The usernsd does the write when the root task is in a user namespace: it knows the child by its real pid */
+	if (root_ns_mask & CLONE_NEWUSER)
+		pid = child->pid->real;
+
+	return move_in_cgroup(se, pid);
 }
 
 void fini_cgroup(void)

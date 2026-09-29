@@ -46,9 +46,11 @@ int clone_noasan(int (*fn)(void *), int flags, void *arg)
 	return clone(fn, stack_ptr, flags, arg);
 }
 
-int clone3_with_pid_noasan(int (*fn)(void *), void *arg, int flags, int exit_signal, pid_t pid)
+int clone3_with_pids_noasan(int (*fn)(void *), void *arg, int flags, int exit_signal, pid_t *set_tid,
+			     size_t set_tid_size)
 {
 	struct _clone_args c_args = {};
+	long ret;
 
 	BUG_ON(flags & CLONE_VM);
 
@@ -75,10 +77,15 @@ int clone3_with_pid_noasan(int (*fn)(void *), void *arg, int flags, int exit_sig
 		c_args.exit_signal = exit_signal;
 	}
 	c_args.flags = flags;
-	c_args.set_tid = ptr_to_u64(&pid);
-	c_args.set_tid_size = 1;
-	pid = syscall(__NR_clone3, &c_args, sizeof(c_args));
-	if (pid == 0)
+	c_args.set_tid = ptr_to_u64(set_tid);
+	c_args.set_tid_size = set_tid_size;
+	ret = syscall(__NR_clone3, &c_args, sizeof(c_args));
+	if (ret == 0)
 		exit(fn(arg));
-	return pid;
+	return ret;
+}
+
+int clone3_with_pid_noasan(int (*fn)(void *), void *arg, int flags, int exit_signal, pid_t pid)
+{
+	return clone3_with_pids_noasan(fn, arg, flags, exit_signal, &pid, 1);
 }

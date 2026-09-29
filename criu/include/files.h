@@ -90,6 +90,17 @@ struct fdinfo_list_entry {
 	u8 received : 1;
 	u8 stage : 3;
 	u8 fake : 1;
+	/*
+	 * The fd of a task living in another network namespace can not
+	 * be delivered with the transport socket: the abstract unix
+	 * socket names are scoped by the network namespace, and the one
+	 * of the peer is not reachable from ours. Such an fd is put into
+	 * the fdstore instead (which is inherited by all the tasks with
+	 * the forks, so it is reachable from any namespace), and this
+	 * field holds its id there, written by the sender. It lives in
+	 * the shared memory: readable by the receiver task.
+	 */
+	int fdstore_id;
 };
 
 extern int inh_fd_max;

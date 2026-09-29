@@ -187,6 +187,7 @@ extern int write_img_buf(struct cr_img *, const void *ptr, int size);
 #define write_img(img, ptr) write_img_buf((img), (ptr), sizeof(*(ptr)))
 extern int read_img_buf_eof(struct cr_img *, void *ptr, int size);
 #define read_img_eof(img, ptr) read_img_buf_eof((img), (ptr), sizeof(*(ptr)))
+extern int read_img_data(struct cr_img *, void *ptr, int size);
 extern int read_img_buf(struct cr_img *, void *ptr, int size);
 #define read_img(img, ptr) read_img_buf((img), (ptr), sizeof(*(ptr)))
 extern int read_img_str(struct cr_img *, char **pstr, int size);

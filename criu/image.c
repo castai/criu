@@ -19,6 +19,7 @@
 #include "proc_parse.h"
 #include "img-streamer.h"
 #include "namespaces.h"
+#include "nested-ns.h"
 
 bool ns_per_id = false;
 bool img_common_magic = true;
@@ -54,6 +55,9 @@ int check_img_inventory(bool restore)
 	}
 
 	ns_per_id = he->has_ns_per_id ? he->ns_per_id : false;
+
+	if (restore && nested_ns_check_restore(he->nested_ns, he->has_nested_ns))
+		goto out_close;
 
 	if (he->root_ids) {
 		root_ids = xmalloc(sizeof(*root_ids));
@@ -245,6 +249,16 @@ int write_img_inventory(InventoryEntry *he)
 	int ret;
 
 	pr_info("Writing image inventory (version %u)\n", CRTOOLS_IMAGES_V1);
+
+	/*
+	 * The nested user namespaces are discovered while the tree is
+	 * collected, which is after the entry of the inventory is
+	 * prepared: the flag of the option is taken at the write time.
+	 */
+	if (opts.nested_ns) {
+		he->has_nested_ns = true;
+		he->nested_ns = true;
+	}
 
 	img = open_image(CR_FD_INVENTORY, O_DUMP);
 	if (!img)
@@ -878,6 +892,17 @@ int read_img_buf_eof(struct cr_img *img, void *ptr, int size)
  *	1  on success
  *	-1 on error or EOF (error message is printed)
  */
+/*
+ * Read the raw bytes of the image, unlike read_img_buf_eof() which
+ * only tells whether the whole size was read: the images of the
+ * dumps of the tools of the iproute2 suite are walked by their own
+ * lengths, so the count of the bytes read is needed.
+ */
+int read_img_data(struct cr_img *img, void *ptr, int size)
+{
+	return bread(&img->_x, ptr, size);
+}
+
 int read_img_buf(struct cr_img *img, void *ptr, int size)
 {
 	int ret;

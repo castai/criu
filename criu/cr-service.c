@@ -439,6 +439,7 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	if (req->has_unprivileged)
 		opts.unprivileged = req->unprivileged;
 
+
 	if (log_keep_err()) {
 		pr_perror("Can't tune log");
 		goto err;

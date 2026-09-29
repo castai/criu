@@ -6,6 +6,7 @@
 #include "imgset.h"
 #include "files.h"
 #include "sockets.h"
+#include "nested-ns.h"
 #include "util.h"
 
 #include "protobuf.h"
@@ -68,13 +69,32 @@ int netlink_receive_one(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 	return sk_collect_one(m->ndiag_ino, PF_NETLINK, &sd->sd, ns);
 }
 
-static bool can_dump_netlink_sk(int lfd)
+static bool can_dump_netlink_sk(int lfd, const struct fd_parms *p)
 {
 	int ret;
 
 	ret = fd_has_data(lfd);
-	if (ret == 1)
-		pr_err("The socket has data to read\n");
+
+	/*
+	 * The tolerance is by the flag, not by the task: the daemons of
+	 * the outer container of a nested-ns dump (e.g. the dockerd and
+	 * the containerd of a docker-in-docker pod) are not in a nested
+	 * user namespace, but always hold the events of the containers
+	 * on their netlink sockets.
+	 */
+	if (nested_ns_enabled()) {
+		/*
+		 * The netlink sockets of the daemons of a nested container
+		 * runtime (e.g. a docker-in-docker) may hold the events of
+		 * the ones running in another network namespace: the data
+		 * is dropped on restore, like on a live one.
+		 */
+		if (ret < 0)
+			return false;
+		if (ret == 1)
+			pr_warn("The socket has data to read. It will be dropped on restore\n");
+		return true;
+	}
 
 	return ret == 0;
 }
@@ -93,7 +113,7 @@ static int dump_one_netlink_fd(int lfd, u32 id, const struct fd_parms *p)
 	ne.id = id;
 	ne.ino = p->stat.st_ino;
 
-	if (!can_dump_netlink_sk(lfd))
+	if (!can_dump_netlink_sk(lfd, p))
 		goto err;
 
 	if (sk) {

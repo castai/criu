@@ -14,6 +14,7 @@
 #include "bitops.h"
 #include "libnetlink.h"
 #include "sockets.h"
+#include "nested-ns.h"
 #include "unix_diag.h"
 #include "inet_diag.h"
 #include "packet_diag.h"
@@ -484,7 +485,14 @@ int sk_setbufs(int sk, uint32_t *bufs)
 
 	if (setsockopt(sk, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf, sizeof(sndbuf)) ||
 	    setsockopt(sk, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf))) {
-		if (opts.unprivileged) {
+		/*
+		 * SO_SNDBUFFORCE/SO_RCVBUFFORCE needs CAP_NET_ADMIN in
+		 * the initial user namespace: a task of a nested one
+		 * can not set them, so fall back to the capped
+		 * SO_SNDBUF/SO_RCVBUF, the same way as the
+		 * unprivileged one does.
+		 */
+		if (opts.unprivileged || nested_ns_task_nested(current)) {
 			pr_info("Unable to set SO_SNDBUFFORCE/SO_RCVBUFFORCE, falling back to SO_SNDBUF/SO_RCVBUF\n");
 			if (setsockopt(sk, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) ||
 			    setsockopt(sk, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf))) {
@@ -905,13 +913,17 @@ int collect_sockets(struct ns_id *ns)
 	if (tmp)
 		err = tmp;
 
-	/* Collect IPv4 UDP-lite sockets */
+	/*
+	 * Collect IPv4 UDP-lite sockets. The protocol was removed from
+	 * the kernel (7.x): its diag request fails with ENOENT there,
+	 * which is not an error, there can be no such sockets.
+	 */
 	req.r.i.sdiag_family = AF_INET;
 	req.r.i.sdiag_protocol = IPPROTO_UDPLITE;
 	req.r.i.idiag_ext = 0;
 	req.r.i.idiag_states = -1; /* All */
 	tmp = do_collect_req(nl, &req, sizeof(req), inet_receive_one, collect_err, ns, &req.r.i);
-	if (tmp)
+	if (tmp && tmp != -ENOENT)
 		err = tmp;
 
 	/* Collect IPv4 RAW sockets */
@@ -951,13 +963,13 @@ int collect_sockets(struct ns_id *ns)
 	if (tmp)
 		err = tmp;
 
-	/* Collect IPv6 UDP-lite sockets */
+	/* Collect IPv6 UDP-lite sockets (see the IPv4 ones above) */
 	req.r.i.sdiag_family = AF_INET6;
 	req.r.i.sdiag_protocol = IPPROTO_UDPLITE;
 	req.r.i.idiag_ext = 0;
 	req.r.i.idiag_states = -1; /* All */
 	tmp = do_collect_req(nl, &req, sizeof(req), inet_receive_one, collect_err, ns, &req.r.i);
-	if (tmp)
+	if (tmp && tmp != -ENOENT)
 		err = tmp;
 
 	/* Collect IPv6 RAW sockets */
@@ -1035,6 +1047,21 @@ int set_netns(uint32_t ns_id)
 	if (nsfd < 0)
 		return -1;
 	if (setns(nsfd, CLONE_NEWNET)) {
+		if (nested_ns_task_nested(current)) {
+			/*
+			 * A task forked into its own copy of the user namespace
+			 * of the container (e.g. a docker exec-ed one) is in a
+			 * sibling of the one owning the namespace, and can not
+			 * enter it. The socket is restored in the network
+			 * namespace of the fork: for the filesystem bound ones
+			 * it is the same, as they are not scoped by the network
+			 * namespace.
+			 */
+			pr_warn("Unable to switch to the network namespace %u (%s): restoring the socket in the fork one\n",
+				ns_id, strerror(errno));
+			close(nsfd);
+			return 0;
+		}
 		pr_perror("Unable to switch a network namespace");
 		close(nsfd);
 		return -1;

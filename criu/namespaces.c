@@ -10,8 +10,14 @@
 #include <sched.h>
 #include <sys/capability.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <limits.h>
 #include <errno.h>
+#include <linux/nsfs.h>
+
+#ifndef NS_GET_PARENT
+#define NS_GET_PARENT _IO(NSIO, 0x2)
+#endif
 
 #include "page.h"
 #include "rst-malloc.h"
@@ -23,9 +29,11 @@
 #include "mount.h"
 #include "pstree.h"
 #include "namespaces.h"
+#include "nested-ns.h"
 #include "net.h"
 #include "cgroup.h"
 #include "fdstore.h"
+#include "servicefd.h"
 #include "kerndat.h"
 #include "util-caps.h"
 
@@ -339,7 +347,7 @@ static void nsid_add(struct ns_id *ns, struct ns_desc *nd, unsigned int id, pid_
 	pr_info("Add %s ns %d pid %d\n", nd->str, ns->id, ns->ns_pid);
 }
 
-static struct ns_id *rst_new_ns_id(unsigned int id, pid_t pid, struct ns_desc *nd, enum ns_type type)
+static struct ns_id *rst_new_ns_id(unsigned int id, pid_t pid, struct ns_desc *nd, enum criu_ns_type type)
 {
 	struct ns_id *nsid;
 
@@ -443,7 +451,7 @@ int walk_namespaces(struct ns_desc *nd, int (*cb)(struct ns_id *, void *), void 
 static unsigned int generate_ns_id(int pid, unsigned int kid, struct ns_desc *nd, struct ns_id **ns_ret)
 {
 	struct ns_id *nsid;
-	enum ns_type type;
+	enum criu_ns_type type;
 
 	nsid = lookup_ns_by_kid(kid, nd);
 	if (nsid)
@@ -456,7 +464,9 @@ static unsigned int generate_ns_id(int pid, unsigned int kid, struct ns_desc *nd
 			pr_info("Will take %s namespace in the image\n", nd->str);
 			root_ns_mask |= nd->cflag;
 			type = NS_ROOT;
-		} else if (nd->cflag & ~CLONE_SUBNS) {
+		} else if (nd == &user_ns_desc) {
+			nested_ns_discover(pid);
+		} else if ((nd->cflag & ~CLONE_SUBNS) && !nested_ns_dump_ok(nd)) {
 			pr_err("Can't dump nested %s namespace for %d\n", nd->str, pid);
 			return 0;
 		}
@@ -633,10 +643,23 @@ static int open_ns_fd(struct file_desc *d, int *new_fd)
 		return -1;
 	}
 
-	snprintf(path, sizeof(path) - 1, "/proc/%d/ns/%s", vpid(item), nd->str);
-	path[sizeof(path) - 1] = '\0';
+	if (nested_ns_pid_not_visible(item)) {
+		/*
+		 * The task is not reachable by its vpid in our /proc (a
+		 * nested pid namespace, or a pid which could not be set):
+		 * open the namespace file via the /proc of criu, where the
+		 * task is known by its real pid.
+		 */
+		int dfd = get_service_fd(CR_PROC_FD_OFF);
 
-	fd = open(path, nfi->nfe->flags);
+		snprintf(path, sizeof(path) - 1, "%d/ns/%s", item->pid->real, nd->str);
+		path[sizeof(path) - 1] = '\0';
+		fd = dfd < 0 ? -1 : openat(dfd, path, nfi->nfe->flags);
+	} else {
+		snprintf(path, sizeof(path) - 1, "/proc/%d/ns/%s", vpid(item), nd->str);
+		path[sizeof(path) - 1] = '\0';
+		fd = open(path, nfi->nfe->flags);
+	}
 	if (fd < 0) {
 		pr_perror("Can't open file %s on restore", path);
 		return fd;
@@ -680,6 +703,10 @@ int predump_task_ns_ids(struct pstree_item *item)
 {
 	int pid = item->pid->real;
 
+	/* The user namespace first, see dump_task_ns_ids() */
+	if (!get_ns_id(pid, &user_ns_desc, NULL))
+		return -1;
+
 	if (!__get_ns_id(pid, &net_ns_desc, NULL, &dmpi(item)->netns))
 		return -1;
 
@@ -693,6 +720,18 @@ int dump_task_ns_ids(struct pstree_item *item)
 {
 	int pid = item->pid->real;
 	TaskKobjIdsEntry *ids = item->ids;
+
+	/*
+	 * The user namespace goes first: a task living in a nested one
+	 * turns the nested namespaces support on (see generate_ns_id),
+	 * which the collection of the other namespaces of it needs.
+	 */
+	ids->has_user_ns_id = true;
+	ids->user_ns_id = get_ns_id(pid, &user_ns_desc, NULL);
+	if (!ids->user_ns_id) {
+		pr_err("Can't make userns id\n");
+		return -1;
+	}
 
 	ids->has_pid_ns_id = true;
 	ids->pid_ns_id = get_ns_id(pid, &pid_ns_desc, NULL);
@@ -748,18 +787,14 @@ int dump_task_ns_ids(struct pstree_item *item)
 		return -1;
 	}
 
-	ids->has_user_ns_id = true;
-	ids->user_ns_id = get_ns_id(pid, &user_ns_desc, NULL);
-	if (!ids->user_ns_id) {
-		pr_err("Can't make userns id\n");
-		return -1;
-	}
-
 	ids->cgroup_ns_id = get_ns_id(pid, &cgroup_ns_desc, &ids->has_cgroup_ns_id);
 	if (!ids->cgroup_ns_id) {
 		pr_err("Can't make cgroup id\n");
 		return -1;
 	}
+
+	if (nested_ns_check_task(item))
+		return -1;
 
 	return 0;
 }
@@ -884,7 +919,7 @@ err:
 	return -1;
 }
 
-int collect_user_ns(struct ns_id *ns, void *oarg)
+static int collect_user_ns(struct ns_id *ns, void *oarg)
 {
 	/*
 	 * User namespace is dumped before files to get uid and gid
@@ -901,6 +936,9 @@ int collect_user_namespaces(bool for_dump)
 {
 	if (!for_dump)
 		return 0;
+
+	if (nested_ns_enabled())
+		return nested_ns_collect_user_namespaces();
 
 	if (!(root_ns_mask & CLONE_NEWUSER))
 		return 0;
@@ -1619,6 +1657,9 @@ int collect_namespaces(bool for_dump)
 
 int prepare_userns_creds(void)
 {
+	if (nested_ns_enabled())
+		return nested_ns_prepare_userns_creds();
+
 	if (!opts.unprivileged || has_cap_setuid(opts.cap_eff)) {
 		/* UID and GID must be set after restoring /proc/PID/{uid,gid}_maps */
 		if (setuid(0) || setgid(0) || setgroups(0, NULL)) {
@@ -1630,8 +1671,8 @@ int prepare_userns_creds(void)
 	/*
 	 * This flag is dropped after entering userns, but is
 	 * required to access files in /proc, so put one here
-	 * temporarily. It will be set to proper value at the
-	 * very end.
+	 * temporarily. It will be set to proper value at
+	 * the very end.
 	 */
 	if (prctl(PR_SET_DUMPABLE, 1, 0)) {
 		pr_perror("Unable to set PR_SET_DUMPABLE");

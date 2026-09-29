@@ -43,7 +43,27 @@
 #include "infect-rpc.h"
 #include "pie/parasite-blob.h"
 
-unsigned long get_exec_start(struct vm_area_list *vmas)
+/*
+ * The area the syscall instruction is injected into has to be writable
+ * through ptrace: a shared sealed mapping (e.g. the memfd holding the
+ * packed binary of upx, which maps it read-only sealed) rejects even
+ * the forced writes of ptrace. Probe the candidate with a write of the
+ * word it holds: the ones which reject it are skipped, the next
+ * executable one is used instead.
+ */
+static bool exec_start_writable(pid_t pid, unsigned long addr)
+{
+	unsigned long word;
+
+	errno = 0;
+	word = ptrace(PTRACE_PEEKDATA, pid, addr, 0);
+	if (errno != 0)
+		return false;
+
+	return ptrace(PTRACE_POKEDATA, pid, addr, (void *)word) == 0;
+}
+
+unsigned long get_exec_start(struct vm_area_list *vmas, pid_t pid)
 {
 	struct vma_area *vma_area;
 
@@ -58,6 +78,12 @@ unsigned long get_exec_start(struct vm_area_list *vmas)
 		len = vma_area_len(vma_area);
 		if (len < PARASITE_START_AREA_MIN) {
 			pr_warn("Suspiciously short VMA @%#lx\n", (unsigned long)vma_area->e->start);
+			continue;
+		}
+
+		if (pid > 0 && !exec_start_writable(pid, vma_area->e->start)) {
+			pr_debug("Skipping the non-writable executable VMA @%#lx\n",
+				 (unsigned long)vma_area->e->start);
 			continue;
 		}
 
@@ -387,7 +413,7 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
 
 	BUG_ON(item->threads[0].real != pid);
 
-	p = get_exec_start(vma_area_list);
+	p = get_exec_start(vma_area_list, pid);
 	if (!p) {
 		pr_err("No suitable VM found\n");
 		return NULL;

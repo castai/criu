@@ -114,6 +114,16 @@ int fdstore_get(int id)
 {
 	int sk, fd;
 
+	/*
+	 * A negative id means "not stored": a negative SO_PEEK_OFF
+	 * would disable the offset and return the first fd of the
+	 * store, whatever it is.
+	 */
+	if (id < 0) {
+		pr_err("Invalid fdstore id %d\n", id);
+		return -1;
+	}
+
 	sk = get_service_fd(FDSTORE_SK_OFF);
 	if (sk < 0) {
 		pr_err("Cannot get FDSTORE_SK_OFF fd\n");
