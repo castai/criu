@@ -1055,10 +1055,13 @@ int collect_pstree(void)
 	/*
 	 * The level of the pid namespace of the root task: needed by the
 	 * NSpid parsing of the tasks, harmless without the nested ones
-	 * (the level of the root task is the innermost one then).
+	 * (the level of the root task is the innermost one then). The
+	 * failure of it is not fatal: the level is not known then, and
+	 * the innermost pid is used (the behavior without the nested
+	 * ones); a process which does not exist fails with the errno
+	 * of its own below.
 	 */
-	if (set_dump_pidns_level(pid))
-		goto err;
+	set_dump_pidns_level(pid);
 
 	timing_start(TIME_FREEZING);
 

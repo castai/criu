@@ -46,11 +46,6 @@ fi
 # check set_compel_interrupt_only_mode when test cgroup is frozen
 ./test/zdtm.py run -t zdtm/static/env00 --freezecg zdtm:f --fault 137
 
-# The vfork00 test is flaky on the loaded CI runners: a task sits in
-# the uninterruptible sleep (state D) during the seizure, which the
-# fault injection (136 = seize) can not interrupt either. The test
-# passed on the runners before and keeps passing locally, the failure
-# is a matter of the runner, not of the code.
-if ./test/zdtm.py run -t zdtm/static/vfork00 --fault 136 --report report -f h 2>/dev/null ; then
+if ./test/zdtm.py run -t zdtm/static/vfork00 --fault 136 --report report -f h ; then
 	fail
 fi
