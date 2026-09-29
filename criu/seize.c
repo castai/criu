@@ -1052,7 +1052,12 @@ int collect_pstree(void)
 	int ret, exit_code = -1;
 	struct proc_status_creds creds;
 
-	if (nested_ns_enabled() && set_dump_pidns_level(pid))
+	/*
+	 * The level of the pid namespace of the root task: needed by the
+	 * NSpid parsing of the tasks, harmless without the nested ones
+	 * (the level of the root task is the innermost one then).
+	 */
+	if (set_dump_pidns_level(pid))
 		goto err;
 
 	timing_start(TIME_FREEZING);

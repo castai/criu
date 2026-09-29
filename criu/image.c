@@ -250,6 +250,16 @@ int write_img_inventory(InventoryEntry *he)
 
 	pr_info("Writing image inventory (version %u)\n", CRTOOLS_IMAGES_V1);
 
+	/*
+	 * The nested user namespaces are discovered while the tree is
+	 * collected, which is after the entry of the inventory is
+	 * prepared: the flag of the option is taken at the write time.
+	 */
+	if (opts.nested_ns) {
+		he->has_nested_ns = true;
+		he->nested_ns = true;
+	}
+
 	img = open_image(CR_FD_INVENTORY, O_DUMP);
 	if (!img)
 		return -1;
@@ -394,12 +404,6 @@ int prepare_inventory(InventoryEntry *he)
 	/* Save network lock method to reuse in restore */
 	he->has_network_lock_method = true;
 	he->network_lock_method = opts.network_lock_method;
-
-	/* The nested user namespaces need the option on restore as well */
-	if (opts.nested_ns) {
-		he->has_nested_ns = true;
-		he->nested_ns = true;
-	}
 
 	/**
 	 * This contains the criu_run_id during dumping of the process.
