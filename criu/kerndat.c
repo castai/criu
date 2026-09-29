@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -359,11 +360,6 @@ static dev_t get_host_dev(unsigned int which)
 			.name	= "devtmpfs",
 			.path	= "/dev",
 			.magic	= TMPFS_MAGIC,
-		},
-		[KERNDAT_FS_STAT_BINFMT_MISC] = {
-			.name	= "binfmt_misc",
-			.path	= "/proc/sys/fs/binfmt_misc",
-			.magic	= BINFMTFS_MAGIC,
 		},
 	};
 
@@ -1741,81 +1737,104 @@ static int kerndat_has_timer_cr_ids(void)
 	return 0;
 }
 
-static void breakpoint_func(void)
+static int kerndat_has_statmount(void)
 {
-	if (raise(SIGSTOP))
-		pr_perror("Unable to kill itself with SIGSTOP");
-	exit(1);
-}
+	struct cr_statmount smbuf = {};
+	struct cr_statx stx = {};
+	struct cr_mnt_id_req req = {
+		.size = MNT_ID_REQ_SIZE_VER1,
+		.param = STATMOUNT_SUPPORTED_MASK
+	};
+	int ret = 0, fd = -1;
 
-/*
- * kerndat_breakpoints checks that hardware breakpoints work as they should.
- * In some cases, they might not work in virtual machines if the hypervisor
- * doesn't virtualize them. For example, they don't work in AMD SEV virtual
- * machines if the Debug Virtualization extension isn't supported or isn't
- * enabled in SEV_FEATURES.
- */
-static int kerndat_breakpoints(void)
-{
-	int status, ret, exit_code = -1;
-	pid_t pid;
+	kdat.has_statmount = false;
+	kdat.statmount_supported_mask = 0;
 
-	pid = fork();
-	if (pid == -1) {
-		pr_perror("fork");
+	fd = open("/", O_PATH);
+	if (fd < 0) {
+		pr_perror("failed to open fd to /");
 		return -1;
 	}
-	if (pid == 0) {
-		if (ptrace(PTRACE_TRACEME, 0, 0, 0)) {
-			pr_perror("ptrace(PTRACE_TRACEME)");
-			exit(1);
-		}
-		raise(SIGSTOP);
-		breakpoint_func();
-		exit(1);
-	}
-	if (waitpid(pid, &status, 0) == -1) {
-		pr_perror("waitpid for initial stop");
-		goto err;
-	}
-	if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGSTOP) {
-		pr_err("Child didn't stop as expected: status=%x\n", status);
-		goto err;
-	}
-	ret = ptrace_set_breakpoint(pid, &breakpoint_func);
+
+	ret = syscall(SYS_statx, fd, "", AT_EMPTY_PATH, STATX_MNT_ID_UNIQUE, &stx);
 	if (ret < 0) {
-		pr_err("Failed to set breakpoint\n");
-		goto err;
-	}
-	if (ret == 0) {
-		pr_debug("Hardware breakpoints appear to be disabled\n");
+		pr_debug("failed to call statx() on fd, assuming statmount() is not supported: %s\n", strerror(errno));
+		ret = 0;
 		goto out;
 	}
-	if (waitpid(pid, &status, 0) == -1) {
-		pr_perror("waitpid for breakpoint trigger");
-		goto err;
-	}
-	if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
-		pr_warn("Hardware breakpoints don't seem to work (status=%x)\n", status);
+
+	if (stx.stx_mask & STATX_MNT_ID_UNIQUE) {
+		req.mnt_id = stx.stx_mnt_id;
+	} else {
+		pr_debug("failed to get mnt_id from statx(), assuming statmount() is not supported\n");
 		goto out;
 	}
-	kdat.has_breakpoints = true;
+
+	if (!sys_statmount(&req, &smbuf, sizeof(smbuf), 0)) {
+		kdat.has_statmount = true;
+		if (smbuf.mask & STATMOUNT_SUPPORTED_MASK) {
+			kdat.statmount_supported_mask = smbuf.supported_mask;
+		} else {
+			/*
+			 * STATMOUNT_SUPPORTED_MASK may not be supported by kernel,
+			 * so return the minimum mask we know is supported because
+			 * it was introduced alongside statmount().
+			 */
+			kdat.statmount_supported_mask = STATMOUNT_SB_BASIC |
+							STATMOUNT_MNT_BASIC |
+							STATMOUNT_PROPAGATE_FROM |
+							STATMOUNT_MNT_ROOT |
+							STATMOUNT_MNT_POINT |
+							STATMOUNT_FS_TYPE;
+		}
+		goto out;
+	}
+
+	switch (errno) {
+		case ENOMEM:
+		case EFAULT:
+			pr_perror("failed to check for statmount() support");
+			ret = -1;
+			goto out;
+		default:
+			pr_info("statmount() isn't supported\n");
+	}
 out:
-	exit_code = 0;
-err:
-	if (kill(pid, SIGKILL)) {
-		pr_perror("Failed to kill the child process");
-		exit_code = -1;
+	close(fd);
+	return ret;
+}
+
+static int kerndat_has_statmount_by_fd(void)
+{
+	struct cr_statmount smbuf = {};
+	struct cr_mnt_id_req req = {
+		.size = MNT_ID_REQ_SIZE_VER1,
+		.param = STATMOUNT_MNT_BASIC,
+		.mnt_fd = -1,
+	};
+
+	kdat.has_statmount_by_fd = false;
+	if (!kdat.has_statmount)
+		return 0;
+
+	if (!sys_statmount(&req, &smbuf, sizeof(smbuf), STATMOUNT_BY_FD)) {
+		pr_err("statmount() with STATMOUNT_BY_FD unexpectedly succeeded\n");
+		return -1;
 	}
-	if (waitpid(pid, &status, 0) == -1) {
-		pr_perror("Failed to wait for the child process");
-		exit_code = -1;
+
+	switch (errno) {
+	case ENOMEM:
+	case EFAULT:
+		pr_perror("failed to check for statmount() with STATMOUNT_BY_FD flag support");
+		return -1;
+	case EBADF:
+		kdat.has_statmount_by_fd = true;
+		return 0;
+	/* anything else means syscall is not supported */
+	default:
+		pr_info("statmount() with STATMOUNT_BY_FD flag isn't supported\n");
 	}
-	if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) {
-		pr_err("The child exited with unexpected code: %x\n", status);
-		exit_code = -1;
-	}
-	return exit_code;
+	return 0;
 }
 
 static int kerndat_has_madv_guard(void)
@@ -1851,6 +1870,92 @@ void kerndat_warn_about_madv_guards(void)
 		pr_warn("ioctl(PAGEMAP_SCAN) doesn't support PAGE_IS_GUARD flag. "
 			"CRIU dump will fail if dumped processes use madvise(MADV_GUARD_INSTALL). "
 			"Please, consider updating your kernel.\n");
+}
+
+/* Keep the fd open so that it can be closed by the caller (required by the parent process) */
+static int __mount_and_stat_detached_binfmt_misc(struct stat *st, int *mnt_fd)
+{
+	int fd;
+
+	fd = mount_detached_fs("binfmt_misc");
+	if (fd < 0) {
+		/* Most likely a permission error, so we can't use binfmt_misc */
+		return 1;
+	}
+
+	if (fstat(fd, st) < 0) {
+		pr_perror("Failed to stat a binfmt_misc mountpoint");
+		close(fd);
+		return -1;
+	}
+
+	*mnt_fd = fd;
+
+	return 0;
+}
+
+struct has_binfmt_misc_arg {
+	dev_t st_dev;
+	bool has;
+};
+
+static int __has_binfmt_misc_sandboxing(void *arg)
+{
+	struct has_binfmt_misc_arg *has_arg = (struct has_binfmt_misc_arg *)arg;
+	struct stat st;
+	int ret, mnt_fd;
+
+	if (unshare(CLONE_NEWNS | CLONE_NEWUSER)) {
+		pr_perror("Failed to unshare namespaces");
+		return 1;
+	}
+
+	ret = __mount_and_stat_detached_binfmt_misc(&st, &mnt_fd);
+	if (ret < 0) {
+		return 1;
+	} else if (ret == 1) {
+		has_arg->has = false;
+		return 0;
+	}
+
+	if (has_arg->st_dev != st.st_dev)
+		has_arg->has = true;
+	else
+		has_arg->has = false;
+
+	close(mnt_fd);
+
+	return 0;
+}
+
+static int kerndat_has_binfmt_misc_sandboxing(void)
+{
+	int ret, mnt_fd;
+	struct stat st;
+	struct has_binfmt_misc_arg arg;
+
+	ret = __mount_and_stat_detached_binfmt_misc(&st, &mnt_fd);
+	if (ret < 0) {
+		return -1;
+	} else if (ret == 1) {
+		arg.has = false;
+		goto out;
+	}
+
+	arg.st_dev = st.st_dev;
+
+	ret = call_in_child_process(__has_binfmt_misc_sandboxing, (void *)&arg);
+	close(mnt_fd);
+	if (ret < 0) {
+		pr_err("Failed to check binfmt_misc sandboxing support in child process\n");
+		return -1;
+	}
+
+out:
+	pr_info("binfmt_misc sandboxing is %s supported\n", arg.has ? "" : "not");
+	kdat.has_binfmt_misc_sandboxing = arg.has;
+
+	return 0;
 }
 
 /*
@@ -2116,13 +2221,22 @@ int kerndat_init(void)
 	}
 	if (!ret && kerndat_has_timer_cr_ids()) {
 		pr_err("kerndat_has_timer_cr_ids has failed when initializing kerndat.\n");
-	}
-	if (!ret && kerndat_breakpoints()) {
-		pr_err("kerndat_breakpoints has failed when initializing kerndat.\n");
 		ret = -1;
 	}
 	if (!ret && kerndat_has_madv_guard()) {
 		pr_err("kerndat_has_madv_guard has failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_has_binfmt_misc_sandboxing()) {
+		pr_err("kerndat_has_binfmt_misc_sandboxing has failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_has_statmount()) {
+		pr_err("kerndat_has_statmount failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_has_statmount_by_fd()) {
+		pr_err("kerndat_has_statmount_by_fd failed when initializing kerndat.\n");
 		ret = -1;
 	}
 

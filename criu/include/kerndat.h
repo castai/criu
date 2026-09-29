@@ -90,9 +90,12 @@ struct kerndat_s {
 	bool has_shstk;
 	bool has_close_range;
 	bool has_timer_cr_ids;
-	bool has_breakpoints;
 	bool has_madv_guard;
 	bool has_pagemap_scan_guard_pages;
+	bool has_binfmt_misc_sandboxing;
+	u64 statmount_supported_mask;
+	bool has_statmount;
+	bool has_statmount_by_fd;
 };
 
 extern struct kerndat_s kdat;

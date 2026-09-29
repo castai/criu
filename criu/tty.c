@@ -259,7 +259,7 @@ static int pts_fd_get_index(int fd, const struct fd_parms *p)
 {
 	int index;
 	const struct fd_link *link = p->link;
-	char *pos = strrchr(link->name, '/');
+	const char *pos = strrchr(link->name, '/');
 
 	if (!pos || pos == (link->name + link->len - 1)) {
 		pr_err("Unexpected format on path %s\n", link->name + 1);
@@ -2345,9 +2345,9 @@ static int pty_create_ptmx_index(int dfd, int index, int flags)
 		return -1;
 
 	id = fdstore_add(fd);
+	close(fd);
 	if (id < 0)
 		return -1;
-	close(fd);
 
 	list_for_each_entry(info, &all_ttys, list) {
 		if (!is_pty(info->driver))

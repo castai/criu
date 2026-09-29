@@ -13,6 +13,7 @@ fi
 	build-essential \
 	gdb \
 	git-core \
+	iproute2 \
 	iptables \
 	kmod \
 	libaio-dev \
@@ -22,6 +23,7 @@ fi
 	libelf-dev \
 	libgnutls28-dev \
 	libgnutls30 \
+	liblz4-dev \
 	libnet-dev \
 	libnl-3-dev \
 	libnl-route-3-dev \
@@ -35,6 +37,7 @@ fi
 	protobuf-c-compiler \
 	protobuf-compiler \
 	python3-importlib-metadata \
+	python3-lz4 \
 	python3-pip \
 	python3-protobuf \
 	python3-yaml \

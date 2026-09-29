@@ -48,10 +48,8 @@ class _criu_comm_sk(_criu_comm):
         self.sk = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:
             self.sk.connect(self.comm)
-            
         except FileNotFoundError:
             raise FileNotFoundError("Socket file not found.")
-        
         except ConnectionRefusedError:
             raise ConnectionRefusedError("Service not running.")
 
@@ -242,7 +240,7 @@ class criu:
         # process resources from its own if criu is located in a same
         # process tree it is trying to dump.
         daemon = False
-        if req.type == rpc.DUMP and not req.opts.HasField('pid'):
+        if req.type == rpc.DUMP and (not req.opts.HasField('pid') or req.opts.pid == os.getpid()):
             daemon = True
 
         try:

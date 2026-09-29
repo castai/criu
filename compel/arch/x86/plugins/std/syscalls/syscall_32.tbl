@@ -66,6 +66,7 @@ __NR_futex		240		sys_futex		(uint32_t *uaddr, int op, uint32_t val, struct times
 __NR_set_thread_area	243		sys_set_thread_area	(user_desc_t *info)
 __NR_get_thread_area	244		sys_get_thread_area	(user_desc_t *info)
 __NR_io_setup		245		sys_io_setup		(unsigned nr_reqs, aio_context_t *ctx32p)
+__NR_io_destroy		246		sys_io_destroy		(aio_context_t ctx)
 __NR_io_getevents	247		sys_io_getevents	(aio_context_t ctx_id, long min_nr, long nr, struct io_event *events, struct timespec *timeout)
 __NR_io_submit		248		sys_io_submit		(aio_context_t ctx_id, long nr, struct iocb **iocbpp)
 __NR_exit_group		252		sys_exit_group		(int error_code)
@@ -108,3 +109,4 @@ __NR_openat2		437		sys_openat2		(int dirfd, char *pathname, struct open_how *how
 __NR_pidfd_getfd	438		sys_pidfd_getfd		(int pidfd, int targetfd, unsigned int flags)
 __NR_rseq       	386		sys_rseq		(void *rseq, uint32_t rseq_len, int flags, uint32_t sig)
 __NR_membarrier 	375		sys_membarrier		(int cmd, unsigned int flags, int cpu_id)
+__NR_statmount		457		sys_statmount		(struct mnt_id_req *req, struct statmount *smbuf, size_t bufsize, unsigned int flags)

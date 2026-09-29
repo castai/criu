@@ -14,6 +14,7 @@
 #include "common/xmalloc.h"
 #include "common/lock.h"
 #include "common/page.h"
+#include "linux/rseq.h"
 
 #include <compel/plugins/std/syscall-codes.h>
 #include <compel/plugins/std/asm/syscall-types.h>
@@ -42,7 +43,7 @@
 #define SECCOMP_MODE_DISABLED 0
 #endif
 
-static int prepare_thread(int pid, struct thread_ctx *ctx);
+static int prepare_thread(int pid, struct thread_ctx *ctx, bool handle_rseq);
 
 static inline void close_safe(int *pfd)
 {
@@ -725,7 +726,6 @@ static int parasite_init_daemon(struct parasite_ctl *ctl)
 		goto err;
 	}
 
-	ctl->sigreturn_addr = (void *)(uintptr_t)args->sigreturn_addr;
 	ctl->daemonized = true;
 	pr_info("Parasite %d has been switched to daemon mode\n", pid);
 	return 0;
@@ -1112,13 +1112,13 @@ int compel_infect(struct parasite_ctl *ctl, unsigned long nr_threads, unsigned l
 	return 0;
 }
 
-struct parasite_thread_ctl *compel_prepare_thread(struct parasite_ctl *ctl, int pid)
+struct parasite_thread_ctl *compel_prepare_thread(struct parasite_ctl *ctl, int pid, bool handle_rseq)
 {
 	struct parasite_thread_ctl *tctl;
 
-	tctl = xmalloc(sizeof(*tctl));
+	tctl = xmemalign(__alignof__(*tctl), sizeof(*tctl));
 	if (tctl) {
-		if (prepare_thread(pid, &tctl->th)) {
+		if (prepare_thread(pid, &tctl->th, handle_rseq)) {
 			xfree(tctl);
 			tctl = NULL;
 		} else {
@@ -1130,7 +1130,117 @@ struct parasite_thread_ctl *compel_prepare_thread(struct parasite_ctl *ctl, int 
 	return tctl;
 }
 
-static int prepare_thread(int pid, struct thread_ctx *ctx)
+#define decode_pointer(x) ((void *)(unsigned long)(x))
+
+static bool task_in_rseq(struct criu_rseq_cs *rseq_cs, uint64_t addr)
+{
+	return addr - rseq_cs->start_ip < rseq_cs->post_commit_offset;
+}
+
+static int read_rseq_cs(pid_t tid, struct __ptrace_rseq_configuration *rseqc, struct criu_rseq_cs *rseq_cs,
+			struct criu_rseq *rseq)
+{
+	int ret;
+
+	if (!rseqc->rseq_abi_pointer)
+		return 0;
+
+	ret = ptrace_peek_area(tid, rseq,
+			       decode_pointer(rseqc->rseq_abi_pointer),
+			       sizeof(struct criu_rseq));
+	if (ret) {
+		pr_err("ptrace_peek_area(%d, %lx, %lx, %lx): fail to read rseq struct\n",
+		       tid, (unsigned long)rseq, (unsigned long)rseqc->rseq_abi_pointer,
+		       (unsigned long)sizeof(struct criu_rseq));
+		return -1;
+	}
+
+	if (!rseq->rseq_cs)
+		return 0;
+
+	ret = ptrace_peek_area(tid, rseq_cs,
+			       decode_pointer(rseq->rseq_cs),
+			       sizeof(struct criu_rseq_cs));
+	if (ret) {
+		pr_err("ptrace_peek_area(%d, %lx, %lx, %lx): fail to read rseq_cs struct\n",
+		       tid, (unsigned long)rseq_cs, (unsigned long)rseq->rseq_cs,
+		       (unsigned long)sizeof(struct criu_rseq_cs));
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * parasite_thread_rseq checks if the victim process is in an rseq critical
+ * section and, if so, aborts it.
+ */
+static int parasite_thread_rseq(int pid, struct thread_ctx *ctx)
+{
+	struct criu_rseq_cs _rseq_cs = {}, *rseq_cs = &_rseq_cs;
+	struct __ptrace_rseq_configuration rseqc;
+	int ret;
+	struct criu_rseq rseq = {};
+
+	ret = ptrace(PTRACE_GET_RSEQ_CONFIGURATION, pid, sizeof(rseqc), &rseqc);
+	if (ret < 0) {
+		pr_perror("ptrace(PTRACE_GET_RSEQ_CONFIGURATION, %d) = %d", pid, ret);
+		return -1;
+	} else if (ret != sizeof(rseqc)) {
+		pr_err("ptrace(PTRACE_GET_RSEQ_CONFIGURATION, %d) returned unexpected size %d\n", pid, ret);
+		return -1;
+	}
+
+	if (rseqc.flags != 0) {
+		pr_err("something wrong with ptrace(PTRACE_GET_RSEQ_CONFIGURATION, %d) flags = 0x%x\n", pid,
+		       rseqc.flags);
+		return -1;
+	}
+
+	pr_debug("rseq of %d: ptr = 0x%lx sign = 0x%x\n", pid, (unsigned long)rseqc.rseq_abi_pointer,
+		 rseqc.signature);
+
+	if (read_rseq_cs(pid, &rseqc, rseq_cs, &rseq))
+		return -1;
+
+	if (rseq.rseq_cs) {
+		uint64_t zero_addr = 0;
+
+		pr_debug(
+			"fixup_thread_rseq for %d: rseq_cs start_ip = %llx abort_ip = %llx post_commit_offset = %llx flags = %x version = %x; IP = %lx\n",
+			pid, rseq_cs->start_ip, rseq_cs->abort_ip, rseq_cs->post_commit_offset, rseq_cs->flags,
+			rseq_cs->version, (unsigned long)REG_IP(ctx->regs));
+
+		if (rseq_cs->version != 0) {
+			pr_err("unsupported RSEQ ABI version = %d\n", rseq_cs->version);
+			return -1;
+		}
+
+		if (rseq.flags || rseq_cs->flags)
+			pr_warn("deprecated rseq flags are ignored for %d: rseq.flags = %#x rseq_cs.flags = %#x\n",
+				pid, rseq.flags, rseq_cs->flags);
+
+		if (task_in_rseq(rseq_cs, REG_IP(ctx->regs))) {
+			SET_REG_IP(ctx->regs, rseq_cs->abort_ip);
+			if (ptrace_set_regs(pid, &ctx->regs)) {
+				pr_perror("Can't apply rseq abort registers (pid: %d)", pid);
+				return -1;
+			}
+		}
+
+		if (ptrace_poke_area(pid, &zero_addr,
+				     decode_pointer(rseqc.rseq_abi_pointer) +
+					     offsetof(struct criu_rseq, rseq_cs),
+				     sizeof(zero_addr))) {
+			pr_err("ptrace_poke_area(%d) failed to zero out rseq_cs\n", pid);
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+static int prepare_thread(int pid, struct thread_ctx *ctx, bool handle_rseq)
 {
 	if (ptrace(PTRACE_GETSIGMASK, pid, sizeof(k_rtsigset_t), &ctx->sigmask)) {
 		pr_perror("can't get signal blocking mask for %d", pid);
@@ -1139,6 +1249,11 @@ static int prepare_thread(int pid, struct thread_ctx *ctx)
 
 	if (ptrace_get_regs(pid, &ctx->regs)) {
 		pr_perror("Can't obtain registers (pid: %d)", pid);
+		return -1;
+	}
+
+	if (handle_rseq && parasite_thread_rseq(pid, ctx)) {
+		pr_err("Can't handle rseq (pid: %d)\n", pid);
 		return -1;
 	}
 
@@ -1154,23 +1269,24 @@ void compel_release_thread(struct parasite_thread_ctl *tctl)
 	xfree(tctl);
 }
 
-struct parasite_ctl *compel_prepare_noctx(int pid)
+struct parasite_ctl *compel_prepare_noctx(int pid, bool handle_rseq)
 {
 	struct parasite_ctl *ctl = NULL;
 
 	/*
 	 * Control block early setup.
 	 */
-	ctl = xzalloc(sizeof(*ctl));
+	ctl = xmemalign(__alignof__(*ctl), sizeof(*ctl));
 	if (!ctl) {
 		pr_err("Parasite control block allocation failed (pid: %d)\n", pid);
 		goto err;
 	}
+	memset(ctl, 0, sizeof(*ctl));
 
 	ctl->tsock = -1;
 	ctl->ictx.log_fd = -1;
 
-	if (prepare_thread(pid, &ctl->orig))
+	if (prepare_thread(pid, &ctl->orig, handle_rseq))
 		goto err;
 
 	ctl->rpid = pid;
@@ -1346,12 +1462,12 @@ static int make_sigframe_plain(void *from, struct rt_sigframe *f, struct rt_sigf
 	return 0;
 }
 
-struct parasite_ctl *compel_prepare(int pid)
+struct parasite_ctl *compel_prepare(int pid, bool handle_rseq)
 {
 	struct parasite_ctl *ctl;
 	struct infect_ctx *ictx;
 
-	ctl = compel_prepare_noctx(pid);
+	ctl = compel_prepare_noctx(pid, handle_rseq);
 	if (ctl == NULL)
 		goto out;
 
@@ -1364,7 +1480,8 @@ struct parasite_ctl *compel_prepare(int pid)
 
 	ictx->save_regs = save_regs_plain;
 	ictx->make_sigframe = make_sigframe_plain;
-	ictx->regs_arg = xmalloc(sizeof(struct plain_regs_struct));
+	ictx->regs_arg = xmemalign(__alignof__(struct plain_regs_struct),
+				   sizeof(struct plain_regs_struct));
 	if (ictx->regs_arg == NULL)
 		goto err;
 
@@ -1435,11 +1552,12 @@ static int parasite_fini_seized(struct parasite_ctl *ctl)
 		return -1;
 
 	/* Go to sigreturn as closer as we can */
-	ret = compel_stop_pie(pid, ctl->sigreturn_addr, ctl->ictx.flags & INFECT_NO_BREAKPOINTS);
-	if (ret < 0)
-		return ret;
+	if (ptrace(PTRACE_SYSCALL, pid, NULL, NULL)) {
+		pr_perror("Unable to restart the %d process", pid);
+		return -1;
+	}
 
-	if (compel_stop_on_syscall(1, __NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1)))
+	if (compel_stop_on_syscall(pid, __NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1)))
 		return -1;
 
 	/*
@@ -1576,7 +1694,7 @@ int compel_unmap(struct parasite_ctl *ctl, unsigned long addr)
 	if (ret)
 		goto err;
 
-	ret = compel_stop_on_syscall(1, __NR(munmap, 0), __NR(munmap, 1));
+	ret = compel_stop_on_syscall(pid, __NR(munmap, 0), __NR(munmap, 1));
 
 	/*
 	 * Don't touch extended registers here: they were restored
@@ -1586,38 +1704,6 @@ int compel_unmap(struct parasite_ctl *ctl, unsigned long addr)
 		ret = -1;
 err:
 	return ret;
-}
-
-int compel_stop_pie(pid_t pid, void *addr, bool no_bp)
-{
-	int ret;
-
-	if (no_bp) {
-		pr_debug("Force no-breakpoints restore of %d\n", pid);
-		ret = 0;
-	} else
-		ret = ptrace_set_breakpoint(pid, addr);
-	if (ret < 0)
-		return ret;
-
-	if (ret > 0) {
-		/*
-		 * PIE will stop on a breakpoint, next
-		 * stop after that will be syscall enter.
-		 */
-		return 0;
-	}
-
-	/*
-	 * No breakpoints available -- start tracing it
-	 * in a per-syscall manner.
-	 */
-	ret = ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
-	if (ret) {
-		pr_perror("Unable to restart the %d process", pid);
-		return -1;
-	}
-	return 0;
 }
 
 static bool task_is_trapped(int status, pid_t pid)
@@ -1650,23 +1736,20 @@ static inline int is_required_syscall(user_regs_struct_t *regs, pid_t pid, const
 }
 
 /*
- * Trap tasks on the exit from the specified syscall
+ * Trap a task on the exit from the specified syscall
  *
- * tasks - number of processes, which should be trapped
+ * pid - the process, which should be trapped
  * sys_nr - the required syscall number
  * sys_nr_compat - the required compatible syscall number
  */
-int compel_stop_on_syscall(int tasks, const int sys_nr, const int sys_nr_compat)
+int compel_stop_on_syscall(pid_t pid, const int sys_nr, const int sys_nr_compat)
 {
-	enum trace_flags trace = tasks > 1 ? TRACE_ALL : TRACE_ENTER;
+	enum trace_flags trace = TRACE_ENTER;
 	user_regs_struct_t regs;
 	int status, ret;
-	pid_t pid;
 
-	/* Stop all threads on the enter point in sys_rt_sigreturn */
-	while (tasks) {
-		pid = wait4(-1, &status, __WALL, NULL);
-		if (pid == -1) {
+	while (1) {
+		if (wait4(pid, &status, __WALL, NULL) == -1) {
 			pr_perror("wait4 failed");
 			return -1;
 		}
@@ -1676,23 +1759,22 @@ int compel_stop_on_syscall(int tasks, const int sys_nr, const int sys_nr_compat)
 
 		pr_debug("%d was trapped\n", pid);
 
-		if ((WSTOPSIG(status) & PTRACE_SYSCALL_TRAP) == 0) {
-			/*
-			 * On some platforms such as ARM64, it is impossible to
-			 * pass through a breakpoint, so let's clear it right
-			 * after it has been triggered.
-			*/
-			if (ptrace_flush_breakpoints(pid)) {
-				pr_err("Unable to clear breakpoints\n");
-				return -1;
-			}
-			goto goon;
+		if (!(WSTOPSIG(status) & PTRACE_SYSCALL_TRAP)) {
+			pr_err("Task %d is in unexpected state: %x\n", pid, status);
+			return -1;
 		}
+
 		if (trace == TRACE_EXIT) {
 			trace = TRACE_ENTER;
 			pr_debug("`- Expecting exit\n");
-			goto goon;
+			ret = ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
+			if (ret) {
+				pr_perror("ptrace");
+				return -1;
+			}
+			continue;
 		}
+
 		if (trace == TRACE_ENTER)
 			trace = TRACE_EXIT;
 
@@ -1713,8 +1795,7 @@ int compel_stop_on_syscall(int tasks, const int sys_nr, const int sys_nr_compat)
 				return -1;
 			}
 
-			pid = wait4(pid, &status, __WALL, NULL);
-			if (pid == -1) {
+			if (wait4(pid, &status, __WALL, NULL) == -1) {
 				pr_perror("wait4 failed");
 				return -1;
 			}
@@ -1722,11 +1803,15 @@ int compel_stop_on_syscall(int tasks, const int sys_nr, const int sys_nr_compat)
 			if (!task_is_trapped(status, pid))
 				return -1;
 
+			if (!(WSTOPSIG(status) & PTRACE_SYSCALL_TRAP)) {
+				pr_err("Task %d is in unexpected state: %x\n", pid, status);
+				return -1;
+			}
+
 			pr_debug("%d was stopped\n", pid);
-			tasks--;
-			continue;
+			break;
 		}
-	goon:
+
 		ret = ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
 		if (ret) {
 			pr_perror("ptrace");
@@ -1735,6 +1820,96 @@ int compel_stop_on_syscall(int tasks, const int sys_nr, const int sys_nr_compat)
 	}
 
 	return 0;
+}
+
+enum {
+	SYS_TRAP_EXIT       = 0, /* exit from a syscall (initial state) */
+	SYS_TRAP_ENTER      = 1, /* enter to a syscall */
+	SYS_TRAP_TGT_ENTER  = 2, /* enter to the target syscall */
+	SYS_TRAP_TGT_EXIT   = 3, /* exit from the target syscall */
+};
+
+/*
+ * Trap tasks on the exit from the specified syscall.
+ *
+ * wait4() with specific PIDs is used instead of wait4(-1, ...) to avoid
+ * the performance overhead of the kernel iterating over many tasks to
+ * find one that has changed state.
+ *
+ * nr_tasks - number of tasks, which should be trapped
+ * pids - an array of tasks IDs
+ * sys_nr - the required syscall number
+ * sys_nr_compat - the required compatible syscall number
+ */
+int compel_stop_tasks_on_syscall(int nr_tasks, pid_t *pids, const int sys_nr, const int sys_nr_compat)
+{
+	user_regs_struct_t regs;
+	int status, ret, exit_code = -1;
+	int cont = 1, i;
+	uint8_t *done;
+	pid_t pid;
+
+	done = xzalloc(sizeof(done[0]) * nr_tasks);
+	if (!done)
+		return -1;
+
+	while (cont) {
+		cont = 0;
+
+		for (i = 0; i < nr_tasks; i++) {
+			if (done[i] == SYS_TRAP_TGT_EXIT)
+				continue;
+			cont = 1;
+			pid = pids[i];
+
+			pid = wait4(pid, &status, __WALL, NULL);
+			if (pid == -1) {
+				pr_perror("wait4 failed");
+				goto err;
+			}
+
+			if (!task_is_trapped(status, pid))
+				goto err;
+
+			pr_debug("%d was trapped\n", pid);
+
+			if (!(WSTOPSIG(status) & PTRACE_SYSCALL_TRAP)) {
+				pr_err("Task %d is in unexpected state: %x\n", pid, status);
+				goto err;
+			}
+
+			switch (done[i]) {
+				case SYS_TRAP_ENTER:
+					done[i] = SYS_TRAP_EXIT;
+					goto goon;
+				case SYS_TRAP_TGT_ENTER:
+					done[i] = SYS_TRAP_TGT_EXIT;
+					continue;
+			}
+
+			ret = ptrace_get_regs(pid, &regs);
+			if (ret) {
+				pr_perror("ptrace");
+				goto err;
+			}
+
+			if (is_required_syscall(&regs, pid, sys_nr, sys_nr_compat))
+				done[i] = SYS_TRAP_TGT_ENTER;
+			else
+				done[i] = SYS_TRAP_ENTER;
+		goon:
+			/* Let this task run while updating the others. */
+			ret = ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
+			if (ret) {
+				pr_perror("ptrace");
+				goto err;
+			}
+		}
+	}
+	exit_code = 0;
+err:
+	xfree(done);
+	return exit_code;
 }
 
 int compel_mode_native(struct parasite_ctl *ctl)

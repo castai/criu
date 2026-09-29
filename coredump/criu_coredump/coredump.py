@@ -32,6 +32,7 @@ import io
 import sys
 import ctypes
 import platform
+from contextlib import ExitStack
 
 from pycriu import images
 from . import elf
@@ -56,6 +57,7 @@ status = {
     "VMA_AREA_AIORING": 1 << 13,
     "VMA_AREA_MEMFD": 1 << 14,
     "VMA_AREA_UPROBES": 1 << 17,
+    "VMA_AREA_NOT_ACCOUNTABLE": 1 << 18,
     "VMA_AREA_UNSUPP": 1 << 31
 }
 
@@ -141,6 +143,7 @@ class coredump_generator:
     thread_info_key = {
         "aarch64": "ti_aarch64",
         "armv7l": "ti_arm",
+        "riscv64": "ti_riscv64",
         "x86_64": "thread_info",
     }
 
@@ -259,6 +262,7 @@ class coredump_generator:
         e_machine_dict = {
             "aarch64": elf.EM_AARCH64,
             "armv7l": elf.EM_ARM,
+            "riscv64": elf.EM_RISCV,
             "x86_64": elf.EM_X86_64,
         }
         return e_machine_dict[self.machine]
@@ -463,6 +467,39 @@ class coredump_generator:
             pr_reg.es = regs["es"]
             pr_reg.fs = regs["fs"]
             pr_reg.gs = regs["gs"]
+        elif self.machine == "riscv64":
+            pr_reg.pc = regs["pc"]
+            pr_reg.ra = regs["ra"]
+            pr_reg.sp = regs["sp"]
+            pr_reg.gp = regs["gp"]
+            pr_reg.tp = regs["tp"]
+            pr_reg.t0 = regs["t0"]
+            pr_reg.t1 = regs["t1"]
+            pr_reg.t2 = regs["t2"]
+            pr_reg.s0 = regs["s0"]
+            pr_reg.s1 = regs["s1"]
+            pr_reg.a0 = regs["a0"]
+            pr_reg.a1 = regs["a1"]
+            pr_reg.a2 = regs["a2"]
+            pr_reg.a3 = regs["a3"]
+            pr_reg.a4 = regs["a4"]
+            pr_reg.a5 = regs["a5"]
+            pr_reg.a6 = regs["a6"]
+            pr_reg.a7 = regs["a7"]
+            pr_reg.s2 = regs["s2"]
+            pr_reg.s3 = regs["s3"]
+            pr_reg.s4 = regs["s4"]
+            pr_reg.s5 = regs["s5"]
+            pr_reg.s6 = regs["s6"]
+            pr_reg.s7 = regs["s7"]
+            pr_reg.s8 = regs["s8"]
+            pr_reg.s9 = regs["s9"]
+            pr_reg.s10 = regs["s10"]
+            pr_reg.s11 = regs["s11"]
+            pr_reg.t3 = regs["t3"]
+            pr_reg.t4 = regs["t4"]
+            pr_reg.t5 = regs["t5"]
+            pr_reg.t6 = regs["t6"]
 
     def _gen_fpregset(self, pid, tid):
         """
@@ -492,7 +529,7 @@ class coredump_generator:
         """
         Get the floating point register dictionary based on the current architecture.
         """
-        fpregs_key_dict = {"aarch64": "fpsimd", "x86_64": "fpregs"}
+        fpregs_key_dict = {"aarch64": "fpsimd", "riscv64": "fpsimd", "x86_64": "fpregs"}
         fpregs_key = fpregs_key_dict[self.machine]
 
         thread_info_key = self.thread_info_key[self.machine]
@@ -507,6 +544,9 @@ class coredump_generator:
             fpregset.vregs = (ctypes.c_ulonglong * len(regs["vregs"]))(*regs["vregs"])
             fpregset.fpsr = regs["fpsr"]
             fpregset.fpcr = regs["fpcr"]
+        elif self.machine == "riscv64":
+            fpregset.f = (ctypes.c_ulonglong * len(regs["f"]))(*regs["f"])
+            fpregset.fcsr = regs["fcsr"]
         elif self.machine == "x86_64":
             fpregset.cwd = regs["cwd"]
             fpregset.swd = regs["swd"]
@@ -833,86 +873,86 @@ class coredump_generator:
             # current process.
             return b"\0" * size
 
-        if vma["status"] & status["VMA_FILE_SHARED"] or \
-           vma["status"] & status["VMA_FILE_PRIVATE"]:
-            # Open file before iterating vma pages
-            shmid = vma["shmid"]
-            off = vma["pgoff"]
+        # ExitStack ensures the file opened below (if any) is closed
+        # when the block exits, even if an exception is raised.
+        with ExitStack() as stack:
+            if vma["status"] & status["VMA_FILE_SHARED"] or \
+               vma["status"] & status["VMA_FILE_PRIVATE"]:
+                # Open file before iterating vma pages
+                shmid = vma["shmid"]
+                off = vma["pgoff"]
 
-            files = self.reg_files
-            fname = next(filter(lambda x: x["id"] == shmid, files))["name"]
+                files = self.reg_files
+                fname = next(
+                    filter(lambda x: x["id"] == shmid, files))["name"]
 
-            try:
-                f = open(fname, 'rb')
-            except FileNotFoundError:
-                sys.exit('Required file %s not found.' % fname)
+                try:
+                    f = stack.enter_context(open(fname, 'rb'))
+                except FileNotFoundError:
+                    sys.exit('Required file %s not found.' % fname)
 
-            f.seek(off)
+                f.seek(off)
 
-        start = vma["start"]
-        end = vma["start"] + size
+            start = vma["start"]
+            end = vma["start"] + size
 
-        # Split requested memory chunk into pages, so it could be
-        # pictured as:
-        #
-        # "----" -- part of page with memory outside of our vma;
-        # "XXXX" -- memory from our vma;
-        #
-        #  Start page     Pages in the middle        End page
-        # [-----XXXXX]...[XXXXXXXXXX][XXXXXXXXXX]...[XXX-------]
-        #
-        # Each page could be found in pages.img or in a standalone
-        # file described by shmid field in vma entry and
-        # corresponding entry in reg-files.img.
-        # For VMA_FILE_PRIVATE vma, unchanged pages are taken from
-        # a file, and changed ones -- from pages.img.
-        # Finally, if no page is found neither in pages.img nor
-        # in file, hole in inserted -- a page filled with zeroes.
-        start_page = start // PAGESIZE
-        end_page = end // PAGESIZE
+            # Split requested memory chunk into pages, so it could be
+            # pictured as:
+            #
+            # "----" -- part of page with memory outside of our vma;
+            # "XXXX" -- memory from our vma;
+            #
+            #  Start page     Pages in the middle        End page
+            # [-----XXXXX]...[XXXXXXXXXX][XXXXXXXXXX]...[XXX-------]
+            #
+            # Each page could be found in pages.img or in a standalone
+            # file described by shmid field in vma entry and
+            # corresponding entry in reg-files.img.
+            # For VMA_FILE_PRIVATE vma, unchanged pages are taken from
+            # a file, and changed ones -- from pages.img.
+            # Finally, if no page is found neither in pages.img nor
+            # in file, hole in inserted -- a page filled with zeroes.
+            start_page = start // PAGESIZE
+            end_page = end // PAGESIZE
 
-        buf = b""
-        for page_no in range(start_page, end_page + 1):
-            page = None
+            buf = b""
+            for page_no in range(start_page, end_page + 1):
+                page = None
 
-            # Search for needed page in pages.img and reg-files.img
-            # and choose appropriate.
-            page_mem = self._get_page(pid, page_no)
+                # Search for needed page in pages.img and reg-files.img
+                # and choose appropriate.
+                page_mem = self._get_page(pid, page_no)
 
-            if f is not None:
-                page = f.read(PAGESIZE)
+                if f is not None:
+                    page = f.read(PAGESIZE)
 
-            if page_mem is not None:
-                # Page from pages.img has higher priority
-                # than one from mapped file on disk.
-                page = page_mem
+                if page_mem is not None:
+                    # Page from pages.img has higher priority
+                    # than one from mapped file on disk.
+                    page = page_mem
 
-            if page is None:
-                # Hole
-                page = PAGESIZE * b"\0"
+                if page is None:
+                    # Hole
+                    page = PAGESIZE * b"\0"
 
-            # If it is a start or end page, we need to read
-            # only part of it.
-            if page_no == start_page:
-                n_skip = start - page_no * PAGESIZE
-                if start_page == end_page:
-                    n_read = size
+                # If it is a start or end page, we need to read
+                # only part of it.
+                if page_no == start_page:
+                    n_skip = start - page_no * PAGESIZE
+                    if start_page == end_page:
+                        n_read = size
+                    else:
+                        n_read = PAGESIZE - n_skip
+                elif page_no == end_page:
+                    n_skip = 0
+                    n_read = end - page_no * PAGESIZE
                 else:
-                    n_read = PAGESIZE - n_skip
-            elif page_no == end_page:
-                n_skip = 0
-                n_read = end - page_no * PAGESIZE
-            else:
-                n_skip = 0
-                n_read = PAGESIZE
+                    n_skip = 0
+                    n_read = PAGESIZE
 
-            buf += page[n_skip:n_skip + n_read]
+                buf += page[n_skip:n_skip + n_read]
 
-        # Don't forget to close file.
-        if f is not None:
-            f.close()
-
-        return buf
+            return buf
 
     def _gen_cmdline(self, pid):
         """

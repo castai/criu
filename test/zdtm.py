@@ -52,6 +52,22 @@ uuid = uuid.uuid4()
 NON_ROOT_UID = 65534
 
 
+def parse_size_str(s):
+    """Parse a SIZE string with optional K/M/G suffix into bytes,
+    matching parse_size() in criu/config.c."""
+    s = str(s).strip()
+    if not s:
+        raise ValueError("empty size string")
+    mult = 1
+    if s[-1] in ('K', 'k'):
+        mult, s = 1024, s[:-1]
+    elif s[-1] in ('M', 'm'):
+        mult, s = 1024 * 1024, s[:-1]
+    elif s[-1] in ('G', 'g'):
+        mult, s = 1024 * 1024 * 1024, s[:-1]
+    return int(s) * mult
+
+
 def alarm(*args):
     print("==== ALARM ====")
 
@@ -206,10 +222,10 @@ class ns_flavor:
     ]
     __dev_dirs = ["pts", "net"]
 
-    def __init__(self, opts):
-        self.name = "ns"
+    def __init__(self, opts, name="ns", uns=False):
+        self.name = name
         self.ns = True
-        self.uns = False
+        self.uns = uns
         self.root, self.devpath = make_tests_root()
         self.root_mounted = False
 
@@ -223,8 +239,9 @@ class ns_flavor:
             except OSError as e:
                 if e.errno != errno.EEXIST:
                     raise
-            dst = tempfile.mktemp(".tso", "",
-                                  self.root + os.path.dirname(fname))
+            fd, dst = tempfile.mkstemp(".tso", "",
+                                      self.root + os.path.dirname(fname))
+            os.close(fd)
             shutil.copy2(fname, dst)
             os.rename(dst, tfname)
 
@@ -340,9 +357,7 @@ class ns_flavor:
 
 class userns_flavor(ns_flavor):
     def __init__(self, opts):
-        ns_flavor.__init__(self, opts)
-        self.name = "userns"
-        self.uns = True
+        ns_flavor.__init__(self, opts, name="userns", uns=True)
 
     def init(self, l_bins, x_bins):
         # To be able to create roots_yard in CRIU
@@ -527,6 +542,7 @@ class zdtm_test:
                 criu_dir_r = "%s%s" % (self.__flavor.root, criu_dir)
 
                 env['ZDTM_CRIU'] = os.path.dirname(os.getcwd())
+                env['ZDTM_CRIU_TREE'] = os.path.join(os.path.dirname(os.getcwd()), "criu.tree")
                 subprocess.check_call(["mkdir", "-p", criu_dir_r])
 
         self.__make_action('pid', env, self.__flavor.root)
@@ -656,7 +672,7 @@ class zdtm_test:
         for postfix in ['.out', '.out.inprogress']:
             if os.access(self.__name + postfix, os.R_OK):
                 print("Test output: " + "=" * 32)
-                with open(self.__name + postfix) as output:
+                with open(self.__name + postfix, errors='ignore') as output:
                     print(output.read())
                 print(" <<< " + "=" * 32)
 
@@ -765,6 +781,7 @@ class inhfd_test:
             os.close(fd)
             fd = os.open("/dev/null", os.O_RDONLY)
             os.dup2(fd, 0)
+            os.close(fd)
             for my_file, _ in self.__files:
                 my_file.close()
             os.close(start_pipe[0])
@@ -1013,6 +1030,8 @@ class criu_rpc:
                 criu.opts.ps.port = int(args.pop(0))
             elif "--address" == arg:
                 criu.opts.ps.address = args.pop(0)
+            elif "--ps-socket" == arg:
+                criu.opts.ps.fd = int(args.pop(0))
             elif "--page-server" == arg:
                 continue
             elif "--prev-images-dir" == arg:
@@ -1023,6 +1042,12 @@ class criu_rpc:
                 if key == "splice":
                     mode = crpc.rpc.SPLICE
                 criu.opts.pre_dump_mode = mode
+            elif "--image-io-mode" == arg:
+                key = args.pop(0)
+                mode = crpc.rpc.IMAGE_IO_DIRECT
+                if key == "writeback":
+                    mode = crpc.rpc.IMAGE_IO_WRITEBACK
+                criu.opts.image_io_mode = mode
             elif "--track-mem" == arg:
                 criu.opts.track_mem = True
             elif "--tcp-established" == arg:
@@ -1041,8 +1066,37 @@ class criu_rpc:
                 criu.opts.pidfd_store_sk = criu_rpc.pidfd_store_socket.fileno()
             elif "--mntns-compat-mode" == arg:
                 criu.opts.mntns_compat_mode = True
+            elif arg in ("-c", "--compress"):
+                criu.opts.compress = 1  # COMPRESS_BLOCK
+                criu.opts.compress_block_size = mmap.PAGESIZE
+            elif "--compress-acceleration" == arg:
+                criu.opts.compress_acceleration = int(args.pop(0))
+                if criu.opts.compress == 0:
+                    criu.opts.compress = 1
+                    criu.opts.compress_block_size = mmap.PAGESIZE
+            elif arg == "--compress-block" or \
+                    arg.startswith("--compress-block="):
+                # Accept K/M/G suffixes and both '--compress-block SIZE'
+                # and '--compress-block=SIZE' forms.
+                if "=" in arg:
+                    val = arg.split("=", 1)[1]
+                else:
+                    val = args.pop(0)
+                criu.opts.compress_block_size = parse_size_str(val)
+                criu.opts.compress = 1  # COMPRESS_BLOCK
+            elif arg == "--decompress-threads" or \
+                    arg.startswith("--decompress-threads="):
+                if "=" in arg:
+                    val = arg.split("=", 1)[1]
+                else:
+                    if not args:
+                        raise test_fail_exc(
+                            "--decompress-threads requires a value")
+                    val = args.pop(0)
+                criu.opts.decompress_threads = int(val)
             else:
-                raise test_fail_exc('RPC for %s(%s) required' % (arg, args.pop(0)))
+                raise test_fail_exc(
+                    'RPC for %s(%s) required' % (arg, args))
 
     @staticmethod
     def run(action,
@@ -1118,7 +1172,9 @@ class criu:
         self.__dump_path = None
         self.__iter = 0
         self.__prev_dump_iter = None
-        self.__page_server = bool(opts['page_server'])
+        self.__page_server_socket = bool(opts['page_server_socket'])
+        self.__page_server = (bool(opts['page_server']) or
+                              self.__page_server_socket)
         self.__remote_lazy_pages = bool(opts['remote_lazy_pages'])
         self.__lazy_pages = (self.__remote_lazy_pages or
                              bool(opts['lazy_pages']))
@@ -1162,8 +1218,12 @@ class criu:
 
         self.__crit_bin = opts['crit_bin']
         self.__pre_dump_mode = opts['pre_dump_mode']
+        self.__image_io_mode = opts['image_io_mode']
         self.__preload_libfault = bool(opts['preload_libfault'])
         self.__mntns_compat_mode = bool(opts['mntns_compat_mode'])
+        self.__compress = bool(opts['compress'])
+        self.__compress_acceleration = opts.get('compress_acceleration', 0)
+        self.__compress_block = opts.get('compress_block', None)
         self.__cuda_checkpoint = bool(opts['mocked_cuda_checkpoint'])
 
         if opts['rpc']:
@@ -1175,7 +1235,7 @@ class criu:
 
     def fini(self):
         if self.__lazy_migrate:
-            ret = self.__dump_process.wait()
+            self.__dump_process.wait()
         if self.__lazy_pages_p:
             ret = self.__lazy_pages_p.wait()
             grep_errors(os.path.join(self.__ddir(), "lazy-pages.log"), err=ret)
@@ -1334,7 +1394,7 @@ class criu:
                                       strace, preexec)
                 grep_errors(os.path.join(__ddir, log))
                 if ret == 0:
-                    return
+                    return None
             rst_succeeded = os.access(
                 os.path.join(__ddir, "restore-succeeded"), os.F_OK)
             if (self.__test.blocking() and not self.__criu.exit_signal(ret)) or \
@@ -1342,6 +1402,8 @@ class criu:
                 raise test_fail_expected_exc(action)
             else:
                 raise test_fail_exc("CRIU %s" % action)
+
+        return None
 
     def __stats_file(self, action):
         return os.path.join(self.__ddir(), "stats-%s" % action)
@@ -1353,11 +1415,86 @@ class criu:
         subprocess.Popen([self.__crit_bin, "show",
                           self.__stats_file(action)]).wait()
 
+    def __compressed_pages_layout(self):
+        """Return the exact page and byte counts described by pagemap files."""
+        layouts = {}
+
+        for name in sorted(os.listdir(self.__ddir())):
+            if not (name.startswith("pagemap-") and name.endswith(".img")):
+                continue
+
+            path = os.path.join(self.__ddir(), name)
+            with open(path, "rb") as image:
+                entries = crpc.images.load(image).get("entries", [])
+            if not entries or "pages_id" not in entries[0]:
+                raise test_fail_exc("%s has no pages_id" % name)
+
+            pages_id = int(entries[0]["pages_id"])
+            if pages_id in layouts:
+                raise test_fail_exc("duplicate pages_id %d" % pages_id)
+
+            offset = 0
+            page_count = 0
+            for entry in entries[1:]:
+                has_flags = "flags" in entry
+                flags = int(entry.get("flags", 0))
+                if entry.get("in_parent"):
+                    flags |= 1  # PE_PARENT
+                elif not has_flags:
+                    flags = 4  # Legacy entries without flags are present.
+                if not flags & 4:  # PE_PRESENT
+                    continue
+
+                nr_pages = int(entry.get(
+                    "nr_pages", entry.get("compat_nr_pages", 0)))
+                if nr_pages <= 0:
+                    raise test_fail_exc("%s has a present empty entry" % name)
+                if flags & 8:  # PE_PAYLOAD_ALIGNED
+                    offset = ((offset + mmap.PAGESIZE - 1) //
+                              mmap.PAGESIZE * mmap.PAGESIZE)
+
+                blocks = entry.get("blocks")
+                if blocks and blocks.get("block_sizes"):
+                    offset += int(blocks.get(
+                        "total_payload_size",
+                        sum(int(s) for s in blocks["block_sizes"])))
+                else:
+                    offset += nr_pages * mmap.PAGESIZE
+                page_count += nr_pages
+
+            layouts[pages_id] = (offset, page_count, name)
+
+        page_files = {}
+        for name in os.listdir(self.__ddir()):
+            match = re.fullmatch(r"pages-([0-9]+)\.img", name)
+            if match:
+                page_files[int(match.group(1))] = name
+
+        if set(layouts) != set(page_files):
+            missing_pages = sorted(set(layouts) - set(page_files))
+            missing_pagemaps = sorted(set(page_files) - set(layouts))
+            raise test_fail_exc(
+                "pages/pagemap id mismatch: missing pages=%s, "
+                "missing pagemaps=%s" % (missing_pages, missing_pagemaps))
+
+        total_bytes = 0
+        total_pages = 0
+        for pages_id, (expected, page_count, pagemap_name) in layouts.items():
+            pages_name = page_files[pages_id]
+            actual = os.path.getsize(os.path.join(self.__ddir(), pages_name))
+            if actual != expected:
+                print("ERROR: %s describes %d bytes for %s, file has %d" %
+                      (pagemap_name, expected, pages_name, actual))
+                raise test_fail_exc("compressed pages size mismatch")
+            total_bytes += actual
+            total_pages += page_count
+
+        return total_pages, total_bytes
+
     def check_pages_counts(self):
         if not os.access(self.__stats_file("dump"), os.R_OK):
             return
 
-        stats_written = -1
         with open(self.__stats_file("dump"), 'rb') as stfile:
             stats = crpc.images.load(stfile)
             stent = stats['entries'][0]['dump']
@@ -1372,7 +1509,7 @@ class criu:
 
         real_written = 0
         for f in os.listdir(self.__ddir()):
-            if f.startswith('pages-'):
+            if re.fullmatch(r"pages-[0-9]+\.img", f):
                 real_written += os.path.getsize(os.path.join(self.__ddir(), f))
 
         if self.__stream:
@@ -1381,7 +1518,28 @@ class criu:
 
         r_pages = real_written / mmap.PAGESIZE
         r_off = real_written % mmap.PAGESIZE
-        if (stats_written != r_pages) or (r_off != 0):
+        # Detect compression: from CLI (--compress / --compress-block)
+        # or from the test's dump options when -c / --compress /
+        # --compress-block is in .desc opts.
+        compress = (self.__compress or bool(self.__compress_block) or
+                    bool(self.__compress_acceleration))
+        if not compress and self.__test is not None:
+            dopts = self.__test.getdopts()
+            compress = ('-c' in dopts or
+                        any(a == '--compress' or
+                            a.startswith('--compress-block')
+                            for a in dopts))
+        if compress:
+            metadata_pages, metadata_bytes = self.__compressed_pages_layout()
+            if (stats_written != metadata_pages or
+                    real_written != metadata_bytes):
+                print("ERROR: compressed page counts mismatch "
+                      "(stats = %d, metadata = %d, real = %d, "
+                      "metadata bytes = %d)" %
+                      (stats_written, metadata_pages, real_written,
+                       metadata_bytes))
+                raise test_fail_exc("page counts mismatch")
+        elif (stats_written != r_pages) or (r_off != 0):
             print("ERROR: bad page counts, stats = %d real = %d(%d)" %
                   (stats_written, r_pages, r_off))
             raise test_fail_exc("page counts mismatch")
@@ -1450,6 +1608,9 @@ class criu:
         return ret
 
     def dump(self, action, opts=[]):
+        page_server_server = None
+        page_server_client = None
+
         self.__iter += 1
         os.mkdir(self.__ddir())
         os.chmod(self.__ddir(), 0o777)
@@ -1465,16 +1626,44 @@ class criu:
         if self.__page_server:
             print("Adding page server")
 
-            ps_opts = ["--port", "12345"] + self.__tls
+            if self.__page_server_socket:
+                page_server_server, page_server_client = socket.socketpair()
+                page_server_server.set_inheritable(True)
+                ps_opts = [
+                    "--ps-socket", str(page_server_server.fileno())
+                ] + self.__tls
+            else:
+                ps_opts = ["--port", "12345"] + self.__tls
             if self.__dedup:
                 ps_opts += ["--auto-dedup"]
 
-            self.__page_server_p = self.__criu_act("page-server",
-                                                   opts=ps_opts,
-                                                   nowait=True)
-            a_opts += [
-                "--page-server", "--address", "127.0.0.1", "--port", "12345"
-            ] + self.__tls
+            # The dump-side wire command declares whether each payload is
+            # compressed. Keep the server deliberately unconfigured so
+            # page-server tests also exercise asymmetric client/server options.
+
+            try:
+                self.__page_server_p = self.__criu_act("page-server",
+                                                       opts=ps_opts,
+                                                       nowait=True)
+            except BaseException:
+                if page_server_client is not None:
+                    page_server_client.close()
+                raise
+            finally:
+                if page_server_server is not None:
+                    page_server_server.close()
+
+            if self.__page_server_socket:
+                page_server_client.set_inheritable(True)
+                a_opts += [
+                    "--page-server", "--ps-socket",
+                    str(page_server_client.fileno()),
+                ] + self.__tls
+            else:
+                a_opts += [
+                    "--page-server", "--address", "127.0.0.1",
+                    "--port", "12345",
+                ] + self.__tls
 
         a_opts += self.__test.getdopts()
 
@@ -1484,6 +1673,9 @@ class criu:
 
         if self.__dedup:
             a_opts += ["--auto-dedup"]
+
+        if self.__image_io_mode:
+            a_opts += ["--image-io-mode", self.__image_io_mode]
 
         a_opts += ["--timeout", "10"]
 
@@ -1498,14 +1690,24 @@ class criu:
             a_opts += ['--empty-ns', 'net']
         if self.__pre_dump_mode:
             a_opts += ["--pre-dump-mode", "%s" % self.__pre_dump_mode]
+        if self.__compress:
+            a_opts += ["-c"]
+        if self.__compress_block:
+            a_opts += ["--compress-block", str(self.__compress_block)]
+        if self.__compress_acceleration:
+            a_opts += ["--compress-acceleration", "%d" % self.__compress_acceleration]
 
         nowait = False
         if self.__lazy_migrate and action == "dump":
             a_opts += ["--lazy-pages", "--port", "12345"] + self.__tls
             nowait = True
-        self.__dump_process = self.__criu_act(action,
-                                              opts=a_opts + opts,
-                                              nowait=nowait)
+        try:
+            self.__dump_process = self.__criu_act(action,
+                                                  opts=a_opts + opts,
+                                                  nowait=nowait)
+        finally:
+            if page_server_client is not None:
+                page_server_client.close()
         if self.__stream:
             ret = self.wait_for_criu_image_streamer()
             if ret:
@@ -1548,11 +1750,14 @@ class criu:
         if self.__dedup:
             r_opts += ["--auto-dedup"]
 
+        if self.__image_io_mode:
+            r_opts += ["--image-io-mode", self.__image_io_mode]
+
         self.__prev_dump_iter = None
         criu_dir = os.path.dirname(os.getcwd())
         if os.getenv("GCOV"):
             r_opts.append('--external')
-            r_opts.append('mnt[zdtm]:%s' % criu_dir)
+            r_opts.append('mnt[zdtm]:%s' % os.path.join(criu_dir, "criu.tree"))
 
         if self.__lazy_pages or self.__lazy_migrate:
             lp_opts = []
@@ -1682,7 +1887,7 @@ def cr(cr_api, test, opts):
     cr_api.set_test(test)
 
     iters = iter_parm(opts['iters'], 1)
-    for i in iters[0]:
+    for _ in iters[0]:
         pre = iter_parm(opts['pre'], 0)
         for p in pre[0]:
             if opts['snaps']:
@@ -1968,7 +2173,7 @@ def is_proc_stopped(pid):
                         return line.split(":", 1)[1].strip().split(" ")[0]
         except Exception as e:
             print("Unable to read a thread status: %s" % e)
-            pass  # process is dead
+            # process is dead
         return None
 
     def is_thread_stopped(status):
@@ -1980,7 +2185,7 @@ def is_proc_stopped(pid):
         thread_dirs = os.listdir(tasks_dir)
     except Exception as e:
         print("Unable to read threads: %s" % e)
-        pass  # process is dead
+        # process is dead
 
     for thread_dir in thread_dirs:
         thread_status = get_thread_status(os.path.join(tasks_dir, thread_dir))
@@ -2005,10 +2210,20 @@ def pstree_signal(root_pid, signal):
             os.kill(int(pid), signal)
         except Exception as e:
             print("Unable to kill %d: %s" % (pid, e))
-            pass  # process is dead
+            # process is dead
 
 
 def do_run_test(tname, tdesc, flavs, opts):
+    if os.getenv("GCOV"):
+        # With GCOV=1 the CRIU workspace parent is bind-mounted into the
+        # test namespace (ZDTM_CRIU / ZDTM_CRIU_TREE in ns.c).  We use a
+        # private bind-mount of ".." as the mount source so that cgroupfs
+        # submounts CRIU creates later (cg_yard via mkdtemp) are invisible
+        # to it.  Without this, those mounts propagate into the source and
+        # become MNT_LOCKED inside the user namespace, causing
+        # open_tree(OPEN_TREE_CLONE) to return EINVAL on restore.
+        os.makedirs("../criu.tree", mode=0o700, exist_ok=True)
+        subprocess.check_call(["mount", "--bind", "--make-private", "..", "../criu.tree"])
     tcname = tname.split('/')[0]
     tclass = test_classes.get(tcname, None)
     if not tclass:
@@ -2106,8 +2321,6 @@ class Launcher:
             print(u"# ", file=self.__file_report)
             print(u"1.." + str(nr_tests), file=self.__file_report)
         self.__taint = self.__read_kernel_tainted()
-        if int(self.__taint, 0) != 0:
-            self.__report_kernel_taint("The kernel is tainted: %r" % self.__taint)
 
     @staticmethod
     def __read_kernel_tainted():
@@ -2119,6 +2332,14 @@ class Launcher:
         print(msg)
         if not opts["ignore_taint"] and os.getenv("ZDTM_IGNORE_TAINT") != "1":
             raise Exception(msg)
+
+    def __check_kernel_taint(self):
+        taint = self.__read_kernel_tainted()
+        if self.__taint != taint:
+            prev_taint = self.__taint
+            self.__taint = taint
+            self.__report_kernel_taint(
+                "The kernel is tainted: %r (was %r)" % (taint, prev_taint))
 
     def __show_progress(self, msg):
         perc = int(self.__nr * 16 / self.__total)
@@ -2140,12 +2361,7 @@ class Launcher:
         if len(self.__subs) >= self.__max:
             self.wait()
 
-        taint = self.__read_kernel_tainted()
-        if self.__taint != taint:
-            prev_taint = self.__taint
-            self.__taint = taint
-            self.__report_kernel_taint(
-                "The kernel is tainted: %r (was %r)" % (taint, prev_taint))
+        self.__check_kernel_taint()
 
         '''
         The option --link-remap allows criu to hardlink open files back to the
@@ -2168,13 +2384,15 @@ class Launcher:
         self.__nr += 1
         self.__show_progress(name)
 
-        nd = ('nocr', 'norst', 'pre', 'iters', 'page_server', 'sibling',
+        nd = ('nocr', 'norst', 'pre', 'iters', 'page_server',
+              'page_server_socket', 'sibling',
               'stop', 'empty_ns', 'fault', 'keep_img', 'report', 'snaps',
               'sat', 'script', 'rpc', 'criu_config', 'lazy_pages', 'join_ns',
               'dedup', 'sbs', 'freezecg', 'user', 'dry_run', 'noauto_dedup',
               'remote_lazy_pages', 'show_stats', 'lazy_migrate', 'stream',
-              'tls', 'criu_bin', 'crit_bin', 'pre_dump_mode', 'mntns_compat_mode',
+              'tls', 'criu_bin', 'crit_bin', 'pre_dump_mode', 'image_io_mode', 'mntns_compat_mode',
               'rootless', 'preload_libfault', 'mocked_cuda_checkpoint',
+              'compress', 'compress_acceleration', 'compress_block',
               'pycriu_search_path')
         arg = repr((name, desc, flavor, {d: self.__opts[d] for d in nd}))
 
@@ -2210,8 +2428,6 @@ class Launcher:
             self.wait()
 
     def __wait_one(self, flags):
-        pid = -1
-        status = -1
         signal.alarm(10)
         while True:
             try:
@@ -2232,6 +2448,7 @@ class Launcher:
             # The following wait() is not useful for our domain logic.
             # It's useful for taming warnings in subprocess.Popen.__del__()
             sub['sub'].wait()
+            self.__check_kernel_taint()
             if status != 0:
                 self.__fail = True
                 failed_flavor = decode_flav(os.WEXITSTATUS(status))
@@ -2284,6 +2501,7 @@ class Launcher:
 
     def finish(self):
         self.__wait_all()
+        self.__check_kernel_taint()
         if not opts['fault'] and check_core_files():
             self.__fail = True
         if self.__file_report:
@@ -2378,6 +2596,15 @@ def print_error(line):
     return False
 
 
+# Patterns of log messages to ignore in grep_errors(). These are
+# matched as regular expressions against each line. Matching lines
+# are silently skipped and will not trigger "ERROR OVER" output.
+grep_errors_ignore = [
+    # Commonly seen with ns/uns flavors; harmless but triggers ERROR OVER
+    r"Error: ipv[46]: [Aa]ddress already assigned\.",  # codespell:ignore ddress
+]
+
+
 def grep_errors(fname, err=False):
     first = True
     print_next = False
@@ -2387,6 +2614,9 @@ def grep_errors(fname, err=False):
             before.append(line)
             if len(before) > 5:
                 before.pop(0)
+            # Skip lines matching known harmless messages
+            if any(re.search(p, line) for p in grep_errors_ignore):
+                continue
             if "Error" in line or "Warn" in line:
                 if first:
                     print_fname(fname, 'log')
@@ -2408,7 +2638,7 @@ def grep_errors(fname, err=False):
         print_sep("grep Error (no)", "-", 60)
         first = False
         for i in before:
-            print_next = print_error(i)
+            print_error(i)
 
     if not first:
         print_sep("ERROR OVER", "-", 60)
@@ -2594,7 +2824,7 @@ def list_tests(opts):
     tlist = all_tests(opts)
     if opts['info']:
         print(sti_fmt % ('Name', 'Flavors', 'Flags'))
-        tlist = map(lambda x: show_test_info(x), tlist)
+        tlist = map(show_test_info, tlist)
     print('\n'.join(tlist))
 
 
@@ -2635,30 +2865,27 @@ class group:
         scripts = filter(lambda names: os.access(names[1], os.X_OK),
                          map(lambda test: (test, test + ext), self.__tests))
         if scripts:
-            f = open(fname + ext, "w")
-            f.write("#!/bin/sh -e\n")
+            with open(fname + ext, "w") as f:
+                f.write("#!/bin/sh -e\n")
 
-            for test, script in scripts:
-                f.write("echo 'Running %s for %s'\n" % (ext, test))
-                f.write('%s "$@"\n' % script)
+                for test, script in scripts:
+                    f.write("echo 'Running %s for %s'\n" % (ext, test))
+                    f.write('%s "$@"\n' % script)
 
-            f.write("echo 'All %s scripts OK'\n" % ext)
-            f.close()
+                f.write("echo 'All %s scripts OK'\n" % ext)
             os.chmod(fname + ext, 0o700)
 
     def dump(self, fname):
-        f = open(fname, "w")
-        for t in self.__tests:
-            f.write(t + '\n')
-        f.close()
+        with open(fname, "w") as f:
+            for t in self.__tests:
+                f.write(t + '\n')
         os.chmod(fname, 0o700)
 
         if len(self.__desc) or len(self.__deps):
-            f = open(fname + '.desc', "w")
-            if len(self.__deps):
-                self.__desc['deps'] = list(self.__deps)
-            f.write(repr(self.__desc))
-            f.close()
+            with open(fname + '.desc', "w") as f:
+                if len(self.__deps):
+                    self.__desc['deps'] = list(self.__deps)
+                f.write(repr(self.__desc))
 
         # write "meta" .checkskip and .hook scripts
         self.__dump_meta(fname, '.checkskip')
@@ -2819,6 +3046,9 @@ def get_cli_args():
     rp.add_argument("--page-server",
                     help="Use page server dump",
                     action='store_true')
+    rp.add_argument("--page-server-socket",
+                    help="Use an inherited socket for the page server dump",
+                    action='store_true')
     rp.add_argument("--stream",
                     help="Use criu-image-streamer",
                     action='store_true')
@@ -2837,7 +3067,7 @@ def get_cli_args():
                     help="Keep running tests in spite of failures",
                     action='store_true')
     rp.add_argument("--ignore-taint",
-                    help="Don't care about a non-zero kernel taint flag",
+                    help="Don't care about kernel taint changes",
                     action='store_true')
     rp.add_argument("--lazy-pages",
                     help="restore pages on demand",
@@ -2869,6 +3099,10 @@ def get_cli_args():
                     help="Use splice or read mode of pre-dumping",
                     choices=['splice', 'read'],
                     default='splice')
+    rp.add_argument("--image-io-mode",
+                    help="Set the pages image I/O mode",
+                    choices=['writeback', 'direct'],
+                    default=None)
     rp.add_argument("--mntns-compat-mode",
                     help="Use old compat mounts restore engine",
                     action='store_true')
@@ -2882,6 +3116,16 @@ def get_cli_args():
                     choices=['amdgpu', 'cuda', 'inventory_test_enabled', 'inventory_test_disabled'],
                     nargs='+',
                     default=None)
+    rp.add_argument("--compress",
+                    help="Enable LZ4 compression of memory pages",
+                    action='store_true')
+    rp.add_argument("--compress-block",
+                    help="Enable LZ4 block compression with the given block "
+                         "size (K/M/G suffix accepted, e.g. 256K, 1M)",
+                    default=None)
+    rp.add_argument("--compress-acceleration",
+                    help="LZ4 acceleration (1=default, higher=faster)",
+                    type=int, default=0)
     rp.add_argument("--mocked-cuda-checkpoint",
                     action="store_true",
                     help="Run criu with the cuda plugin and the mocked cuda-checkpoint tool")
@@ -2951,8 +3195,9 @@ if __name__ == '__main__':
 
     if opts['action'] == run_tests:
         criu.available()
-    for tst in test_classes.values():
-        tst.available()
+    if opts['action'] != clean_stuff:
+        for tst in test_classes.values():
+            tst.available()
 
     orig_hugepages = set_nr_hugepages(20)
     opts['action'](opts)

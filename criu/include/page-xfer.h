@@ -1,6 +1,7 @@
 #ifndef __CR_PAGE_XFER__H__
 #define __CR_PAGE_XFER__H__
 #include "pagemap.h"
+#include "pagemap-block.h"
 
 struct ps_info {
 	int pid;
@@ -31,6 +32,17 @@ struct page_xfer {
 	 */
 	unsigned long offset;
 	bool transfer_lazy;
+	/* Store the current page-pipe segment as compressed-format raw/zero blocks. */
+	bool force_raw;
+
+	/*
+	 * Local non-streaming dump only: the pages image fd was switched to
+	 * O_DIRECT (--image-io-mode=direct). write_pages_loc() splices with
+	 * O_DIRECT set and clears this if the filesystem rejects direct I/O.
+	 */
+	bool pi_use_direct;
+	/* Bytes already emitted to the pages image, including alignment padding. */
+	uint64_t pages_image_offset;
 
 	/* private data for every page-xfer engine */
 	union {
@@ -46,6 +58,27 @@ struct page_xfer {
 	};
 
 	struct page_read *parent;
+
+	/*
+	 * Pending pagemap entry for compressed writes.
+	 * write_pagemap saves the entry here because the
+	 * compressed_size array is not known until write_pages
+	 * compresses all pages. Once done, write_pages writes
+	 * the complete pagemap entry.
+	 *
+	 * The sizes[] array holds one element per compressed block (length
+	 * n_compressed == ceil(nr_pages / pages_per_block)).
+	 */
+	struct {
+		unsigned long vaddr;
+		unsigned long nr_pages;
+		u32 flags;
+		struct page_block_layout b_layout;
+		/* Number of compressed blocks emitted so far. */
+		size_t n_compressed;
+		/* Whether this entry has emitted its first non-zero payload. */
+		bool payload_started;
+	} pending_pe;
 };
 
 extern int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long id);

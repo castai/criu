@@ -1400,6 +1400,17 @@ static int check_timer_cr_ids(void)
 	return 0;
 }
 
+static int check_statmount_by_fd(void)
+{
+	if (!kdat.has_statmount_by_fd) {
+		pr_warn("statmount syscall with STATMOUNT_BY_FD is unavailable,"
+				" files on unmounted bind mounts will not be supported\n");
+		return -1;
+	}
+
+	return 0;
+}
+
 /* musl doesn't have a statx wrapper... */
 struct staty {
 	__u32 stx_dev_major;
@@ -1589,16 +1600,6 @@ static int check_overlayfs_maps(void)
 	return status == 0 ? 0 : -1;
 }
 
-static int check_breakpoints(void)
-{
-	if (!kdat.has_breakpoints) {
-		pr_warn("Hardware breakpoints don't seem to work\n");
-		return -1;
-	}
-
-	return 0;
-}
-
 static int check_pagemap_scan_guard_pages(void)
 {
 	kerndat_warn_about_madv_guards();
@@ -1731,6 +1732,7 @@ int cr_check(void)
 		ret |= check_overlayfs_maps();
 		ret |= check_timer_cr_ids();
 		ret |= check_pagemap_scan_guard_pages();
+		ret |= check_statmount_by_fd();
 
 		if (kdat.lsm == LSMTYPE__APPARMOR)
 			ret |= check_apparmor_stacking();
@@ -1746,7 +1748,6 @@ int cr_check(void)
 	/*
 	 * Category 4 - optional.
 	 */
-	check_breakpoints();
 
 	pr_msg("%s\n", ret ? CHECK_MAYBE : CHECK_GOOD);
 	return ret;
@@ -1810,6 +1811,26 @@ static int check_external_net_ns(void)
 	return 0;
 }
 
+static int check_binfmt_misc_sandboxing(void)
+{
+	if (!kdat.has_binfmt_misc_sandboxing) {
+		pr_info("binfmt_misc sandboxing isn't supported\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int check_compress(void)
+{
+#ifdef CONFIG_LZ4
+	return 0;
+#else
+	pr_info("LZ4 compression support is not compiled in\n");
+	return -1;
+#endif
+}
+
 struct feature_list {
 	char *name;
 	int (*func)(void);
@@ -1859,8 +1880,9 @@ static struct feature_list feature_list[] = {
 	{ "pagemap_scan", check_pagemap_scan },
 	{ "timer_cr_ids", check_timer_cr_ids },
 	{ "overlayfs_maps", check_overlayfs_maps },
-	{ "breakpoints", check_breakpoints },
 	{ "pagemap_scan_guard_pages", check_pagemap_scan_guard_pages },
+	{ "binfmt_misc_sandboxing", check_binfmt_misc_sandboxing },
+	{ "compress", check_compress },
 	{ NULL, NULL },
 };
 

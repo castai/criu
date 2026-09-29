@@ -37,9 +37,11 @@
 #include "amdgpu_drm.h"
 #include "amdgpu_plugin_util.h"
 #include "amdgpu_plugin_topology.h"
+#include "amdgpu_plugin_drm.h"
 
-/* Tracks number of device files that need to be checkpointed */
-static int dev_file_cnt = 0;
+static LIST_HEAD(dumped_fds);
+static LIST_HEAD(shared_bos);
+static LIST_HEAD(completed_work);
 
 /* Helper structures to encode device topology of SRC and DEST platforms */
 struct tp_system src_topology;
@@ -49,45 +51,197 @@ struct tp_system dest_topology;
 struct device_maps checkpoint_maps;
 struct device_maps restore_maps;
 
-bool checkpoint_is_complete()
+int record_dumped_fd(int fd, bool is_drm)
 {
-	return (dev_file_cnt == 0);
+	int newfd = dup(fd);
+
+	if (newfd < 0)
+		return newfd;
+	struct dumped_fd *st = malloc(sizeof(struct dumped_fd));
+	if (!st)
+		return -1;
+	st->fd = newfd;
+	st->is_drm = is_drm;
+	list_add(&st->l, &dumped_fds);
+
+	return 0;
 }
 
-void decrement_checkpoint_count()
+struct list_head *get_dumped_fds()
 {
-	dev_file_cnt--;
+	return &dumped_fds;
 }
 
-void init_gpu_count(struct tp_system *topo)
+bool shared_bo_has_exporter(int handle)
 {
-	if (dev_file_cnt != 0)
-		return;
+	struct shared_bo *bo;
 
-	/* We add ONE to include checkpointing of KFD device */
-	dev_file_cnt = 1 + topology_gpu_count(topo);
+	if (handle == -1)
+		return false;
+
+	list_for_each_entry(bo, &shared_bos, l) {
+		if (bo->handle == handle) {
+			return bo->has_exporter;
+		}
+	}
+
+	return false;
 }
 
-int read_fp(FILE *fp, void *buf, const size_t buf_len)
+int record_shared_bo(int handle, bool is_imported)
 {
-	size_t len_read;
+	struct shared_bo *bo;
 
-	len_read = fread(buf, 1, buf_len, fp);
-	if (len_read != buf_len) {
-		pr_err("Unable to read file (read:%ld buf_len:%ld)\n", len_read, buf_len);
-		return -EIO;
+	if (handle == -1)
+		return 0;
+
+	list_for_each_entry(bo, &shared_bos, l) {
+		if (bo->handle == handle) {
+			return 0;
+		}
+	}
+	bo = malloc(sizeof(struct shared_bo));
+	if (!bo)
+		return -1;
+	bo->handle = handle;
+	bo->has_exporter = !is_imported;
+	list_add(&bo->l, &shared_bos);
+
+	return 0;
+}
+
+int handle_for_shared_bo_fd(int fd)
+{
+	struct dumped_fd *df;
+	int trial_handle;
+	amdgpu_device_handle h_dev;
+	uint32_t major, minor;
+	struct shared_bo *bo;
+
+	list_for_each_entry(df, &dumped_fds, l) {
+		/* see if the gem handle for fd using the hdev for df->fd is the
+		   same as bo->handle. */
+
+		if (!df->is_drm) {
+			continue;
+		}
+
+		if (amdgpu_device_initialize(df->fd, &major, &minor, &h_dev)) {
+			pr_err("Failed to initialize amdgpu device\n");
+			continue;
+		}
+
+		trial_handle = get_gem_handle(h_dev, fd);
+		if (trial_handle < 0) {
+			amdgpu_device_deinitialize(h_dev);
+			continue;
+		}
+
+		list_for_each_entry(bo, &shared_bos, l) {
+			if (bo->handle == trial_handle) {
+				amdgpu_device_deinitialize(h_dev);
+				return trial_handle;
+			}
+		}
+
+		amdgpu_device_deinitialize(h_dev);
+	}
+
+	return -1;
+}
+
+int record_completed_work(int handle, int id)
+{
+	struct restore_completed_work *work;
+
+	work = malloc(sizeof(struct restore_completed_work));
+	if (!work)
+		return -1;
+	work->handle = handle;
+	work->id = id;
+	list_add(&work->l, &completed_work);
+
+	return 0;
+}
+
+bool work_already_completed(int handle, int id)
+{
+	struct restore_completed_work *work;
+
+	list_for_each_entry(work, &completed_work, l) {
+		if (work->handle == handle && work->id == id) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+void clear_restore_state()
+{
+	while (!list_empty(&completed_work)) {
+		struct restore_completed_work *st = list_first_entry(&completed_work, struct restore_completed_work, l);
+		list_del(&st->l);
+		free(st);
+	}
+}
+
+void clear_dumped_fds()
+{
+	while (!list_empty(&dumped_fds)) {
+		struct dumped_fd *st = list_first_entry(&dumped_fds, struct dumped_fd, l);
+		list_del(&st->l);
+		close(st->fd);
+		free(st);
+	}
+}
+
+int img_read(int fd, void *buf, size_t buf_len)
+{
+	char *ptr = buf;
+
+	while (buf_len) {
+		ssize_t len = read(fd, ptr, buf_len);
+
+		if ((len < 0 && (errno != EINTR && errno != EAGAIN)) ||
+		    (len == 0 && buf_len)) {
+			int ret;
+
+			ret = len ? -errno : -EIO;
+			errno = -ret;
+			pr_perror("Unable to read file (remain:%zu)", buf_len);
+
+			return ret;
+		}
+		if (len >= 0) {
+			buf_len -= len;
+			ptr += len;
+		}
 	}
 	return 0;
 }
 
-int write_fp(FILE *fp, const void *buf, const size_t buf_len)
+int img_write(int fd, const void *buf, size_t buf_len)
 {
-	size_t len_write;
+	const char *ptr = buf;
 
-	len_write = fwrite(buf, 1, buf_len, fp);
-	if (len_write != buf_len) {
-		pr_err("Unable to write file (wrote:%ld buf_len:%ld)\n", len_write, buf_len);
-		return -EIO;
+	while (buf_len) {
+		ssize_t len = write(fd, ptr, buf_len);
+
+		if ((len < 0 && (errno != EINTR && errno != EAGAIN)) ||
+		    (len == 0 && buf_len)) {
+			int ret;
+
+			ret = len ? -errno : -EIO;
+			errno = -ret;
+			pr_perror("Unable to write file (remain:%zu)", buf_len);
+
+			return ret;
+		}
+		if (len >= 0) {
+			buf_len -= len;
+			ptr += len;
+		}
 	}
 	return 0;
 }
@@ -95,66 +249,68 @@ int write_fp(FILE *fp, const void *buf, const size_t buf_len)
 /**
  * @brief Open an image file
  *
- * We store the size of the actual contents in the first 8-bytes of
- * the file. This allows us to determine the file size when using
- * criu_image_streamer when fseek and fstat are not available. The
- * FILE * returned is already at the location of the first actual
- * contents.
+ * We store the size of the actual contents at the start of the file. (Note that
+ * the size of this field is architecture dependent!). This allows us to
+ * determine the file size when using criu_image_streamer when fseek and fstat
+ * are not available. The file descriptor returned is already at the location of
+ * the first actual contents.
  *
  * @param path The file path
  * @param write False for read, true for write
  * @param size Size of actual contents
- * @return FILE *if successful, NULL if failed
+ * @param expect_present If true, the file not existing is an error
+ * @return file descriptor if successful, -errno on failure
  */
-FILE *open_img_file(char *path, bool write, size_t *size)
+int open_img_file(char *path, bool write, size_t *size, bool expect_present)
 {
-	FILE *fp = NULL;
 	int fd, ret;
 
-	if (opts.stream)
+	if (opts.stream) {
 		fd = img_streamer_open(path, write ? O_DUMP : O_RSTR);
-	else
-		fd = openat(criu_get_image_dir(), path, write ? (O_WRONLY | O_CREAT) : O_RDONLY, 0600);
-
-	if (fd < 0) {
-		pr_err("%s: Failed to open for %s\n", path, write ? "write" : "read");
-		return NULL;
+		if (fd == -1)
+			errno = EIO;
+		else if (fd < 0)
+			errno = -fd;
+	} else {
+		fd = openat(criu_get_image_dir(), path,
+			    write ? (O_WRONLY | O_CREAT | O_TRUNC) : O_RDONLY,
+			    0600);
 	}
 
-	fp = fdopen(fd, write ? "w" : "r");
-	if (!fp) {
-		pr_err("%s: Failed get pointer for %s\n", path, write ? "write" : "read");
-		return NULL;
+	if (fd < 0) {
+		fd = -errno;
+		if (expect_present)
+			pr_perror("%s: Failed to open for %s",
+				  path, write ? "write" : "read");
+		return fd;
 	}
 
 	if (write)
-		ret = write_fp(fp, size, sizeof(*size));
+		ret = img_write(fd, size, sizeof(*size));
 	else
-		ret = read_fp(fp, size, sizeof(*size));
-
+		ret = img_read(fd, size, sizeof(*size));
 	if (ret) {
-		pr_err("%s:Failed to access file size\n", path);
-		fclose(fp);
-		return NULL;
+		close(fd);
+		return ret;
 	}
 
 	pr_debug("%s:Opened file for %s with size:%ld\n", path, write ? "write" : "read", *size);
-	return fp;
+	return fd;
 }
 
 int read_file(const char *file_path, void *buf, const size_t buf_len)
 {
-	int ret;
-	FILE *fp;
+	int ret, fd;
 
-	fp = fopen(file_path, "r");
-	if (!fp) {
-		pr_err("Cannot fopen %s\n", file_path);
-		return -errno;
+	fd = open(file_path, O_RDONLY);
+	if (fd < 0) {
+		ret = -errno;
+		pr_perror("Cannot open %s", file_path);
+		return ret;
 	}
 
-	ret = read_fp(fp, buf, buf_len);
-	fclose(fp); /* this will also close fd */
+	ret = img_read(fd, buf, buf_len);
+	close(fd);
 	return ret;
 }
 
@@ -172,16 +328,15 @@ int read_file(const char *file_path, void *buf, const size_t buf_len)
  */
 int write_img_file(char *path, const void *buf, const size_t buf_len)
 {
-	int ret;
-	FILE *fp;
+	int ret, fd;
 	size_t len = buf_len;
 
-	fp = open_img_file(path, true, &len);
-	if (!fp)
-		return -errno;
+	fd = open_img_file(path, true, &len, true);
+	if (fd < 0)
+		return fd;
 
-	ret = write_fp(fp, buf, buf_len);
-	fclose(fp); /* this will also close fd */
+	ret = img_write(fd, buf, buf_len);
+	close(fd);
 	return ret;
 }
 

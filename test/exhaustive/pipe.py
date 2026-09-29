@@ -56,19 +56,20 @@ def make_pipes(task_nr, nr_pipes, pipes, comb, status_pipe):
 def get_pipe_ino(pid, fd):
     try:
         return os.stat('/proc/%d/fd/%d' % (pid, fd)).st_ino
-    except:
+    except Exception:
         return None
 
 
 def get_pipe_rw(pid, fd):
-    for l in open('/proc/%d/fdinfo/%d' % (pid, fd)):
-        if l.startswith('flags:'):
-            f = l.split(None, 1)[1][-2]
-            if f == '0':
-                return 0  # Read
-            elif f == '1':
-                return 1  # Write
-            break
+    with open('/proc/%d/fdinfo/%d' % (pid, fd)) as fh:
+        for l in fh:
+            if l.startswith('flags:'):
+                f = l.split(None, 1)[1][-2]
+                if f == '0':
+                    return 0  # Read
+                elif f == '1':
+                    return 1  # Write
+                break
 
     raise Exception('Unexpected fdinfo contents')
 
@@ -204,7 +205,7 @@ def cr_test(pid):
             criu_bin, 'dump', '-t',
             '%d' % pid, '-D', img_dir, '-o', 'dump.log', '-v4', '-j'
         ])
-    except:
+    except Exception:
         print('`- dump fail')
         return False
 
@@ -214,7 +215,7 @@ def cr_test(pid):
             criu_bin, 'restore', '-D', img_dir, '-o', 'rst.log', '-v4', '-j',
             '-d', '-S'
         ])
-    except:
+    except Exception:
         print('`- restore fail')
         return False
 
@@ -247,7 +248,7 @@ def run(comb, opts):
         try:
             # Kick the test to check its state
             s.sendto(res, '\0CRIUPCSK')
-        except:
+        except Exception:
             # Restore might have failed or smth else happened
             os.kill(pid, signal.SIGKILL)
         s.close()

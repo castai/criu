@@ -408,7 +408,7 @@ static int dump_one_unix_fd(int lfd, uint32_t id, const struct fd_parms *p)
 	 * (i stands for in-flight, cons -- for connections) things.
 	 */
 	if (sk->rqlen != 0 && sk->state != TCP_LISTEN) {
-		if (dump_sk_queue(lfd, id))
+		if (dump_sk_queue(lfd, id, SK_QUEUE_REAL_PID))
 			goto err;
 	}
 
@@ -785,6 +785,7 @@ static int unix_collect_one(const struct unix_diag_msg *m, struct nlattr **tb, s
 
 	if (tb[UNIX_DIAG_ICONS]) {
 		unsigned int len = nla_len(tb[UNIX_DIAG_ICONS]);
+		struct unix_sk_listen_icon *icon_head = NULL;
 		unsigned int i;
 
 		d->icons = xmalloc(len);
@@ -795,6 +796,25 @@ static int unix_collect_one(const struct unix_diag_msg *m, struct nlattr **tb, s
 		d->nr_icons = len / sizeof(uint32_t);
 
 		/*
+		 * Pre-allocate all icon structures first.
+		 */
+		for (i = 0; i < d->nr_icons; i++) {
+			struct unix_sk_listen_icon *e;
+
+			e = xzalloc(sizeof(*e));
+			if (!e) {
+				while (icon_head) {
+					e = icon_head;
+					icon_head = e->next;
+					xfree(e);
+				}
+				goto err;
+			}
+			e->next = icon_head;
+			icon_head = e;
+		}
+
+		/*
 		 * Remember these sockets, we will need them
 		 * to fix up in-flight sockets peers.
 		 */
@@ -802,9 +822,8 @@ static int unix_collect_one(const struct unix_diag_msg *m, struct nlattr **tb, s
 			struct unix_sk_listen_icon *e, **chain;
 			unsigned int n;
 
-			e = xzalloc(sizeof(*e));
-			if (!e)
-				goto err;
+			e = icon_head;
+			icon_head = e->next;
 
 			n = d->icons[i];
 			chain = &unix_listen_icons[n % SK_HASH_SIZE];
@@ -1039,6 +1058,18 @@ static struct unix_sk_info *find_queuer_for(int id)
 	return NULL;
 }
 
+static struct unix_sk_info *find_unix_socket(int id)
+{
+	struct unix_sk_info *ui;
+
+	list_for_each_entry(ui, &unix_sockets, list) {
+		if (ui->ue->id == id)
+			return ui;
+	}
+
+	return NULL;
+}
+
 static struct fdinfo_list_entry *get_fle_for_task(struct file_desc *tgt, struct pstree_item *owner, bool force_master)
 {
 	struct fdinfo_list_entry *fle;
@@ -1076,7 +1107,7 @@ static struct fdinfo_list_entry *get_fle_for_task(struct file_desc *tgt, struct 
 		 * we need to ... invent a new one!
 		 */
 
-		e = xmalloc(sizeof(*e));
+		e = shmalloc(sizeof(*e));
 		if (!e)
 			return NULL;
 
@@ -1096,13 +1127,14 @@ static struct fdinfo_list_entry *get_fle_for_task(struct file_desc *tgt, struct 
 
 int unix_note_scm_rights(int id_for, uint32_t *file_ids, int *fds, int n_ids)
 {
+	struct fdinfo_list_entry *fle;
 	struct unix_sk_info *ui;
 	struct pstree_item *owner;
 	int i;
 
 	ui = find_queuer_for(id_for);
 	if (!ui) {
-		pr_err("Can't find sender for %#x\n", id_for);
+		pr_err("Can't find %#x\n", id_for);
 		return -1;
 	}
 
@@ -1110,7 +1142,14 @@ int unix_note_scm_rights(int id_for, uint32_t *file_ids, int *fds, int n_ids)
 	/*
 	 * This is the task that will restore this socket
 	 */
-	owner = file_master(&ui->d)->task;
+	fle = try_file_master(&ui->d);
+	if (!fle) {
+		struct unix_sk_info *peer;
+
+		peer = find_unix_socket(id_for);
+		fle = file_master(&peer->d);
+	}
+	owner = fle->task;
 
 	pr_info("-> will set up deps\n");
 	/*
@@ -1404,6 +1443,7 @@ static int post_open_standalone(struct file_desc *d, int fd)
 	mutex_lock(mutex_ghost);
 	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr.sun_family) + len) < 0) {
 		pr_perror("Can't connect %d socket", ui->ue->ino);
+		mutex_unlock(mutex_ghost);
 		goto err_revert_and_exit;
 	}
 	mutex_unlock(mutex_ghost);
@@ -1701,7 +1741,7 @@ static int open_unixsk_pair_master(struct unix_sk_info *ui, int *new_fd)
 {
 	struct fdinfo_list_entry *fle, *fle_peer;
 	struct unix_sk_info *peer = ui->peer;
-	int sk[2], tmp;
+	int sk[2], ret;
 
 	fle = file_master(&ui->d);
 	pr_info_opening("master", ui, fle);
@@ -1725,29 +1765,39 @@ static int open_unixsk_pair_master(struct unix_sk_info *ui, int *new_fd)
 		 * Below setup_and_serve_out() will reuse this fd,
 		 * so this dups it in something else.
 		 */
-		tmp = dup(sk[0]);
-		if (tmp < 0) {
+		ret = dup(sk[0]);
+		if (ret < 0) {
 			pr_perror("Can't dup()");
-			return -1;
+			goto err;
 		}
 		close(sk[0]);
-		sk[0] = tmp;
+		sk[0] = ret;
 	}
 
-	if (setup_and_serve_out(fle_peer, sk[1])) {
+	ret = setup_and_serve_out(fle_peer, sk[1]);
+	sk[1] = -1;
+	if (ret) {
 		pr_err("Can't send pair slave\n");
-		return -1;
+		goto err;
 	}
-	sk[1] = fle_peer->fe->fd;
 
 	if (bind_unix_sk(sk[0], ui))
-		return -1;
+		goto err;
 
-	if (bind_unix_sk(sk[1], peer))
-		return -1;
+	if (bind_unix_sk(fle_peer->fe->fd, peer))
+		goto err;
 
 	*new_fd = sk[0];
 	return 1;
+err:
+	close_safe(&sk[1]);
+	close_safe(&sk[0]);
+	/*
+	 * Don't close fle_peer->fe->fd here: once setup_and_serve_out()
+	 * succeeds the descriptor is at FLE_OPEN and may already be
+	 * referenced by other restore participants.
+	 */
+	return -1;
 }
 
 static int open_unixsk_pair_slave(struct unix_sk_info *ui, int *new_fd)
@@ -1780,6 +1830,7 @@ static int setup_second_end(int *sks, struct fdinfo_list_entry *second_end)
 		ret = dup(sks[0]);
 		if (ret < 0) {
 			pr_perror("Can't dup()");
+			close(sks[1]);
 			return -1;
 		}
 		close(sks[0]);
@@ -1797,7 +1848,7 @@ static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 {
 	struct unix_sk_info *queuer = ui->queuer;
 	struct unix_sk_info *peer = ui->peer;
-	struct fdinfo_list_entry *fle;
+	struct fdinfo_list_entry *fle, *second_end = NULL;
 	int sk;
 
 	fle = file_master(&ui->d);
@@ -1842,13 +1893,17 @@ static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 			return -1;
 		}
 
-		if (send_criu_dump_resp(sks[1], true, true) == -1)
+		if (send_criu_dump_resp(sks[1], true, true) == -1) {
+			close(sks[0]);
+			close(sks[1]);
 			return -1;
+		}
 
 		close(sks[1]);
 		sk = sks[0];
 	} else if ((ui->ue->state == TCP_ESTABLISHED && ui->ue->type != SOCK_DGRAM) && queuer &&
 		   queuer->ue->ino == FAKE_INO) {
+		struct fdinfo_list_entry *queuer_fle;
 		int ret, sks[2];
 
 		if (ui->ue->shutdown != SK_SHUTDOWN__BOTH) {
@@ -1862,11 +1917,16 @@ static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 			return -1;
 		}
 
-		if (setup_second_end(sks, file_master(&queuer->d)))
+		queuer_fle = file_master(&queuer->d);
+		if (setup_second_end(sks, queuer_fle)) {
+			close(sks[0]);
 			return -1;
+		}
 
+		second_end = queuer_fle;
 		sk = sks[0];
 	} else if (ui->ue->type == SOCK_DGRAM && queuer && queuer->ue->ino == FAKE_INO) {
+		struct fdinfo_list_entry *queuer_fle;
 		struct sockaddr_un addr;
 		int sks[2];
 
@@ -1890,12 +1950,18 @@ static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 		 */
 		if (connect(sk, (struct sockaddr *)&addr, sizeof(addr.sun_family))) {
 			pr_perror("Can't clear socket's peer");
+			close(sks[0]);
+			close(sks[1]);
 			return -1;
 		}
 
-		if (setup_second_end(sks, file_master(&queuer->d)))
+		queuer_fle = file_master(&queuer->d);
+		if (setup_second_end(sks, queuer_fle)) {
+			close(sks[0]);
 			return -1;
+		}
 
+		second_end = queuer_fle;
 		sk = sks[0];
 	} else {
 		if (ui->ue->uflags & USK_CALLBACK) {
@@ -1922,16 +1988,14 @@ static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 	}
 
 	if (bind_unix_sk(sk, ui)) {
-		close(sk);
-		return -1;
+		goto err;
 	}
 
 	if (ui->ue->state == TCP_LISTEN) {
 		pr_info("\tPutting %u into listen state\n", ui->ue->ino);
 		if (listen(sk, ui->ue->backlog) < 0) {
 			pr_perror("Can't make usk listen");
-			close(sk);
-			return -1;
+			goto err;
 		}
 		ui->listen = 1;
 		wake_connected_sockets(ui);
@@ -1951,10 +2015,17 @@ static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 
 out:
 	if (restore_sk_common(sk, ui))
-		return -1;
+		goto err;
 
 	*new_fd = sk;
 	return 0;
+err:
+	if (second_end) {
+		close(second_end->fe->fd);
+		second_end->fe->fd = -1;
+	}
+	close(sk);
+	return -1;
 }
 
 static int open_unix_sk(struct file_desc *d, int *new_fd)
@@ -2195,7 +2266,6 @@ static void set_peer(struct unix_sk_info *ui, struct unix_sk_info *peer)
 static int add_fake_queuer(struct unix_sk_info *ui)
 {
 	struct unix_sk_info *peer;
-	struct pstree_item *task;
 	UnixSkEntry *peer_ue;
 	SkOptsEntry *skopts;
 	FownEntry *fown;
@@ -2230,14 +2300,14 @@ static int add_fake_queuer(struct unix_sk_info *ui)
 	file_desc_add(&peer->d, peer_ue->id, &unix_desc_ops);
 	list_del_init(&peer->d.fake_master_list);
 	list_add(&peer->list, &unix_sockets);
-	task = file_master(&ui->d)->task;
-
-	return (get_fle_for_task(&peer->d, task, true) == NULL);
+	return 0;
 }
 
 int add_fake_unix_queuers(void)
 {
 	struct unix_sk_info *ui;
+
+	pr_info("Adding fake unix queuers\n");
 
 	list_for_each_entry(ui, &unix_sockets, list) {
 		if ((ui->ue->uflags & (USK_EXTERN | USK_CALLBACK)) || ui->queuer)
@@ -2245,6 +2315,29 @@ int add_fake_unix_queuers(void)
 		if (!(ui->ue->state == TCP_ESTABLISHED && !ui->peer) && ui->ue->type != SOCK_DGRAM)
 			continue;
 		if (add_fake_queuer(ui))
+			return -1;
+	}
+	return 0;
+}
+
+static int add_fake_queuer_finish(struct unix_sk_info *queuer)
+{
+	struct pstree_item *task = file_master(&queuer->peer->d)->task;
+
+	return get_fle_for_task(&queuer->d, task, true) == NULL;
+}
+
+int add_fake_unix_queuers_finish(void)
+{
+	struct unix_sk_info *ui;
+
+	pr_info("Adding fake unix queuers (finish)\n");
+
+	list_for_each_entry(ui, &unix_sockets, list) {
+		if (ui->ue->ino != FAKE_INO)
+			continue;
+
+		if (add_fake_queuer_finish(ui))
 			return -1;
 	}
 	return 0;
