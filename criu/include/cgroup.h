@@ -72,6 +72,7 @@ int parse_cg_info(void);
 int new_cg_root_add(char *controller, char *newroot);
 
 extern struct ns_desc cgroup_ns_desc;
+extern int restore_child_cgroup(struct pstree_item *child, pid_t pid);
 
 /*
  * This struct describes a group controlled by one controller.

@@ -28,6 +28,7 @@
 #include "mem.h"
 #include "bfd.h"
 #include "proc_parse.h"
+#include "nested-ns.h"
 #include "fdinfo.h"
 #include "parasite.h"
 #include "cr_options.h"
@@ -1129,11 +1130,33 @@ int parse_pid_status(pid_t pid, struct seize_task_status *ss, void *data)
 		}
 
 		if (!strncmp(str, "NSpid:", 6)) {
-			/* Get a thread ID in the thread PID namespace. */
+			/*
+			 * Get a thread ID in the thread PID namespace. With a
+			 * nested pid namespace (e.g. the one of a docker-in-docker
+			 * inner container) the ID is the one from the pid namespace
+			 * of the root task of the dump, which is not necessarily
+			 * the innermost one.
+			 */
 			char *last;
+			int count = 0, level, target, dump_level;
 
-			last = strrchr(str, '\t');
-			if (!last || sscanf(last, "%d", &cr->s.vpid) != 1) {
+			for (last = str; (last = strchr(last, '\t')) != NULL; last++)
+				count++;
+
+			dump_level = nested_ns_dump_pidns_level();
+			target = count - 1;
+			if (dump_level >= 0 && target > dump_level)
+				target = dump_level;
+
+			last = str;
+			for (level = 0; level <= target; level++) {
+				last = strchr(last, '\t');
+				if (!last)
+					goto err_parse;
+				last++;
+			}
+
+			if (sscanf(last, "%d", &cr->s.vpid) != 1) {
 				pr_err("Unable to parse: %s\n", str);
 				goto err_parse;
 			}
@@ -1712,6 +1735,20 @@ struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid, bool for_dump)
 		 */
 		if (for_dump && should_skip_mount(new->ns_mountpoint)) {
 			pr_info("\tskip %s @ %s\n", fsname, new->ns_mountpoint);
+			mnt_entry_free(new);
+			new = NULL;
+			goto end;
+		}
+
+		/*
+		 * The nsfs bind mounts are handles for the namespaces of a
+		 * nested container runtime, e.g. the /run/docker/netns files
+		 * of a docker-in-docker. The namespaces themselves are dumped
+		 * as the nested ones, and the files are re-created by the inner
+		 * runtime when it runs its containers, so they are skipped.
+		 */
+		if (for_dump && nested_ns_enabled() && !strcmp(fsname, "nsfs")) {
+			pr_info("\tskip nsfs mount %s @ %s\n", new->source, new->ns_mountpoint);
 			mnt_entry_free(new);
 			new = NULL;
 			goto end;

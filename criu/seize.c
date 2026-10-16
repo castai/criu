@@ -18,6 +18,7 @@
 #include <compel/ptrace.h>
 #include "plugin.h"
 #include "proc_parse.h"
+#include "nested-ns.h"
 #include "seccomp.h"
 #include "seize.h"
 #include "stats.h"
@@ -738,7 +739,7 @@ static int collect_children(struct pstree_item *item)
 
 		if (ret == TASK_ZOMBIE)
 			ret = TASK_DEAD;
-		else
+		else if (processes_to_wait > 0)
 			processes_to_wait--;
 
 		if (ret == TASK_STOPPED)
@@ -926,7 +927,7 @@ static int collect_threads(struct pstree_item *item)
 
 		if (ret == TASK_ZOMBIE)
 			ret = TASK_DEAD;
-		else
+		else if (processes_to_wait > 0)
 			processes_to_wait--;
 
 		BUG_ON(item->nr_threads + 1 > nr_threads);
@@ -1051,6 +1052,17 @@ int collect_pstree(void)
 	int ret, exit_code = -1;
 	struct proc_status_creds creds;
 
+	/*
+	 * The level of the pid namespace of the root task: needed by the
+	 * NSpid parsing of the tasks, harmless without the nested ones
+	 * (the level of the root task is the innermost one then). The
+	 * failure of it is not fatal: the level is not known then, and
+	 * the innermost pid is used (the behavior without the nested
+	 * ones); a process which does not exist fails with the errno
+	 * of its own below.
+	 */
+	set_dump_pidns_level(pid);
+
 	timing_start(TIME_FREEZING);
 
 	/*
@@ -1098,7 +1110,7 @@ int collect_pstree(void)
 
 	if (ret == TASK_ZOMBIE)
 		ret = TASK_DEAD;
-	else
+	else if (processes_to_wait > 0)
 		processes_to_wait--;
 
 	if (ret == TASK_STOPPED)

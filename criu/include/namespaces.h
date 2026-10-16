@@ -7,6 +7,7 @@
 #include "files.h"
 #include "common/list.h"
 #include "images/netdev.pb-c.h"
+#include "images/userns.pb-c.h"
 
 #ifndef CLONE_NEWNS
 #define CLONE_NEWNS 0x00020000
@@ -73,7 +74,13 @@ struct join_ns {
 	} extra_opts;
 };
 
-enum ns_type {
+/*
+ * The newer kernel headers define an enum ns_type of their own (the
+ * namespace_api uapi one), which conflicts with this one on the
+ * distributions shipping them (e.g. the alpine and fedora CI images):
+ * ours is named differently.
+ */
+enum criu_ns_type {
 	NS_UNKNOWN = 0,
 	NS_CRIU,
 	NS_ROOT,
@@ -98,7 +105,7 @@ struct ns_id {
 	pid_t ns_pid;
 	struct ns_desc *nd;
 	struct ns_id *next;
-	enum ns_type type;
+	enum criu_ns_type type;
 	char *ext_key;
 
 	/*
@@ -108,6 +115,13 @@ struct ns_id {
 	 * and proceed.
 	 */
 	bool ns_populated;
+
+	/*
+	 * The namespace is owned by a user namespace nested in the
+	 * one of the root task (--nested-ns): its content is set up by
+	 * the task entering it, not by the root task.
+	 */
+	bool nested;
 
 	union {
 		struct {

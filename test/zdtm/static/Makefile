@@ -258,6 +258,8 @@ TST_NOFILE	:=				\
 		s390x_mmap_high			\
 		uffd-events			\
 		thread_different_uid_gid	\
+		userns_nested		\
+		userns_nested_deep	\
 		pipe03				\
 		netns_lock_iptables			\
 		netns_lock_nftables			\
