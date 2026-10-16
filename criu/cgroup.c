@@ -1310,7 +1310,8 @@ static int move_in_cgroup(CgSetEntry *se, pid_t pid)
 		}
 
 		req->pid = pid;
-		aux_off = ctrl_dir_and_opt(ctrl, aux, sizeof(aux), NULL, 0);
+		aux_off = ctrl_dir_and_opt(ctrl, aux,
+					   sizeof(buf) - offsetof(struct cg_move_req, path), NULL, 0);
 		if (aux_off < 0)
 			return -1;
 
