@@ -27,6 +27,7 @@ fi
 
 T=$(mktemp -d /tmp/criu-fuse-dind.XXXXXX)
 ROOT=""
+rm -rf /test/out
 trap 'rm -rf "$T"; [ -n "$ROOT" ] && kill "$ROOT" 2>/dev/null || :' EXIT
 
 BACK="$T/backing"
@@ -63,6 +64,7 @@ timeout -k 5 90 $CRIU dump -t "$ROOT" --shell-job -D "$T" -v4 -o dump.log
 RC=$?
 [ $RC -eq 0 ] || {
 	echo "FAIL: dump rc=$RC (124 = the fuse deadlock)"
+	cp -r "$T" /test/out 2>/dev/null
 	tail -20 "$T/dump.log" 2>/dev/null
 	exit 1
 }
@@ -76,7 +78,8 @@ timeout -k 5 90 $CRIU restore --shell-job -D "$T" -v4 -o restore.log -d --pidfil
 RC=$?
 [ $RC -eq 0 ] || {
 	echo "FAIL: restore rc=$RC"
-	tail -20 "$T/restore.log" 2>/dev/null
+	cp -r "$T" /test/out 2>/dev/null
+	tail -40 "$T/restore.log" 2>/dev/null
 	exit 1
 }
 

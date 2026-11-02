@@ -245,7 +245,16 @@ int check_open_handle(unsigned int s_dev, unsigned long i_ino, FhEntry *f_handle
 		 * attempt to open or to stat the watched files would wait
 		 * for it forever.
 		 */
-		mi = lookup_mnt_sdev(s_dev);
+		/*
+		 * The dir-restricted lookup_mnt_sdev() is for the ones
+		 * which open the mount found: a fuse mountpoint can be
+		 * unstat-able for the dumper (the server of it is
+		 * frozen), so the fstype check takes any mount of the
+		 * dev, not a dir one only.
+		 */
+		for (mi = mntinfo; mi; mi = mi->next)
+			if (mi->s_dev == s_dev)
+				break;
 		if (mi && (mi->fstype->code == FSTYPE__CGROUP || mi->fstype->code == FSTYPE__CGROUP2 ||
 			   mi->fstype->code == FSTYPE__FUSE)) {
 			pr_debug("\tHandle 0x%x:0x%lx is on cgroupfs or a fuse mount, dumping with the handle only\n",

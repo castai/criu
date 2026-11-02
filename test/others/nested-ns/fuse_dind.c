@@ -268,6 +268,13 @@ int main(int argc, char **argv)
 		fprintf(stderr, "usage: %s BACKING MNT COUNTER FDSTATUS\n", argv[0]);
 		return 1;
 	}
+
+	/* Like a container init (runc unshares one for it): the root
+	 * task of the dump lives in a mount namespace of its own, not
+	 * in the one of whoever runs the dump. */
+	CHECK(unshare(CLONE_NEWNS));
+	CHECK(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL));
+
 	backing = argv[1];
 	mnt = argv[2];
 	counter = argv[3];
