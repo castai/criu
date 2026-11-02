@@ -234,14 +234,11 @@ static int check_nested_user_ns(struct pstree_item *item)
 	/*
 	 * The task which enters the nested user namespace may have
 	 * its own pid, network and mount namespaces, which are created
-	 * by it on restore. The time namespace is not supported yet.
+	 * by it on restore. Its time namespace is taken into the image,
+	 * but it is not re-created on restore, like the cgroup one: an
+	 * envbox workspace has a nested one for the inner container of
+	 * the sysbox tier (the offsets of them are zero there).
 	 */
-	if (item->ids->has_time_ns_id != parent->ids->has_time_ns_id ||
-	    (item->ids->has_time_ns_id && item->ids->time_ns_id != parent->ids->time_ns_id)) {
-		pr_err("Can't dump a task in a nested user namespace with its own time namespace (pid %d)\n",
-		       item->pid->real);
-		return -1;
-	}
 
 	ns = lookup_ns_by_id(item->ids->user_ns_id, &user_ns_desc);
 	pns = lookup_ns_by_id(parent->ids->user_ns_id, &user_ns_desc);
