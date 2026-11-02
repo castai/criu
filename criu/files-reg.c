@@ -1805,8 +1805,21 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 
 	mi = lookup_mnt_id(p->mnt_id);
 	if (mi == NULL) {
+		struct statfs fs;
+
 		if (opts.shell_job && is_tty(p->stat.st_rdev, p->stat.st_dev)) {
 			skip_for_shell_job = true;
+		} else if (!fstatfs(lfd, &fs) &&
+			   (fs.f_type == CGROUP2_SUPER_MAGIC || fs.f_type == CGROUP_SUPER_MAGIC)) {
+			/*
+			 * A file of a cgroup filesystem opened before the
+			 * mount namespace was entered or via the one of the
+			 * parent: the mounts of them are re-created as fresh
+			 * ones on restore, so the fd is closed instead (the
+			 * task can open the file again if it needs it).
+			 */
+			pr_warn("fd %d on a cgroup file is closed on restore\n", p->fd);
+			return 0;
 		} else {
 			pr_err("Can't lookup mount=%d for fd=%d path=%s\n", p->mnt_id, p->fd, link->name + 1);
 			return -1;
