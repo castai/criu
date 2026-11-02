@@ -213,6 +213,19 @@ static void substitute_ns(unsigned int *id, struct ns_desc *nd, unsigned int new
 	*id = new_id;
 }
 
+/*
+ * The dump of the tasks of a network namespace uses the cached
+ * entry of it (the parasite socket lives in the one of it, see
+ * parasite-syscall.c): the entry of the dropped namespace is
+ * dangling after the substitution, so the cache is repointed to
+ * the entry of the namespace of the parent task.
+ */
+static void substitute_net_ns_cache(struct pstree_item *item)
+{
+	if (dmpi(item)->netns && lookup_ns_by_id(item->ids->net_ns_id, &net_ns_desc) != dmpi(item)->netns)
+		dmpi(item)->netns = lookup_ns_by_id(item->ids->net_ns_id, &net_ns_desc);
+}
+
 static int check_nested_user_ns(struct pstree_item *item)
 {
 	struct pstree_item *parent = item->parent;
@@ -245,6 +258,7 @@ static int check_nested_user_ns(struct pstree_item *item)
 			pr_warn("The network namespace of %d is the one of its parent task on restore\n",
 				item->pid->real);
 			substitute_ns(&item->ids->net_ns_id, &net_ns_desc, parent->ids->net_ns_id);
+			substitute_net_ns_cache(item);
 		}
 		if (item->ids->mnt_ns_id != parent->ids->mnt_ns_id) {
 			pr_warn("The mount namespace of %d is the one of its parent task on restore\n",

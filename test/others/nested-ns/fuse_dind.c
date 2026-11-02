@@ -39,6 +39,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/inotify.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -241,6 +243,42 @@ static void helper(const char *hostfile)
 	ev.events = EPOLLIN;
 	CHECK(epoll_ctl(epfd, EPOLL_CTL_ADD, fusefd, &ev));
 	CHECK(epoll_ctl(epfd, EPOLL_CTL_ADD, ifd, &ev));
+
+	/* The inner container: its own mnt+net ns below the userns-entering
+	 * task (substituted at dump): a tmpfs of its own, a socket in its
+	 * own net ns, and the fuse fd of the tier1 view. */
+	pid_t t2 = fork();
+	CHECK(t2);
+	if (t2 == 0) {
+		char run[64];
+		int rfd, sfd;
+		struct sockaddr_un su = { .sun_family = AF_UNIX };
+
+		CHECK(unshare(CLONE_NEWNS | CLONE_NEWNET));
+		CHECK(mount("none", "/tmp", "tmpfs", 0, NULL));
+		snprintf(run, sizeof(run), "/tmp/run-%d", getppid());
+		rfd = open(run, O_RDWR | O_CREAT, 0644);
+		CHECK(rfd);
+		CHECK(dprintf(rfd, "inner container\n") > 0);
+
+		sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+		CHECK(sfd);
+		snprintf(su.sun_path, sizeof(su.sun_path), "/tmp/sock-%d", getppid());
+		unlink(su.sun_path);
+		CHECK(bind(sfd, (struct sockaddr *)&su, sizeof(su)));
+
+		for (;;) {
+			char b2[64];
+			int e2 = 0;
+
+			/* The fuse fd is inherited from the parent helper */
+			if (read(fusefd, b2, sizeof(b2)) < 0)
+				e2 = errno;
+			(void)e2;
+			sleep(1);
+		}
+		_exit(0); /* not reached */
+	}
 
 	for (;;) {
 		char buf[64];
