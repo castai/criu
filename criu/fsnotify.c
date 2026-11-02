@@ -238,11 +238,18 @@ int check_open_handle(unsigned int s_dev, unsigned long i_ino, FhEntry *f_handle
 		 * re-created on restore, so the handles are stale there
 		 * anyway. Dump the watch with its handle only: it is dropped
 		 * on restore, the watchers track their containers by other
-		 * means (pidfd, waitpid) as well.
+		 * means (pidfd, waitpid) as well. Watches on a fuse mount
+		 * (the sysboxfs ones of the inner container of an envbox
+		 * workspace) are the same: the mount is not restored, and
+		 * the server of it is frozen by the dump itself, so an
+		 * attempt to open or to stat the watched files would wait
+		 * for it forever.
 		 */
 		mi = lookup_mnt_sdev(s_dev);
-		if (mi && (mi->fstype->code == FSTYPE__CGROUP || mi->fstype->code == FSTYPE__CGROUP2)) {
-			pr_debug("\tHandle 0x%x:0x%lx is on cgroupfs, dumping with the handle only\n", s_dev, i_ino);
+		if (mi && (mi->fstype->code == FSTYPE__CGROUP || mi->fstype->code == FSTYPE__CGROUP2 ||
+			   mi->fstype->code == FSTYPE__FUSE)) {
+			pr_debug("\tHandle 0x%x:0x%lx is on cgroupfs or a fuse mount, dumping with the handle only\n",
+				 s_dev, i_ino);
 			goto out_nopath;
 		}
 	}
