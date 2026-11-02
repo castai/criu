@@ -120,7 +120,7 @@ void nested_ns_mark_owned(void)
  * Dump side
  */
 
-bool nested_ns_dump_ok(struct ns_desc *nd)
+bool nested_ns_kind(struct ns_desc *nd)
 {
 	/*
 	 * User, uts, net, pid, ipc and cgroup namespaces may be
@@ -130,9 +130,13 @@ bool nested_ns_dump_ok(struct ns_desc *nd)
 	 * their parent task. All the other ones keep failing with
 	 * the usual error.
 	 */
-	return nested_ns_enabled() &&
-	       (nd == &user_ns_desc || nd == &uts_ns_desc || nd == &net_ns_desc || nd == &pid_ns_desc ||
-		nd == &ipc_ns_desc || nd == &cgroup_ns_desc);
+	return nd == &user_ns_desc || nd == &uts_ns_desc || nd == &net_ns_desc || nd == &pid_ns_desc ||
+	       nd == &ipc_ns_desc || nd == &cgroup_ns_desc;
+}
+
+bool nested_ns_dump_ok(struct ns_desc *nd)
+{
+	return nested_ns_enabled() && nested_ns_kind(nd);
 }
 
 /*

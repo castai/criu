@@ -464,7 +464,18 @@ static unsigned int generate_ns_id(int pid, unsigned int kid, struct ns_desc *nd
 			pr_info("Will take %s namespace in the image\n", nd->str);
 			root_ns_mask |= nd->cflag;
 			type = NS_ROOT;
-		} else if (nd == &user_ns_desc) {
+		} else if (nested_ns_kind(nd)) {
+			/*
+			 * A new namespace of a kind which can be nested.
+			 * The nested user namespace of the tree can be
+			 * seen later than this one (the sysbox tier of
+			 * an envbox workspace has a nested cgroup one
+			 * while it lives in the root user namespace),
+			 * so the support can not wait for it: turn it
+			 * on now. It changes nothing for the classic
+			 * dumps, these namespaces were the fatal
+			 * errors there.
+			 */
 			nested_ns_discover(pid);
 		} else if ((nd->cflag & ~CLONE_SUBNS) && !nested_ns_dump_ok(nd)) {
 			pr_err("Can't dump nested %s namespace for %d\n", nd->str, pid);

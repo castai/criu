@@ -58,6 +58,7 @@ bool nested_ns_real_pid_nested(pid_t real);
  */
 
 /* Whether a nested namespace of this type may be taken into the image. */
+bool nested_ns_kind(struct ns_desc *nd);
 bool nested_ns_dump_ok(struct ns_desc *nd);
 
 /*
