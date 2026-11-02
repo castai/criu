@@ -378,6 +378,8 @@ static int dump_one_unix_fd(int lfd, uint32_t id, const struct fd_parms *p)
 	*fown = p->fown;
 
 	sk = (struct unix_sk_desc *)lookup_socket(p->stat.st_ino, PF_UNIX, 0);
+	if (IS_ERR_OR_NULL(sk) && nested_ns_enabled() && !collect_substituted_sockets(p->pid))
+		sk = (struct unix_sk_desc *)lookup_socket(p->stat.st_ino, PF_UNIX, 0);
 	if (IS_ERR_OR_NULL(sk)) {
 		pr_err("Unix socket %d not found\n", (int)p->stat.st_ino);
 		goto err;

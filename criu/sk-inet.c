@@ -35,6 +35,7 @@
 #include "pstree.h"
 #include "rst-malloc.h"
 #include "sockets.h"
+#include "nested-ns.h"
 #include "sk-inet.h"
 #include "protobuf.h"
 #include "util.h"
@@ -486,6 +487,8 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 	if (type == SOCK_RAW)
 		sk = (struct inet_sk_desc *)lookup_socket_ino(p->stat.st_ino, family);
 	else
+		sk = (struct inet_sk_desc *)lookup_socket(p->stat.st_ino, family, proto);
+	if (IS_ERR_OR_NULL(sk) && nested_ns_enabled() && !collect_substituted_sockets(p->pid))
 		sk = (struct inet_sk_desc *)lookup_socket(p->stat.st_ino, family, proto);
 	if (IS_ERR(sk))
 		goto err;

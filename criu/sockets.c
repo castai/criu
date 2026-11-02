@@ -876,6 +876,87 @@ static int collect_err(int err, struct ns_id *ns, void *arg)
 	return err;
 }
 
+/*
+ * The sockets of the network namespaces substituted at dump are not
+ * collected with the rest of the tree (the namespaces are dropped
+ * from it). The fd of one names its owner task, and the network
+ * namespace of it is entered to collect the sockets of it: the
+ * owner task runs in the namespace of its parent task after the
+ * restore, the sockets are dumped into that one (see
+ * get_socket_ns).
+ */
+struct collected_ns {
+	struct collected_ns *next;
+	unsigned long ino;
+};
+
+static struct collected_ns *collected_ns;
+static struct ns_id *sub_sock_ns;
+
+int collect_substituted_sockets(int pid)
+{
+	char path[64];
+	struct collected_ns *cn;
+	struct stat st;
+	int netfd, curfd, nl, ret = -1;
+
+	if (!sub_sock_ns) {
+		sub_sock_ns = xzalloc(sizeof(*sub_sock_ns));
+		if (!sub_sock_ns)
+			return -1;
+		sub_sock_ns->type = NS_OTHER;
+		sub_sock_ns->nd = &net_ns_desc;
+		sub_sock_ns->id = -2;
+		sub_sock_ns->net.nlsk = -1;
+	}
+
+	snprintf(path, sizeof(path), "/proc/%d/ns/net", pid);
+	netfd = open(path, O_RDONLY);
+	if (netfd < 0)
+		return -1;
+
+	if (fstat(netfd, &st)) {
+		close(netfd);
+		return -1;
+	}
+
+	for (cn = collected_ns; cn; cn = cn->next)
+		if (cn->ino == st.st_ino) {
+			close(netfd);
+			return 0; /* already collected */
+		}
+
+	curfd = open("/proc/self/ns/net", O_RDONLY);
+	if (curfd < 0) {
+		close(netfd);
+		return -1;
+	}
+
+	if (setns(netfd, CLONE_NEWNET) == 0) {
+		nl = socket(PF_NETLINK, SOCK_RAW, NETLINK_INET_DIAG);
+		if (nl >= 0) {
+			sub_sock_ns->net.nlsk = nl;
+			ret = collect_sockets(sub_sock_ns);
+			close(nl);
+		}
+		setns(curfd, CLONE_NEWNET);
+	}
+
+	close(netfd);
+	close(curfd);
+
+	if (ret == 0) {
+		cn = xmalloc(sizeof(*cn));
+		if (!cn)
+			return -1;
+		cn->ino = st.st_ino;
+		cn->next = collected_ns;
+		collected_ns = cn;
+	}
+
+	return ret;
+}
+
 int collect_sockets(struct ns_id *ns)
 {
 	int err = 0, tmp;

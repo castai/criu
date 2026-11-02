@@ -129,3 +129,5 @@ extern const char *socket_proto_name(unsigned int proto, char *nm, size_t size);
 #endif
 
 #endif /* __CR_SOCKETS_H__ */
+
+extern int collect_substituted_sockets(int pid);
