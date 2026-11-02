@@ -96,7 +96,7 @@ void nested_ns_prepare_pstree(void);
 void nested_ns_fixup_clone_flags(void);
 
 /* Whether the clone flags of a sub-task with a new user namespace are allowed. */
-bool nested_ns_cflags_ok(unsigned long cflags);
+bool nested_ns_cflags_ok(unsigned long cflags, struct pstree_item *item);
 
 /*
  * The pids to request with clone3(set_tid): the one of the task in its

@@ -988,7 +988,7 @@ static int prepare_pstree_kobj_ids(void)
 		if (item == root_item) {
 			pr_info("Will restore in %lx namespaces\n", cflags);
 			root_ns_mask = cflags;
-		} else if ((cflags & ~(root_ns_mask & CLONE_SUBNS)) && !nested_ns_cflags_ok(cflags)) {
+		} else if ((cflags & ~(root_ns_mask & CLONE_SUBNS)) && !nested_ns_cflags_ok(cflags, item)) {
 			/*
 			 * Namespaces from CLONE_SUBNS can be nested, but in
 			 * this case nobody can't share external namespaces of

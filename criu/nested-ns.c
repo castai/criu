@@ -486,7 +486,7 @@ int nested_ns_check_restore(bool image_nested_ns, bool has_image_flag)
 	return 0;
 }
 
-bool nested_ns_cflags_ok(unsigned long cflags)
+bool nested_ns_cflags_ok(unsigned long cflags, struct pstree_item *item)
 {
 	if (!nested_ns_enabled())
 		return false;
@@ -499,7 +499,17 @@ bool nested_ns_cflags_ok(unsigned long cflags)
 	 * is taken into the image, but it is not re-created on
 	 * restore: its tasks run in the one of their parent task,
 	 * the same way as with the cgroup one.
+	 *
+	 * The first task of a nested user namespace is forked with
+	 * CLONE_NEWNS as well: it is born in a copy of the parent's
+	 * mount namespace, which it fills in by itself (see
+	 * nested-mnt.c), so the flag is fine for the tasks of such
+	 * namespaces -- it never appears on the other ones, as they
+	 * inherit the namespace of the first one.
 	 */
+	if (item && nested_ns_skip_mntns(item))
+		cflags &= ~CLONE_NEWNS;
+
 	return !((cflags & ~(root_ns_mask & CLONE_SUBNS)) &
 		 ~(CLONE_NEWUSER | CLONE_NEWUTS | CLONE_NEWNET | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWCGROUP |
 		   CLONE_NEWTIME));
