@@ -569,25 +569,50 @@ err:
 	return path;
 }
 
+/*
+ * The restore counterpart of the dump-side check: the fuse mounts of
+ * the nested namespaces are not assembled, but their entries stay in
+ * the mount list, so the watch is told apart by the fstype of the
+ * mount of its device. The dir-restricted lookup_mnt_sdev() is not
+ * for here: a not-assembled mount has no mountpoint to open.
+ */
+static struct mount_info *watch_mnt(unsigned int s_dev)
+{
+	struct mount_info *mi;
+
+	for (mi = mntinfo; mi; mi = mi->next)
+		if (mi->s_dev == s_dev)
+			return mi;
+	return NULL;
+}
+
+static bool stale_nested_watch(unsigned int s_dev)
+{
+	struct mount_info *mi = watch_mnt(s_dev);
+
+	return mi && (mi->fstype->code == FSTYPE__CGROUP || mi->fstype->code == FSTYPE__CGROUP2 ||
+		      mi->fstype->code == FSTYPE__FUSE);
+}
+
 static int restore_one_inotify(int inotify_fd, struct fsnotify_mark_info *info)
 {
 	InotifyWdEntry *iwe = info->iwe;
 	int ret = -1, target = -1;
 	char buf[PSFDS], *path;
 	uint32_t mask;
-	struct mount_info *mi;
 
 	if (nested_ns_enabled()) {
 		/*
-		 * The watches on cgroupfs are dumped with their handle only
-		 * (see check_open_handle): the cgroups they were put on are
-		 * re-created on restore, so the handles are stale. Drop the
-		 * watches, the watchers track their containers by other
-		 * means (pidfd, waitpid) as well.
+		 * The watches on cgroupfs or on the fuse mounts of the
+		 * nested namespaces are dumped with their handle only
+		 * (see check_open_handle): the cgroups they were put on
+		 * are re-created on restore and the fuse mounts are not
+		 * assembled, so the handles are stale. Drop the watches,
+		 * the watchers track their containers by other means
+		 * (pidfd, waitpid) as well.
 		 */
-		mi = lookup_mnt_sdev(iwe->s_dev);
-		if (mi && (mi->fstype->code == FSTYPE__CGROUP || mi->fstype->code == FSTYPE__CGROUP2)) {
-			pr_warn("\tDropping the stale cgroupfs watch %#08x:%#016lx\n", iwe->s_dev, iwe->i_ino);
+		if (stale_nested_watch(iwe->s_dev)) {
+			pr_warn("\tDropping the stale cgroupfs or fuse watch %#08x:%#016lx\n", iwe->s_dev, iwe->i_ino);
 			return 0;
 		}
 	}
@@ -669,6 +694,11 @@ static int restore_one_fanotify(int fd, struct fsnotify_mark_info *mark)
 		snprintf(buf, sizeof(buf), "/proc/self/fd/%d", target);
 		path = buf;
 	} else if (fme->type == MARK_TYPE__INODE) {
+		if (nested_ns_enabled() && stale_nested_watch(fme->s_dev)) {
+			pr_warn("\tDropping the stale cgroupfs or fuse mark %#08x:%#016lx\n", fme->s_dev, fme->ie->i_ino);
+			return 0;
+		}
+
 		path = get_mark_path("fanotify", mark->remap, fme->ie->f_handle, fme->ie->i_ino, fme->s_dev, buf,
 				     &target);
 		if (!path)

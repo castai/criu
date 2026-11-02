@@ -59,6 +59,10 @@ N1=$(wc -l < "$COUNTER" 2>/dev/null || echo 0)
 }
 echo "topology up: $N1 ticks, fuse fd alive"
 
+# Like a container runtime does for the restore of a container rootfs:
+# the mountpoints of the image mounts are already there
+mkdir -p "$T/root"/{proc,sys,dev/pts,dev/shm,dev/mqueue,mnt/fuse-dind,tmp,etc,run}
+
 # The dump must not wait for the frozen fuse server
 timeout -k 5 90 $CRIU dump -t "$ROOT" --shell-job -D "$T" -v4 -o dump.log
 RC=$?
@@ -74,7 +78,7 @@ grep -q "on a fuse mount is closed on restore" "$T/dump.log" || {
 }
 echo "dump ok: fuse fds closed on restore"
 
-timeout -k 5 90 $CRIU restore --shell-job -D "$T" -v4 -o restore.log -d --pidfile "$T/pid"
+timeout -k 5 90 $CRIU restore --shell-job --root / -D "$T" -v4 -o restore.log -d --pidfile "$T/pid"
 RC=$?
 [ $RC -eq 0 ] || {
 	echo "FAIL: restore rc=$RC"
