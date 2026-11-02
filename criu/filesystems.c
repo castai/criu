@@ -685,6 +685,20 @@ static int always_fail(struct mount_info *pm)
 	return -1;
 }
 
+/*
+ * The fuse mounts of the mount namespaces owned by a nested user
+ * namespace (the sysboxfs ones of the inner container of an envbox
+ * workspace) are not restored: the dump takes them into the image
+ * and the nested restore skips them.
+ */
+static int fuse_dump(struct mount_info *pm)
+{
+	if (nested_ns_own_mntns(pm->nsid))
+		return 0;
+
+	return always_fail(pm);
+}
+
 static struct fstype fstypes[] = {
 	{
 		.name = "unsupported",
@@ -787,7 +801,7 @@ static struct fstype fstypes[] = {
 	{
 		.name = "fuse",
 		.code = FSTYPE__FUSE,
-		.dump = always_fail,
+		.dump = fuse_dump,
 		.restore = always_fail,
 	},
 	{
