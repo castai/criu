@@ -893,44 +893,18 @@ struct collected_ns {
 static struct collected_ns *collected_ns;
 static struct ns_id *sub_sock_ns;
 
-int collect_substituted_sockets(int pid)
+static int collect_ns_sockets(unsigned long ino, int netfd)
 {
-	char path[64];
 	struct collected_ns *cn;
-	struct stat st;
-	int netfd, curfd, nl, ret = -1;
-
-	if (!sub_sock_ns) {
-		sub_sock_ns = xzalloc(sizeof(*sub_sock_ns));
-		if (!sub_sock_ns)
-			return -1;
-		sub_sock_ns->type = NS_OTHER;
-		sub_sock_ns->nd = &net_ns_desc;
-		sub_sock_ns->id = -2;
-		sub_sock_ns->net.nlsk = -1;
-	}
-
-	snprintf(path, sizeof(path), "/proc/%d/ns/net", pid);
-	netfd = open(path, O_RDONLY);
-	if (netfd < 0)
-		return -1;
-
-	if (fstat(netfd, &st)) {
-		close(netfd);
-		return -1;
-	}
+	int curfd, nl, ret = -1;
 
 	for (cn = collected_ns; cn; cn = cn->next)
-		if (cn->ino == st.st_ino) {
-			close(netfd);
+		if (cn->ino == ino)
 			return 0; /* already collected */
-		}
 
 	curfd = open("/proc/self/ns/net", O_RDONLY);
-	if (curfd < 0) {
-		close(netfd);
+	if (curfd < 0)
 		return -1;
-	}
 
 	if (setns(netfd, CLONE_NEWNET) == 0) {
 		nl = socket(PF_NETLINK, SOCK_RAW, NETLINK_INET_DIAG);
@@ -942,19 +916,62 @@ int collect_substituted_sockets(int pid)
 		setns(curfd, CLONE_NEWNET);
 	}
 
-	close(netfd);
 	close(curfd);
 
 	if (ret == 0) {
 		cn = xmalloc(sizeof(*cn));
 		if (!cn)
 			return -1;
-		cn->ino = st.st_ino;
+		cn->ino = ino;
 		cn->next = collected_ns;
 		collected_ns = cn;
 	}
 
 	return ret;
+}
+
+/*
+ * The sockets of the whole dumped tree are collected: the peer of a
+ * socket of a substituted network namespace may live in another one
+ * of them, so the namespaces of every task of the tree are walked,
+ * not only the one of the owner of the fd.
+ */
+int collect_substituted_sockets(int pid)
+{
+	struct pstree_item *item;
+	char path[64];
+	struct stat st;
+	int netfd;
+
+	if (!sub_sock_ns) {
+		sub_sock_ns = xzalloc(sizeof(*sub_sock_ns));
+		if (!sub_sock_ns)
+			return -1;
+		sub_sock_ns->type = NS_OTHER;
+		sub_sock_ns->nd = &net_ns_desc;
+		sub_sock_ns->id = -2;
+		sub_sock_ns->net.nlsk = -1;
+	}
+
+	for_each_pstree_item(item) {
+		if (!item->pid || !item->pid->real)
+			continue;
+
+		snprintf(path, sizeof(path), "/proc/%d/ns/net", item->pid->real);
+		netfd = open(path, O_RDONLY);
+		if (netfd < 0)
+			continue;
+
+		if (fstat(netfd, &st)) {
+			close(netfd);
+			continue;
+		}
+
+		collect_ns_sockets(st.st_ino, netfd);
+		close(netfd);
+	}
+
+	return 0;
 }
 
 int collect_sockets(struct ns_id *ns)

@@ -727,7 +727,7 @@ int validate_mounts(struct mount_info *info, bool for_dump)
 				return -1;
 			}
 		} else if (m->fstype->code == FSTYPE__CGROUP2 || m->fstype->code == FSTYPE__CGROUP ||
-			   (nested_ns_own_mntns(m->nsid) && m->fstype->code == FSTYPE__FUSE)) {
+			   (nested_ns_enabled() && m->fstype->code == FSTYPE__FUSE)) {
 			/*
 			 * A cgroup mount with the root of a cgroup namespace
 			 * subtree does not need the root of a bind: it is

@@ -693,8 +693,24 @@ static int always_fail(struct mount_info *pm)
  */
 static int fuse_dump(struct mount_info *pm)
 {
-	if (nested_ns_own_mntns(pm->nsid))
+	if (nested_ns_enabled())
 		return 0;
+
+	return always_fail(pm);
+}
+
+/*
+ * A fuse mount of a dump of a nested tree is never restored: the
+ * server of it is a part of the dump itself, and no fuse connection
+ * survives it (there is no api for the replacement of a daemon of
+ * a mount).
+ */
+static int fuse_restore(struct mount_info *pm)
+{
+	if (nested_ns_enabled()) {
+		pr_warn("The fuse mount at %s is not restored\n", pm->ns_mountpoint);
+		return 0;
+	}
 
 	return always_fail(pm);
 }
@@ -802,7 +818,7 @@ static struct fstype fstypes[] = {
 		.name = "fuse",
 		.code = FSTYPE__FUSE,
 		.dump = fuse_dump,
-		.restore = always_fail,
+		.restore = fuse_restore,
 	},
 	{
 		.name = "overlay",

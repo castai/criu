@@ -687,6 +687,18 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 			ops = &timerfd_dump_ops;
 		else if (is_pidfd_link(link))
 			ops = &pidfd_dump_ops;
+		else if (nested_ns_enabled() && !strncmp(link, "anon_inode:seccomp notify", 24)) {
+			/*
+			 * A seccomp notification fd of a sysbox daemon (the
+			 * syscall interception of the inner container): the
+			 * notification is a kernel object, which can not be
+			 * restored -- the fd is closed on restore, the
+			 * syscalls of the inner container are served by the
+			 * kernel itself after it.
+			 */
+			pr_warn("fd %d of %d is a seccomp notify one, closed on restore\n", fd, pid->real);
+			return 0;
+		}
 #ifdef CONFIG_HAS_LIBBPF
 		else if (is_bpfmap_link(link))
 			ops = &bpfmap_dump_ops;
