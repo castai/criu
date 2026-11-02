@@ -446,36 +446,76 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
 	 * created in the real one of such a task.
 	 */
 	if (dmpi(item)->netns_substituted) {
+		static struct psock_ns {
+			struct psock_ns *next;
+			unsigned long ino;
+			int sk;
+		} *psock_ns;
+		struct psock_ns *pn;
 		struct sockaddr_un addr;
+		struct stat st;
 		char nspath[64];
 		int netfd, curfd, sk;
 
 		snprintf(nspath, sizeof(nspath), "/proc/%d/ns/net", item->pid->real);
 		netfd = open(nspath, O_RDONLY);
-		curfd = netfd < 0 ? -1 : open("/proc/self/ns/net", O_RDONLY);
-		if (netfd < 0 || curfd < 0) {
-			pr_perror("Can't open the network namespaces of %d", item->pid->real);
-			close_safe(&netfd);
-			close_safe(&curfd);
+		if (netfd < 0) {
+			pr_perror("Can't open the network namespace of %d", item->pid->real);
+			return NULL;
+		}
+		if (fstat(netfd, &st)) {
+			close(netfd);
 			return NULL;
 		}
 
 		sk = -1;
-		if (setns(netfd, CLONE_NEWNET) == 0) {
-			sk = socket(PF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK, 0);
-			if (sk >= 0) {
-				socklen_t alen = compel_gen_parasite_saddr(&addr, getpid());
-
-				if (bind(sk, &addr, alen) < 0 || listen(sk, 1) < 0) {
-					close(sk);
-					sk = -1;
-				}
+		for (pn = psock_ns; pn; pn = pn->next)
+			if (pn->ino == st.st_ino) {
+				sk = pn->sk;
+				break;
 			}
-			setns(curfd, CLONE_NEWNET);
+
+		if (sk < 0) {
+			curfd = open("/proc/self/ns/net", O_RDONLY);
+			if (curfd < 0) {
+				pr_perror("Can't open the current network namespace");
+				close(netfd);
+				return NULL;
+			}
+
+			if (setns(netfd, CLONE_NEWNET) == 0) {
+				sk = socket(PF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK, 0);
+				if (sk >= 0) {
+					socklen_t alen = compel_gen_parasite_saddr(&addr, getpid());
+
+					if (bind(sk, &addr, alen) < 0 || listen(sk, 1) < 0) {
+						pr_perror("Can't bind a parasite socket in the network namespace of %d",
+						  item->pid->real);
+						close(sk);
+						sk = -1;
+					}
+				}
+				setns(curfd, CLONE_NEWNET);
+			} else
+				pr_perror("Can't enter the network namespace of %d", item->pid->real);
+
+			close(curfd);
+
+			if (sk >= 0) {
+				pn = xmalloc(sizeof(*pn));
+				if (!pn) {
+					close(sk);
+					close(netfd);
+					return NULL;
+				}
+				pn->ino = st.st_ino;
+				pn->sk = sk;
+				pn->next = psock_ns;
+				psock_ns = pn;
+			}
 		}
 
 		close(netfd);
-		close(curfd);
 		if (sk < 0) {
 			pr_err("Can't create a parasite socket in the network namespace of %d\n",
 			       item->pid->real);

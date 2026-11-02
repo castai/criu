@@ -42,6 +42,7 @@
 #include "file-ids.h"
 #include "mount.h"
 #include "files.h"
+#include "nested-ns.h"
 #include "common/list.h"
 #include "rst-malloc.h"
 #include "fs-magic.h"
@@ -1819,6 +1820,17 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 			 * task can open the file again if it needs it).
 			 */
 			pr_warn("fd %d on a cgroup file is closed on restore\n", p->fd);
+			return 0;
+		} else if (nested_ns_enabled()) {
+			/*
+			 * A file of a mount of a namespace substituted at
+			 * dump (e.g. a mapped one of the tmpfs of the
+			 * /run of the systemd of an inner container):
+			 * the mount is not restored, so the file of it is
+			 * neither -- the holder re-opens it from the
+			 * namespace of its parent task if it needs it.
+			 */
+			pr_warn("fd %d on a mount of a substituted namespace is closed on restore\n", p->fd);
 			return 0;
 		} else {
 			pr_err("Can't lookup mount=%d for fd=%d path=%s\n", p->mnt_id, p->fd, link->name + 1);
