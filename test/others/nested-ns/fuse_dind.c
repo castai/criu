@@ -38,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/inotify.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -215,7 +216,8 @@ static void write_map(const char *file, const char *val)
 static void helper(const char *hostfile)
 {
 	char path[4096];
-	int fusefd, ifd, wd, n, cfd;
+	int fusefd, ifd, wd, n, cfd, epfd;
+	struct epoll_event ev;
 	unsigned long n_ok = 0;
 
 	snprintf(path, sizeof(path), "%s/%s", mnt, hostfile);
@@ -232,6 +234,13 @@ static void helper(const char *hostfile)
 	CHECK(ifd);
 	wd = inotify_add_watch(ifd, path, IN_MODIFY | IN_ATTRIB);
 	CHECK(wd);
+
+	/* Like the inner systemd services: the fuse fd is polled */
+	epfd = epoll_create1(0);
+	CHECK(epfd);
+	ev.events = EPOLLIN;
+	CHECK(epoll_ctl(epfd, EPOLL_CTL_ADD, fusefd, &ev));
+	CHECK(epoll_ctl(epfd, EPOLL_CTL_ADD, ifd, &ev));
 
 	for (;;) {
 		char buf[64];

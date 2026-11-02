@@ -357,12 +357,12 @@ int do_dump_gen_file(struct fd_parms *p, int lfd, const struct fdtype_ops *ops, 
  * fuse daemon). The fd of /dev/fuse of a server below a nested user
  * namespace is closed on restore together with its mount.
  */
-static bool fd_is_fuse_dev(struct pid *pid, int fd)
+bool fd_is_fuse_dev(int pid, int fd)
 {
 	char path[64], link[PATH_MAX];
 	int n;
 
-	snprintf(path, sizeof(path), "/proc/%d/fd/%d", pid->real, fd);
+	snprintf(path, sizeof(path), "/proc/%d/fd/%d", pid, fd);
 	n = readlink(path, link, sizeof(link) - 1);
 	if (n <= 0)
 		return false;
@@ -370,12 +370,12 @@ static bool fd_is_fuse_dev(struct pid *pid, int fd)
 	return !strcmp(link, "/dev/fuse");
 }
 
-static bool fd_on_fuse_mount(struct pid *pid, int fd)
+bool fd_on_fuse_mount(int pid, int fd)
 {
-	struct fdinfo_common fdinfo = { .mnt_id = -1, .owner = pid->ns[0].virt };
+	struct fdinfo_common fdinfo = { .mnt_id = -1, .owner = 0 };
 	struct mount_info *mi;
 
-	if (parse_fdinfo_pid(pid->real, fd, FD_TYPES__UND, &fdinfo))
+	if (parse_fdinfo_pid(pid, fd, FD_TYPES__UND, &fdinfo))
 		return false; /* can't tell: let the old path sort it out */
 
 	mi = lookup_mnt_id(fdinfo.mnt_id);
@@ -710,11 +710,11 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, s
 	 * under the nested namespaces anyway.
 	 */
 	for (i = 0, off = 0; i < dfds->nr_fds; i++) {
-		if (fd_on_fuse_mount(item->pid, dfds->fds[i])) {
+		if (fd_on_fuse_mount(item->pid->real, dfds->fds[i])) {
 			pr_warn("fd %d of %d on a fuse mount is closed on restore\n", dfds->fds[i], item->pid->real);
 			continue;
 		}
-		if (nested_ns_enabled() && fd_is_fuse_dev(item->pid, dfds->fds[i])) {
+		if (nested_ns_enabled() && fd_is_fuse_dev(item->pid->real, dfds->fds[i])) {
 			pr_warn("fd %d of %d on /dev/fuse is closed on restore\n", dfds->fds[i], item->pid->real);
 			continue;
 		}
