@@ -351,6 +351,37 @@ int do_dump_gen_file(struct fd_parms *p, int lfd, const struct fdtype_ops *ops, 
 	return ret;
 }
 
+/*
+ * The fuse connection lives in the kernel: no daemon of it can be
+ * revived by the restore (there is no api for the replacement of a
+ * fuse daemon). The fd of /dev/fuse of a server below a nested user
+ * namespace is closed on restore together with its mount.
+ */
+static bool fd_is_fuse_dev(struct pid *pid, int fd)
+{
+	char path[64], link[PATH_MAX];
+	int n;
+
+	snprintf(path, sizeof(path), "/proc/%d/fd/%d", pid->real, fd);
+	n = readlink(path, link, sizeof(link) - 1);
+	if (n <= 0)
+		return false;
+	link[n] = '\0';
+	return !strcmp(link, "/dev/fuse");
+}
+
+static bool fd_on_fuse_mount(struct pid *pid, int fd)
+{
+	struct fdinfo_common fdinfo = { .mnt_id = -1, .owner = pid->ns[0].virt };
+	struct mount_info *mi;
+
+	if (parse_fdinfo_pid(pid->real, fd, FD_TYPES__UND, &fdinfo))
+		return false; /* can't tell: let the old path sort it out */
+
+	mi = lookup_mnt_id(fdinfo.mnt_id);
+	return mi && mi->fstype && mi->fstype->code == FSTYPE__FUSE;
+}
+
 int fill_fdlink(int lfd, const struct fd_parms *p, struct fd_link *link)
 {
 	int len;
@@ -668,6 +699,28 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, s
 	pr_info("\n");
 	pr_info("Dumping opened files (pid: %d)\n", item->pid->real);
 	pr_info("----------------------------------------\n");
+
+	/*
+	 * The fds on the fuse mounts are never drained: the dup of one
+	 * into criu is harmless, but the close of it is not -- the flush
+	 * waits for the fuse server, which is frozen by the dump itself.
+	 * The fdinfo of /proc tells the mount of the fd without a single
+	 * syscall on the fd: the fuse ones are closed on restore
+	 * instead (see fill_fd_params), as their mounts are not restored
+	 * under the nested namespaces anyway.
+	 */
+	for (i = 0, off = 0; i < dfds->nr_fds; i++) {
+		if (fd_on_fuse_mount(item->pid, dfds->fds[i])) {
+			pr_warn("fd %d of %d on a fuse mount is closed on restore\n", dfds->fds[i], item->pid->real);
+			continue;
+		}
+		if (nested_ns_enabled() && fd_is_fuse_dev(item->pid, dfds->fds[i])) {
+			pr_warn("fd %d of %d on /dev/fuse is closed on restore\n", dfds->fds[i], item->pid->real);
+			continue;
+		}
+		dfds->fds[off++] = dfds->fds[i];
+	}
+	dfds->nr_fds = off;
 
 	lfds = xmalloc(nr_fds * sizeof(int));
 	if (!lfds)
