@@ -1404,6 +1404,19 @@ static int prep_unix_sk_cwd(struct unix_sk_info *ui, int *prev_cwd_fd, int *prev
 		int ns_fd;
 
 		if (mntns == NULL) {
+			/*
+			 * A socket of a mount namespace substituted at
+			 * dump: the namespace is not restored, the file
+			 * of the socket is created in the one of the
+			 * task itself (the one of its parent task after
+			 * it) instead.
+			 */
+			if (nested_ns_enabled()) {
+				pr_warn("The mount %d of the socket is not restored, binding in the current namespace\n",
+					ui->ue->mnt_id);
+				*prev_mntns_fd = -1;
+				return 0;
+			}
 			pr_err("Unable to find the %d mount\n", ui->ue->mnt_id);
 			goto err;
 		}
