@@ -408,6 +408,51 @@ static bool mnt_id_is_fuse_in_proc(int pid, int mnt_id)
 	return ret;
 }
 
+/*
+ * Whether the fd is on a mount of a namespace substituted at dump:
+ * the mount is not in the collected tree (it names nothing in the
+ * mntinfo), but the one of the task itself still carries it. Such
+ * an fd can not be restored -- the task runs in the mount namespace
+ * of its parent task after it -- so it is closed on restore, the
+ * same way as the ones of the fuse mounts.
+ */
+bool fd_on_substituted_mount(int pid, int fd)
+{
+	struct fdinfo_common fdinfo = { .mnt_id = -1, .owner = 0 };
+	char path[64], line[2048];
+	FILE *f;
+	bool found = false;
+
+	if (!nested_ns_enabled())
+		return false;
+
+	if (parse_fdinfo_pid(pid, fd, FD_TYPES__UND, &fdinfo))
+		return false;
+
+	if (fdinfo.mnt_id < 0)
+		return false;
+
+	if (lookup_mnt_id(fdinfo.mnt_id))
+		return false; /* the usual case: the mount is collected */
+
+	snprintf(path, sizeof(path), "/proc/%d/mountinfo", pid);
+	f = fopen(path, "r");
+	if (!f)
+		return false;
+
+	while (fgets(line, sizeof(line), f)) {
+		int id = -1;
+
+		if (sscanf(line, "%d", &id) == 1 && id == fdinfo.mnt_id) {
+			found = true;
+			break;
+		}
+	}
+
+	fclose(f);
+	return found;
+}
+
 bool fd_on_fuse_mount(int pid, int fd)
 {
 	struct fdinfo_common fdinfo = { .mnt_id = -1, .owner = 0 };
@@ -751,6 +796,11 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, s
 	 * under the nested namespaces anyway.
 	 */
 	for (i = 0, off = 0; i < dfds->nr_fds; i++) {
+		if (fd_on_substituted_mount(item->pid->real, dfds->fds[i])) {
+			pr_warn("fd %d of %d on a mount of a substituted namespace is closed on restore\n", dfds->fds[i],
+				item->pid->real);
+			continue;
+		}
 		if (fd_on_fuse_mount(item->pid->real, dfds->fds[i])) {
 			pr_warn("fd %d of %d on a fuse mount is closed on restore\n", dfds->fds[i], item->pid->real);
 			continue;

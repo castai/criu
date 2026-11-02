@@ -189,6 +189,7 @@ extern int shared_fdt_prepare(struct pstree_item *item);
 
 extern struct collect_image_info ext_file_cinfo;
 bool fd_on_fuse_mount(int pid, int fd);
+bool fd_on_substituted_mount(int pid, int fd);
 bool fd_is_fuse_dev(int pid, int fd);
 
 extern int dump_unsupp_fd(struct fd_parms *p, int lfd, char *more, char *info, FdinfoEntry *);

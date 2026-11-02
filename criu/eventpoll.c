@@ -288,7 +288,8 @@ static int dump_one_eventpoll(int lfd, u32 id, const struct fd_parms *p)
 	 * them are dropped from the image the same way.
 	 */
 	for (i = 0; i < e->n_tfd;) {
-		if (fd_on_fuse_mount(p->pid, e->tfd[i]->tfd) ||
+		if (fd_on_substituted_mount(p->pid, e->tfd[i]->tfd) ||
+		    fd_on_fuse_mount(p->pid, e->tfd[i]->tfd) ||
 		    (nested_ns_enabled() && fd_is_fuse_dev(p->pid, e->tfd[i]->tfd))) {
 			pr_warn("eventpoll: tfd %d of %d is on a fuse mount, the registration is dropped\n",
 				e->tfd[i]->tfd, p->pid);
