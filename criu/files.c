@@ -370,6 +370,44 @@ bool fd_is_fuse_dev(int pid, int fd)
 	return !strcmp(link, "/dev/fuse");
 }
 
+/*
+ * The mnt_id of the fdinfo is the one of the mount namespace of
+ * the task the fd belongs to: when that namespace is substituted
+ * at dump (see substitute_ns), its mounts are dropped from the
+ * collected tree and the id is not in the mntinfo. The mountinfo
+ * of the task itself still names it and its fstype: the file is
+ * never touched on the way, only the /proc entries are read.
+ */
+static bool mnt_id_is_fuse_in_proc(int pid, int mnt_id)
+{
+	char path[64], line[2048];
+	FILE *f;
+	bool ret = false;
+
+	snprintf(path, sizeof(path), "/proc/%d/mountinfo", pid);
+	f = fopen(path, "r");
+	if (!f)
+		return false;
+
+	while (fgets(line, sizeof(line), f)) {
+		int id = -1;
+		char fstype[128], *sep;
+
+		if (sscanf(line, "%d", &id) != 1 || id != mnt_id)
+			continue;
+		sep = strstr(line, " - ");
+		if (!sep)
+			continue;
+		if (sscanf(sep + 3, "%127s", fstype) == 1 && !strncmp(fstype, "fuse", 4)) {
+			ret = true;
+			break;
+		}
+	}
+
+	fclose(f);
+	return ret;
+}
+
 bool fd_on_fuse_mount(int pid, int fd)
 {
 	struct fdinfo_common fdinfo = { .mnt_id = -1, .owner = 0 };
@@ -379,7 +417,10 @@ bool fd_on_fuse_mount(int pid, int fd)
 		return false; /* can't tell: let the old path sort it out */
 
 	mi = lookup_mnt_id(fdinfo.mnt_id);
-	return mi && mi->fstype && mi->fstype->code == FSTYPE__FUSE;
+	if (mi)
+		return mi->fstype && mi->fstype->code == FSTYPE__FUSE;
+
+	return mnt_id_is_fuse_in_proc(pid, fdinfo.mnt_id);
 }
 
 int fill_fdlink(int lfd, const struct fd_parms *p, struct fd_link *link)
