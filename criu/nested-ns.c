@@ -194,6 +194,25 @@ static int check_pid_restorable(struct pstree_item *item, struct pstree_item *pa
  * namespace, and that the parent task lives in the user namespace
  * of the root task: the id translations only cover one level.
  */
+static void substitute_ns(unsigned int *id, struct ns_desc *nd, unsigned int new_id)
+{
+	struct ns_id **p, *ns;
+
+	/*
+	 * The tasks of the namespace are recorded in the one of
+	 * their parent task: the own one is dropped from the
+	 * collection, so nothing of it is taken into the images.
+	 */
+	ns = lookup_ns_by_id(*id, nd);
+	for (p = &ns_ids; *p && *p != ns; p = &(*p)->next)
+		;
+	if (ns) {
+		*p = ns->next;
+		pr_info("The %s namespace %d is dropped from the images\n", nd->str, *id);
+	}
+	*id = new_id;
+}
+
 static int check_nested_user_ns(struct pstree_item *item)
 {
 	struct pstree_item *parent = item->parent;
@@ -212,15 +231,25 @@ static int check_nested_user_ns(struct pstree_item *item)
 	if (item->ids->user_ns_id == parent->ids->user_ns_id) {
 		/*
 		 * A task below the one which has entered the nested
-		 * user namespace. It inherits the network and mount
-		 * namespaces from it, as the ones created for it on
-		 * restore would be owned by the nested user namespace
-		 * and are not supported yet.
+		 * user namespace. The network and mount namespaces of
+		 * its own are substituted with the ones of the parent
+		 * task, as the ones created for it on restore would be
+		 * owned by the nested user namespace, which is not
+		 * supported yet: the services of the systemd of the
+		 * inner container of an envbox workspace have their own
+		 * mount one, and so do the containers of the docker
+		 * daemon running inside it. The tasks run in the ones
+		 * of their parent task on restore.
 		 */
-		if (item->ids->net_ns_id != parent->ids->net_ns_id || item->ids->mnt_ns_id != parent->ids->mnt_ns_id) {
-			pr_err("Can't dump a task in a nested user namespace with its own net or mount namespace below the one entering it (pid %d)\n",
-			       item->pid->real);
-			return -1;
+		if (item->ids->net_ns_id != parent->ids->net_ns_id) {
+			pr_warn("The network namespace of %d is the one of its parent task on restore\n",
+				item->pid->real);
+			substitute_ns(&item->ids->net_ns_id, &net_ns_desc, parent->ids->net_ns_id);
+		}
+		if (item->ids->mnt_ns_id != parent->ids->mnt_ns_id) {
+			pr_warn("The mount namespace of %d is the one of its parent task on restore\n",
+				item->pid->real);
+			substitute_ns(&item->ids->mnt_ns_id, &mnt_ns_desc, parent->ids->mnt_ns_id);
 		}
 		return check_pid_restorable(item, parent);
 	}
