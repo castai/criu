@@ -19,6 +19,7 @@
 #include "pstree.h"
 #include "rst_info.h"
 #include "namespaces.h"
+#include "timens.h"
 #include "nested-ns.h"
 #include "mount.h"
 #include "net.h"
@@ -131,7 +132,8 @@ bool nested_ns_kind(struct ns_desc *nd)
 	 * the usual error.
 	 */
 	return nd == &user_ns_desc || nd == &uts_ns_desc || nd == &net_ns_desc || nd == &pid_ns_desc ||
-	       nd == &ipc_ns_desc || nd == &cgroup_ns_desc;
+	       nd == &ipc_ns_desc || nd == &cgroup_ns_desc || nd == &time_ns_desc ||
+	       nd == &time_for_children_ns_desc;
 }
 
 bool nested_ns_dump_ok(struct ns_desc *nd)
@@ -467,10 +469,14 @@ bool nested_ns_cflags_ok(unsigned long cflags)
 	 * In addition to the nested CLONE_SUBNS namespaces a sub-task
 	 * may be created in its own user namespace and, from inside
 	 * it, in its own uts, net, pid, ipc and cgroup ones, which are
-	 * restored when its parent task forks it.
+	 * restored when its parent task forks it. A time namespace
+	 * is taken into the image, but it is not re-created on
+	 * restore: its tasks run in the one of their parent task,
+	 * the same way as with the cgroup one.
 	 */
 	return !((cflags & ~(root_ns_mask & CLONE_SUBNS)) &
-		 ~(CLONE_NEWUSER | CLONE_NEWUTS | CLONE_NEWNET | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWCGROUP));
+		 ~(CLONE_NEWUSER | CLONE_NEWUTS | CLONE_NEWNET | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWCGROUP |
+		   CLONE_NEWTIME));
 }
 
 /*
