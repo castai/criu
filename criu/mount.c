@@ -726,6 +726,19 @@ int validate_mounts(struct mount_info *info, bool for_dump)
 				       m->root, m->mnt_id);
 				return -1;
 			}
+		} else if (m->fstype->code == FSTYPE__CGROUP2 || m->fstype->code == FSTYPE__CGROUP ||
+			   (nested_ns_own_mntns(m->nsid) && m->fstype->code == FSTYPE__FUSE)) {
+			/*
+			 * A cgroup mount with the root of a cgroup namespace
+			 * subtree does not need the root of a bind: it is
+			 * re-created as a fresh one on restore (the root of it
+			 * is the one of the cgroup namespace a task is restored
+			 * into). The fuse mounts of the mount namespaces owned
+			 * by a nested user namespace (e.g. the sysboxfs
+			 * overmounts of the inner container of an envbox
+			 * workspace) are skipped by the nested restore.
+			 */
+			continue;
 		} else {
 			t = find_fsroot_mount_for(m);
 			if (!t) {
