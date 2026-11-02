@@ -65,6 +65,7 @@ struct thread_lsm {
 struct ns_id;
 struct dmp_info {
 	struct ns_id *netns;
+	bool netns_substituted;
 	struct page_pipe *mem_pp;
 	struct parasite_ctl *parasite_ctl;
 	struct parasite_thread_ctl **thread_ctls;

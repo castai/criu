@@ -436,6 +436,13 @@ int compel_resume_task_sig(pid_t pid, int orig_st, int st, int stop_signo)
 	return ret;
 }
 
+static int gen_parasite_saddr(struct sockaddr_un *saddr, int key);
+
+int compel_gen_parasite_saddr(struct sockaddr_un *saddr, int key)
+{
+	return gen_parasite_saddr(saddr, key);
+}
+
 static int gen_parasite_saddr(struct sockaddr_un *saddr, int key)
 {
 	int sun_len;
@@ -448,6 +455,8 @@ static int gen_parasite_saddr(struct sockaddr_un *saddr, int key)
 
 	return sun_len;
 }
+
+static int gen_parasite_saddr(struct sockaddr_un *saddr, int key);
 
 static int prepare_tsock(struct parasite_ctl *ctl, pid_t pid, struct parasite_init_args *args)
 {

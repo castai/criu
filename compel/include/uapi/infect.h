@@ -2,6 +2,7 @@
 #define __COMPEL_INFECT_H__
 
 #include <stdbool.h>
+#include <sys/un.h>
 
 #include <compel/asm/sigframe.h>
 #include <compel/asm/infect-types.h>
@@ -210,3 +211,5 @@ static inline int parasite_setup_shstk(struct parasite_ctl *ctl,
 #endif
 
 #endif
+
+int compel_gen_parasite_saddr(struct sockaddr_un *saddr, int key);

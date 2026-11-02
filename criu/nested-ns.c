@@ -259,6 +259,7 @@ static int check_nested_user_ns(struct pstree_item *item)
 				item->pid->real);
 			substitute_ns(&item->ids->net_ns_id, &net_ns_desc, parent->ids->net_ns_id);
 			substitute_net_ns_cache(item);
+			dmpi(item)->netns_substituted = true;
 		}
 		if (item->ids->mnt_ns_id != parent->ids->mnt_ns_id) {
 			pr_warn("The mount namespace of %d is the one of its parent task on restore\n",

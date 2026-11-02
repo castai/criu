@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <sched.h>
 #include <inttypes.h>
 
 #include <sys/stat.h>
@@ -437,7 +438,53 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
 	ictx->orig_handler.sa_flags = SA_SIGINFO | SA_RESTART;
 	sigemptyset(&ictx->orig_handler.sa_mask);
 	sigaddset(&ictx->orig_handler.sa_mask, SIGCHLD);
-	ictx->sock = dmpi(item)->netns->net.seqsk;
+	/*
+	 * A task with a substituted network namespace is dumped into
+	 * the one of its parent task, but the parasite transport (an
+	 * abstract unix socket) is reachable in the network namespace
+	 * the parasite is injected in only: a dedicated listener is
+	 * created in the real one of such a task.
+	 */
+	if (dmpi(item)->netns_substituted) {
+		struct sockaddr_un addr;
+		char nspath[64];
+		int netfd, curfd, sk;
+
+		snprintf(nspath, sizeof(nspath), "/proc/%d/ns/net", item->pid->real);
+		netfd = open(nspath, O_RDONLY);
+		curfd = netfd < 0 ? -1 : open("/proc/self/ns/net", O_RDONLY);
+		if (netfd < 0 || curfd < 0) {
+			pr_perror("Can't open the network namespaces of %d", item->pid->real);
+			close_safe(&netfd);
+			close_safe(&curfd);
+			return NULL;
+		}
+
+		sk = -1;
+		if (setns(netfd, CLONE_NEWNET) == 0) {
+			sk = socket(PF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK, 0);
+			if (sk >= 0) {
+				socklen_t alen = compel_gen_parasite_saddr(&addr, getpid());
+
+				if (bind(sk, &addr, alen) < 0 || listen(sk, 1) < 0) {
+					close(sk);
+					sk = -1;
+				}
+			}
+			setns(curfd, CLONE_NEWNET);
+		}
+
+		close(netfd);
+		close(curfd);
+		if (sk < 0) {
+			pr_err("Can't create a parasite socket in the network namespace of %d\n",
+			       item->pid->real);
+			return NULL;
+		}
+		ictx->sock = sk;
+	} else {
+		ictx->sock = dmpi(item)->netns->net.seqsk;
+	}
 	ictx->save_regs = save_task_regs;
 	ictx->make_sigframe = make_sigframe;
 	ictx->regs_arg = item->core[0];
