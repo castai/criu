@@ -3879,7 +3879,7 @@ struct ns_id *net_get_root_ns(void)
  * socket_diag doesn't report unbound and unconnected sockets,
  * so we have to get their network namespaces explicitly
  */
-struct ns_id *get_socket_ns(int lfd)
+struct ns_id *get_socket_ns(int lfd, pid_t owner)
 {
 	struct ns_id *ns;
 	struct stat st;
@@ -3895,13 +3895,33 @@ struct ns_id *get_socket_ns(int lfd)
 		return NULL;
 	}
 	if (fstat(ns_fd, &st)) {
-		pr_perror("Unable to stat a network namespace");
+		pr_perror("Can't stat a network namespace");
 		close(ns_fd);
 		return NULL;
 	}
 	close(ns_fd);
 
 	ns = lookup_ns_by_kid(st.st_ino, &net_ns_desc);
+	if (ns == NULL && nested_ns_enabled() && owner > 0) {
+		/*
+		 * The socket lives in a network namespace substituted at
+		 * dump (it is not in the collected list), but its owner
+		 * task runs in the one of its parent task after the
+		 * restore: the socket is dumped into that one.
+		 */
+		char path[64];
+
+		snprintf(path, sizeof(path), "/proc/%d/ns/net", owner);
+		ns_fd = open(path, O_RDONLY);
+		if (ns_fd >= 0 && !fstat(ns_fd, &st))
+			ns = lookup_ns_by_kid(st.st_ino, &net_ns_desc);
+		if (ns_fd >= 0)
+			close(ns_fd);
+		if (ns) {
+			pr_warn("A socket of a substituted network namespace is dumped into the one of its owner\n");
+			return ns;
+		}
+	}
 	if (ns == NULL) {
 		pr_err("Unable to dump a socket from an external network namespace\n");
 		return NULL;
@@ -3909,7 +3929,6 @@ struct ns_id *get_socket_ns(int lfd)
 
 	return ns;
 }
-
 void check_has_netns_ioc(int fd, bool *kdat_val, const char *name)
 {
 	int ns_fd;

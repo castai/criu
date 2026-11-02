@@ -167,7 +167,7 @@ static int dump_one_netlink_fd(int lfd, u32 id, const struct fd_parms *p)
 		socklen_t aux = sizeof(val);
 
 		if (root_ns_mask & CLONE_NEWNET) {
-			nsid = get_socket_ns(lfd);
+			nsid = get_socket_ns(lfd, p->pid);
 			if (nsid == NULL)
 				return -1;
 			ne.ns_id = nsid->id;

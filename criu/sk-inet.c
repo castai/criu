@@ -264,7 +264,7 @@ static struct inet_sk_desc *gen_uncon_sk(int lfd, const struct fd_parms *p, int 
 	int ret;
 
 	if (root_ns_mask & CLONE_NEWNET) {
-		ns = get_socket_ns(lfd);
+		ns = get_socket_ns(lfd, p->pid);
 		if (ns == NULL)
 			return NULL;
 	}

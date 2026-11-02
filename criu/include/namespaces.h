@@ -237,7 +237,7 @@ extern int __userns_call(const char *func_name, uns_call_t call, int flags, void
 
 extern int add_ns_shared_cb(int (*actor)(void *data), void *data);
 
-extern struct ns_id *get_socket_ns(int lfd);
+extern struct ns_id *get_socket_ns(int lfd, pid_t owner);
 extern struct ns_id *lookup_ns_by_kid(unsigned int kid, struct ns_desc *nd);
 
 struct unsc_msg {
