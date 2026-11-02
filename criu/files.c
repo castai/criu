@@ -40,6 +40,8 @@
 #include "timerfd.h"
 #include "imgset.h"
 #include "fs-magic.h"
+#include "filesystems.h"
+#include "images/mnt.pb-c.h"
 #include "fdinfo.h"
 #include "cr_options.h"
 #include "autofs.h"
@@ -375,6 +377,23 @@ static int fill_fd_params(struct pid *owner_pid, int fd, int lfd, struct fd_opts
 	struct statfs fsbuf;
 	struct fdinfo_common fdinfo = { .mnt_id = -1, .owner = owner_pid->ns[0].virt };
 
+	/*
+	 * The fdinfo is parsed first, as the mount of the fd may be the
+	 * one of a fuse server which is frozen by the dump itself: the
+	 * statfs of such an fd would wait for the server forever. The
+	 * fds of the mounts of them are closed on restore instead
+	 * (see dump_one_reg_file).
+	 */
+	struct mount_info *mi;
+
+	if (parse_fdinfo_pid(owner_pid->real, fd, FD_TYPES__UND, &fdinfo))
+		return -1;
+	mi = lookup_mnt_id(fdinfo.mnt_id);
+	if (mi && mi->fstype && mi->fstype->code == FSTYPE__FUSE) {
+		pr_warn("fd %d of %d on a fuse mount is closed on restore\n", fd, owner_pid->real);
+		return -EOPNOTSUPP;
+	}
+
 	if (fstat(lfd, &p->stat) < 0) {
 		pr_perror("Can't stat fd %d", lfd);
 		return -1;
@@ -384,9 +403,6 @@ static int fill_fd_params(struct pid *owner_pid, int fd, int lfd, struct fd_opts
 		pr_perror("Can't statfs fd %d", lfd);
 		return -1;
 	}
-
-	if (parse_fdinfo_pid(owner_pid->real, fd, FD_TYPES__UND, &fdinfo))
-		return -1;
 
 	p->fs_type = fsbuf.f_type;
 	p->fd = fd;
@@ -502,8 +518,14 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 	struct fd_parms p = FD_PARMS_INIT;
 	const struct fdtype_ops *ops;
 	struct fd_link link;
+	int ret;
 
-	if (fill_fd_params(pid, fd, lfd, opts, &p) < 0) {
+	ret = fill_fd_params(pid, fd, lfd, opts, &p);
+	if (ret == -EOPNOTSUPP) {
+		/* An fd of a fuse mount: closed on restore instead */
+		return 0;
+	}
+	if (ret < 0) {
 		pr_err("Can't get stat on %d\n", fd);
 		return -1;
 	}
