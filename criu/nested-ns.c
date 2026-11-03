@@ -897,8 +897,10 @@ pid_t pid_at_dump_level(pid_t pid, pid_t fallback)
 
 	snprintf(path, sizeof(path), "/proc/%d/status", pid);
 	f = fopen(path, "r");
-	if (!f)
-		return fallback;
+	if (!f) {
+		pr_err("Can't read the status of %d to name its pid at the level of the root task\n", pid);
+		return -1;
+	}
 
 	while (fgets(buf, sizeof(buf), f)) {
 		char *p;
@@ -924,8 +926,11 @@ pid_t pid_at_dump_level(pid_t pid, pid_t fallback)
 				break;
 			p++;
 		}
-		if (p && sscanf(p, "%d", &ret) != 1)
-			ret = fallback;
+		if (!p || sscanf(p, "%d", &ret) != 1) {
+			pr_err("Can't parse the NSpid of %d\n", pid);
+			fclose(f);
+			return -1;
+		}
 		break;
 	}
 	fclose(f);
