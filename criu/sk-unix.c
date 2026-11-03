@@ -913,6 +913,20 @@ static int __dump_external_socket(struct unix_sk_desc *sk, struct unix_sk_desc *
 		return 0;
 	}
 
+	if (nested_ns_enabled()) {
+		/*
+		 * A socket of a nested tree with a peer outside of the
+		 * dumped one (e.g. the /dev/log forwarding to the
+		 * journald of the host, which the runtime sets up for
+		 * the containers): the peer can not be restored, so the
+		 * connection is not taken into the image -- the holder
+		 * of the socket re-connects it if it needs the peer.
+		 */
+		pr_warn("The unix socket %x is dumped without its external peer %x\n", sk->sd.ino, peer->sd.ino);
+		sk->ue->peer = 0;
+		return 0;
+	}
+
 	/* Legacy -x|--ext-unix-sk option handling */
 	if (!opts.ext_unix_sk) {
 		show_one_unix("Runaway socket", peer);
