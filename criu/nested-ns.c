@@ -650,6 +650,22 @@ int nested_ns_set_tid(struct pstree_item *item, pid_t pid, pid_t *set_tid, int m
 	}
 
 	/*
+	 * The root task of a dump of a nested tree, restored by a
+	 * runtime (a runc one, e.g.) which has created the pid
+	 * namespace of the container before the criu one has entered
+	 * it: the pid of the task at the level of the dump (the
+	 * pod-level one, e.g. 15) is a pid of the outer namespace,
+	 * taken by the processes of the runtime itself in the fresh
+	 * one. The task is forked with the pid it had in the
+	 * namespace of its own: the one of the init of the container.
+	 */
+	if (item == root_item && item->own_ns_pid && item->own_ns_pid != pid &&
+	    !(rsti(item)->clone_flags & CLONE_NEWPID)) {
+		set_tid[0] = item->own_ns_pid;
+		return 1;
+	}
+
+	/*
 	 * The task is forked by a one living in a nested pid namespace:
 	 * its pid in it differs from the one in the root one. It is
 	 * restored with the one of its own namespace, which its own
