@@ -754,7 +754,13 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 		else
 			return dump_unsupp_fd(&p, lfd, "reg", link.name + 1, e);
 
-		return do_dump_gen_file(&p, lfd, ops, e);
+		/*
+		 * A file of a mount of a substituted namespace is not
+		 * restored (see dump_one_reg_file): the fd is closed on
+		 * restore, like the ones of the fuse mounts.
+		 */
+		ret = do_dump_gen_file(&p, lfd, ops, e);
+		return ret == -EOPNOTSUPP ? 0 : ret;
 	}
 
 	if (S_ISFIFO(p.stat.st_mode)) {

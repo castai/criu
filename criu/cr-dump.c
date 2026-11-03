@@ -329,6 +329,12 @@ static int dump_task_exe_link(pid_t pid, MmEntry *mm)
 		return -1;
 
 	ret = dump_one_reg_file_cond(fd, &mm->exe_file_id, &params);
+	if (ret == -EOPNOTSUPP) {
+		/* The exe file is on a mount of a substituted namespace:
+		 * the link of it is not restored. */
+		mm->exe_file_id = 0;
+		ret = 0;
+	}
 
 	close(fd);
 	return ret;
@@ -351,6 +357,12 @@ static int dump_task_fs(pid_t pid, struct parasite_dump_misc *misc, struct cr_im
 		return -1;
 
 	ret = dump_one_reg_file_cond(fd, &fe.cwd_id, &p);
+	if (ret == -EOPNOTSUPP) {
+		/* The cwd is on a mount of a substituted namespace:
+		 * the task is restored with the one of its parent. */
+		fe.cwd_id = 0;
+		ret = 0;
+	}
 	if (ret < 0)
 		return ret;
 
@@ -466,6 +478,21 @@ static int dump_filemap(struct vma_area *vma_area, int fd)
 		ret = dump_one_memfd_cond(fd, &id, &p);
 	else
 		ret = dump_one_reg_file_cond(fd, &id, &p);
+
+	if (ret == -EOPNOTSUPP) {
+		/*
+		 * A mapped file of a mount of a substituted namespace:
+		 * it is not restored, the vma is dumped as an anonymous
+		 * one -- the private pages of it are in the memory
+		 * image already.
+		 */
+		pr_warn("The mapping at %#lx is restored as an anonymous one\n",
+			vma->start);
+		vma->shmid = 0;
+		vma->status &= ~VMA_AREA_MEMFD;
+		vma->flags |= MAP_ANONYMOUS;
+		return 0;
+	}
 
 	vma->shmid = id;
 	return ret;

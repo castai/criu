@@ -1846,7 +1846,7 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 			 * namespace of its parent task if it needs it.
 			 */
 			pr_warn("fd %d on a mount of a substituted namespace is closed on restore\n", p->fd);
-			return 0;
+			return -EOPNOTSUPP;
 		} else {
 			pr_err("Can't lookup mount=%d for fd=%d path=%s\n", p->mnt_id, p->fd, link->name + 1);
 			return -1;
