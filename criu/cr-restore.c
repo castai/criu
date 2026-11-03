@@ -1344,8 +1344,11 @@ static inline int fork_with_pid(struct pstree_item *item)
 
 	if (ret < 0) {
 		pr_perror("Can't fork for %d", pid);
-		if (errno == EEXIST)
+		if (errno == EEXIST) {
+			pr_err("DIAGFORK pid %d: clone_flags %lx, own_ns_pid %d, parent %d\n", pid, ca.clone_flags,
+			       current->own_ns_pid, current->parent ? vpid(current->parent) : -1);
 			set_cr_errno(EEXIST);
+		}
 		goto err_unlock;
 	}
 
@@ -2614,6 +2617,16 @@ int cr_restore_tasks(void)
 		goto err;
 
 	if (crtools_prepare_shared() < 0)
+		goto err;
+
+	/*
+	 * The pid counter of the namespace has to be above every
+	 * requested pid BEFORE any helper of the restore is forked:
+	 * the helpers (the cgroupd one, e.g.) are forked with random
+	 * pids, which would take the ones the tasks of the tree ask
+	 * for with the set_tid of theirs.
+	 */
+	if (nested_ns_seed_pid_counter())
 		goto err;
 
 	if (prepare_cgroup())
