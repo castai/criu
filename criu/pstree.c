@@ -818,8 +818,28 @@ static int prepare_pstree_ids(pid_t pid)
 			}
 
 			if (parent == NULL) {
-				pr_err("Can't find a session leader for %d\n", item->sid);
-				return -1;
+				/*
+				 * The session leader has died and been
+				 * reaped, and the member was adopted by
+				 * a subreaper deep in the tree (the way
+				 * the daemons of the inner containers
+				 * of an envbox workspace are). The
+				 * session of a dead leader can not be
+				 * restored: the member becomes a leader
+				 * of its own one -- the marks the walk
+				 * has left on the old ancestors are
+				 * cleared, they would mislead the fork
+				 * order at restore.
+				 */
+				for (parent = item->parent; parent; parent = parent->parent)
+					if (parent->born_sid == item->sid)
+						parent->born_sid = -1;
+
+				pr_warn("The session of %d is not restored: its leader is gone, it inherits the one of its parent\n",
+					vpid(item));
+				item->sid = item->parent->sid;
+				item->pgid = 0; /* the group of the forking task */
+				continue;
 			}
 
 			continue;
@@ -828,6 +848,7 @@ static int prepare_pstree_ids(pid_t pid)
 
 	/* All other helpers are session leaders for own sessions */
 	list_splice(&helpers, &root_item->children);
+
 
 	/* Add a process group leader if it is absent  */
 	for_each_pstree_item(item) {

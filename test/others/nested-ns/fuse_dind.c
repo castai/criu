@@ -46,6 +46,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 
 #define CHECK(x)                                                              \
@@ -266,6 +267,30 @@ static void helper(const char *hostfile)
 		snprintf(su.sun_path, sizeof(su.sun_path), "/tmp/sock-%d", getppid());
 		unlink(su.sun_path);
 		CHECK(bind(sfd, (struct sockaddr *)&su, sizeof(su)));
+
+		/* A daemonized grandchild: its session leader dies and is
+		 * reaped, and it is adopted by the subreaper, the way the
+		 * daemons of the inner containers of an envbox workspace
+		 * are. */
+		prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+		{
+			pid_t d = fork();
+
+			CHECK(d);
+			if (d == 0) {
+				CHECK(setsid());
+				d = fork();
+				CHECK(d);
+				if (d > 0)
+					_exit(0);
+
+				/* the grandchild: the session of the dead leader */
+				for (;;)
+					sleep(1);
+				_exit(0); /* not reached */
+			}
+			waitpid(d, NULL, 0);
+		}
 
 		for (;;) {
 			char b2[64];
