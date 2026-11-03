@@ -1074,6 +1074,16 @@ int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info, bool fake)
 
 	fdesc = find_file_desc(e);
 	if (fdesc == NULL) {
+		if (nested_ns_enabled()) {
+			/*
+			 * A file of a nested tree which is not restorable (a
+			 * ghost of a stand-in mount, a connection to the
+			 * services of the source node): the fd is closed on
+			 * restore, the way the un-restorable ones are dumped.
+			 */
+			pr_warn("No file for fd %d id %#x, it is closed on restore\n", e->fd, e->id);
+			return 0;
+		}
 		pr_err("No file for fd %d id %#x\n", e->fd, e->id);
 		return -1;
 	}
