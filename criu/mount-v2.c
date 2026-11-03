@@ -529,6 +529,15 @@ static bool can_mount_now_v2(struct mount_info *mi)
 		}
 	}
 
+	/*
+	 * A cgroup mount with the root of a cgroup namespace subtree is
+	 * mounted as a fresh one: the root of it is the one of the
+	 * cgroup namespace a task is restored into (the bind of the
+	 * subtree of the dump one does not exist on the destination).
+	 */
+	if (mi->fstype->code == FSTYPE__CGROUP || mi->fstype->code == FSTYPE__CGROUP2)
+		return true;
+
 	/* Non fsroot mounts can not be mounted without bind-mount */
 	if (!fsroot_mounted(mi) && !mi->bind && !mi->need_plugin) {
 		pr_debug("%s: false as %d is non-root without bind or plugin\n", __func__, mi->mnt_id);
