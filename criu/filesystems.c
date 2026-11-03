@@ -736,6 +736,27 @@ static void fuse_standin_subtree(struct mount_info *mi, const char *plain)
 	}
 }
 
+/*
+ * The rootfs overlays of the inner containers of an envbox workspace
+ * (the ones sysbox-runc mounts in the outer container namespace) are
+ * backed by the runtime directories of the latter, which do not exist
+ * on the destination node: such a mount is restored as a stand-in
+ * tmpfs too.
+ */
+static int overlay_mount(struct mount_info *mi, const char *src, const char *fstype, unsigned long flags)
+{
+	if (nested_ns_enabled()) {
+		pr_warn("The overlay mount at %s is restored as a tmpfs\n", mi->ns_mountpoint);
+		mkdir(service_mountpoint(mi), 0755);
+		if (mount("none", service_mountpoint(mi), "tmpfs", 0, "") < 0)
+			pr_warn("Can't mount a tmpfs at %s either\n", mi->ns_mountpoint);
+		fuse_standin_subtree(mi, service_mountpoint(mi));
+		return 0;
+	}
+
+	return -1;
+}
+
 static int fuse_mount(struct mount_info *mi, const char *src, const char *fstype, unsigned long flags)
 {
 	if (nested_ns_enabled()) {
@@ -869,6 +890,7 @@ static struct fstype fstypes[] = {
 		.name = "overlay",
 		.code = FSTYPE__OVERLAYFS,
 		.parse = overlayfs_parse,
+		.mount = overlay_mount,
 	},
 	{
 		.name = "autofs",
