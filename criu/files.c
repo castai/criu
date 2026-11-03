@@ -880,8 +880,10 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, s
 			FdinfoEntry e = FDINFO_ENTRY__INIT;
 
 			ret = dump_one_file(item->pid, dfds->fds[i + off], lfds[i], opts + i, ctl, &e, dfds);
-			if (ret)
+			if (ret) {
+				pr_err("Dumping fd %d of %d failed: %d\n", dfds->fds[i + off], item->pid->real, ret);
 				break;
+			}
 
 			ret = pb_write_one(img, &e, PB_FDINFO);
 			if (ret)
