@@ -500,6 +500,9 @@ void pstree_insert_pid(struct pid *pid_node)
 
 	n = lookup_create_pid(pid_node->ns[0].virt, pid_node);
 
+	if (n != pid_node)
+		pr_err("Duplicate vpid %d (real %d) in the pid tree: the existing one is real %d\n",
+		       pid_node->ns[0].virt, pid_node->real, n->real);
 	BUG_ON(n != pid_node);
 }
 
