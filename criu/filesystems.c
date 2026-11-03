@@ -718,7 +718,16 @@ static int fuse_restore(struct mount_info *pm)
 static int fuse_mount(struct mount_info *mi, const char *src, const char *fstype, unsigned long flags)
 {
 	if (nested_ns_enabled()) {
-		pr_warn("The fuse mount at %s is not created\n", mi->ns_mountpoint);
+		/*
+		 * A stand-in tmpfs: the mount tree of the restore
+		 * expects a mount at the plain mountpoint of every
+		 * entry (the propagation one is set on it), and a
+		 * placeholder filesystem is as good as none for a
+		 * server which is not restored.
+		 */
+		pr_warn("The fuse mount at %s is restored as a tmpfs\n", mi->ns_mountpoint);
+		if (mount("none", service_mountpoint(mi), "tmpfs", 0, "") < 0)
+			pr_warn("Can't mount a tmpfs at %s either\n", mi->ns_mountpoint);
 		return 0;
 	}
 

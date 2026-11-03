@@ -924,7 +924,10 @@ static int dump_task_thread(struct parasite_ctl *parasite_ctl, const struct pstr
 		pr_err("Can't dump thread for pid %d\n", pid);
 		goto err;
 	}
-	pstree_insert_pid(tid);
+	/* The threads of a task of a nested tree share the vpid of
+	 * their leader: the pid of it is in the tree already. */
+	if (tid->ns[0].virt != vpid(item))
+		pstree_insert_pid(tid);
 
 	core->thread_core->creds->lsm_profile = dmpi(item)->thread_lsms[id]->profile;
 	core->thread_core->creds->lsm_sockcreate = dmpi(item)->thread_lsms[0]->sockcreate;
