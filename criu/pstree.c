@@ -1001,16 +1001,26 @@ static int prepare_pstree_kobj_ids(void)
 		 *
 		 * A task entering a nested user namespace with its own pid
 		 * namespace is the child reaper of the new one, even though
-		 * its vpid is not the INIT_PID of the root one.
+		 * its vpid is not the INIT_PID of the root one. The root
+		 * task is the child reaper of its own pid namespace too:
+		 * a dump of a nested tree records it with the pid it has at
+		 * the level of the dump (a pod-level one), but the pid
+		 * namespace of its own is created by the task at restore
+		 * (a runtime restore, e.g. a runc one, enters the namespace
+		 * of the root one of the dump, not the one of the root task).
 		 */
-		if (vpid(item) != INIT_PID && !(nested_ns_task_nested(item) && item->parent && item->parent->ids &&
-						item->ids->pid_ns_id != item->parent->ids->pid_ns_id))
+		if (item != root_item && vpid(item) != INIT_PID &&
+		    !(nested_ns_task_nested(item) && item->parent && item->parent->ids &&
+		      item->ids->pid_ns_id != item->parent->ids->pid_ns_id))
 			rsti(item)->clone_flags &= ~CLONE_NEWPID;
 
 		cflags &= CLONE_ALLNS;
 
 		if (item == root_item) {
 			pr_info("Will restore in %lx namespaces\n", cflags);
+			if (nested_ns_enabled())
+				pr_err("DIAGROOT cflags=%lx root pid_ns=%u root_ids pid_ns=%u own=%u vpid=%u\n", cflags,
+				       item->ids->pid_ns_id, root_ids->pid_ns_id, item->own_ns_pid, vpid(item));
 			root_ns_mask = cflags;
 		} else if ((cflags & ~(root_ns_mask & CLONE_SUBNS)) && !nested_ns_cflags_ok(cflags, item)) {
 			/*
