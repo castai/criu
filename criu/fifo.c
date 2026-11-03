@@ -7,6 +7,7 @@
 #include "imgset.h"
 #include "image.h"
 #include "files.h"
+#include "nested-ns.h"
 #include "files-reg.h"
 #include "file-ids.h"
 #include "pipes.h"
@@ -55,8 +56,18 @@ static int dump_one_fifo(int lfd, u32 id, const struct fd_parms *p)
 	 * code to save path to a fifo, then we reuse it
 	 * on restore.
 	 */
-	if (dump_one_reg_file(lfd, rf_id, p))
+	if (dump_one_reg_file(lfd, rf_id, p)) {
+		if (nested_ns_enabled()) {
+			/*
+			 * A fifo of a mount of a substituted namespace: the
+			 * path of it is not taken into the image, the fd is
+			 * closed on restore.
+			 */
+			pr_warn("A fifo of a substituted mount, its fd is closed on restore\n");
+			return 0;
+		}
 		return -1;
+	}
 
 	pr_info("Dumping fifo %d with id %#x pipe_id %#x\n", lfd, id, pipe_id(p));
 
