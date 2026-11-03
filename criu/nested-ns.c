@@ -704,8 +704,20 @@ int nested_ns_set_tid(struct pstree_item *item, pid_t pid, pid_t *set_tid, int m
 	 * level of the helper one is requested instead, as it is the
 	 * one settable by it.
 	 */
+	/*
+	 * Only a one living below the level of the root task (a real
+	 * member of the pid namespace of it, not a helper carrying the
+	 * ids of a nested one, nor the root task itself) forks the
+	 * task in the pid namespace of its own: the ones at the level
+	 * of the root one (the root task itself, a task or a helper
+	 * forked by it) name the tasks by their vpid, which is the pid
+	 * of them at that level -- the pid of the own namespace of a
+	 * task is not settable from it.
+	 */
 	if (item->own_ns_pid && item->own_ns_pid != pid &&
-	    item->parent && item->parent->ids &&
+	    item->parent && item->parent->ids && root_item->ids &&
+	    item->parent != root_item &&
+	    item->parent->ids->pid_ns_id != root_item->ids->pid_ns_id &&
 	    item->parent->pid->state != TASK_HELPER &&
 	    item->parent->ids->pid_ns_id == item->ids->pid_ns_id)
 		set_tid[0] = item->own_ns_pid;

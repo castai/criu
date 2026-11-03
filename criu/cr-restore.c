@@ -1187,6 +1187,8 @@ static inline int fork_with_pid(struct pstree_item *item)
 	struct ns_id *pid_ns = NULL;
 	bool external_pidns = false;
 	bool pid_not_set = false;
+	pid_t set_tid[2] = { 0, 0 };
+	int set_tid_size = 0;
 	int ret = -1;
 	pid_t pid = vpid(item);
 
@@ -1290,6 +1292,11 @@ static inline int fork_with_pid(struct pstree_item *item)
 
 	pr_info("Forking task with %d pid (flags 0x%lx)\n", pid, ca.clone_flags);
 
+	if (nested_ns_enabled() && item->parent == root_item)
+		pr_err("DIAGCHILD vpid %d: state %d, pgid %d, sid %d, own %d, flags %lx, pidns %u (parent %u)\n",
+		       pid, item->pid->state, item->pgid, item->sid, item->own_ns_pid, ca.clone_flags,
+		       item->ids ? item->ids->pid_ns_id : 0, root_item->ids ? root_item->ids->pid_ns_id : 0);
+
 	pid_not_set = nested_ns_pid_can_not_be_set(item);
 	if (pid_not_set)
 		pr_warn("The pid of the task %d can not be set: it will be restored with a random one\n", pid);
@@ -1324,9 +1331,6 @@ static inline int fork_with_pid(struct pstree_item *item)
 	}
 
 	if (kdat.has_clone3_set_tid) {
-		pid_t set_tid[2];
-		int set_tid_size;
-
 		/*
 		 * The pids to request: the one of the task, or, in a
 		 * nested pid namespace, the one at each level the forking
@@ -1391,8 +1395,11 @@ static inline int fork_with_pid(struct pstree_item *item)
 	if (ret < 0) {
 		pr_perror("Can't fork for %d", pid);
 		if (errno == EEXIST) {
-			pr_err("DIAGFORK pid %d: clone_flags %lx, own_ns_pid %d, parent %d\n", pid, ca.clone_flags,
-			       current->own_ns_pid, current->parent ? vpid(current->parent) : -1);
+			pr_err("DIAGSETTID size %d: [%d, %d]\n", set_tid_size, set_tid_size > 0 ? set_tid[0] : -1,
+			       set_tid_size > 1 ? set_tid[1] : -1);
+			pr_err("DIAGFORK pid %d: clone_flags %lx, own_ns_pid %d, parent %d, state %d, pgid %d, sid %d\n",
+			       pid, ca.clone_flags, current->own_ns_pid,
+			       current->parent ? vpid(current->parent) : -1, item->pid->state, item->pgid, item->sid);
 			set_cr_errno(EEXIST);
 		}
 		goto err_unlock;
