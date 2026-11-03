@@ -376,6 +376,12 @@ static int dump_task_fs(pid_t pid, struct parasite_dump_misc *misc, struct cr_im
 		return -1;
 
 	ret = dump_one_reg_file_cond(fd, &fe.root_id, &p);
+	if (ret == -EOPNOTSUPP) {
+		/* The root is on a mount of a substituted namespace:
+		 * the link of it is not restored. */
+		fe.root_id = 0;
+		ret = 0;
+	}
 	if (ret < 0)
 		return ret;
 

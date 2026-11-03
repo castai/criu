@@ -42,6 +42,8 @@
 #include "file-ids.h"
 #include "mount.h"
 #include "files.h"
+#include "filesystems.h"
+#include "images/mnt.pb-c.h"
 #include "nested-ns.h"
 #include "common/list.h"
 #include "rst-malloc.h"
@@ -1821,8 +1823,10 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 
 	mi = lookup_mnt_id(p->mnt_id);
 	/* The ids of the mounts of the nested trees are remapped at dump:
-	 * the one of the file can name an other mount now. */
-	if (mi && mi->s_dev != p->stat.st_dev)
+	 * the one of the file can name an other mount now. The files of
+	 * an overlay report the device of the layer, not of the mount:
+	 * those are trusted by the id alone. */
+	if (mi && mi->fstype->code != FSTYPE__OVERLAYFS && mi->s_dev != p->stat.st_dev)
 		mi = NULL;
 	if (mi == NULL) {
 		struct statfs fs;

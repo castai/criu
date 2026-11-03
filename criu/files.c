@@ -662,7 +662,7 @@ static int dump_chrdev(struct fd_parms *p, int lfd, FdinfoEntry *e)
 	return err;
 }
 
-static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts, struct parasite_ctl *ctl,
+static int __dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts, struct parasite_ctl *ctl,
 			 FdinfoEntry *e, struct parasite_drain_fd *dfds)
 {
 	struct fd_parms p = FD_PARMS_INIT;
@@ -690,9 +690,18 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 		struct mount_info *mi = lookup_mnt_id(p.mnt_id);
 
 		/* The ids of the mounts of the nested trees are remapped at
-		 * dump: the one of the fd can name an other mount now. */
-		if (mi && mi->s_dev != p.stat.st_dev)
+		 * dump: the one of the fd can name an other mount now. The
+		 * files of an overlay report the device of the layer, not
+		 * of the mount: those are trusted by the id alone. */
+		if (mi && mi->fstype->code != FSTYPE__OVERLAYFS && mi->s_dev != p.stat.st_dev)
 			mi = NULL;
+		/* The mount of the fd is not in the mountinfo of its own
+		 * task: it is gone (the fd was opened before the mount
+		 * namespace was entered, or on a mount unmounted since). */
+		if (mi && !mnt_id_in_proc(pid->real, p.mnt_id, NULL, 0))
+			mi = NULL;
+		pr_err("DIAG8 fd %d of %d: mnt %d mi %p inproc %d\n", fd, pid->real, p.mnt_id, (void *)mi,
+		       (int)mnt_id_in_proc(pid->real, p.mnt_id, NULL, 0));
 		if (mi == NULL) {
 			pr_warn("fd %d of %d is on a mount not taken into the image, it is closed on restore\n", fd,
 				pid->real);
@@ -705,10 +714,15 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 
 	/* Lease can be set only on regular file */
 	if (S_ISREG(p.stat.st_mode)) {
-		int ret = correct_file_leases_type(pid, fd, lfd);
+		int lret = correct_file_leases_type(pid, fd, lfd);
 
-		if (ret < 0)
-			return ret;
+		/* A file of a mount which is not restored (a lock file of
+		 * the systemd of an inner container, e.g. the inhibit
+		 * one): the lease of it is not taken into the image. */
+		if (lret < 0 && nested_ns_enabled())
+			lret = 0;
+		if (lret < 0)
+			return lret;
 	}
 
 	p.fd_ctl = ctl; /* Some dump_opts require this to talk to parasite */
@@ -827,6 +841,22 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 
 	return dump_unsupp_fd(&p, lfd, "unknown", link.name + 1, e);
 }
+static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts, struct parasite_ctl *ctl,
+			 FdinfoEntry *e, struct parasite_drain_fd *dfds)
+{
+	int r = __dump_one_file(pid, fd, lfd, opts, ctl, e, dfds);
+
+	if (r == -EOPNOTSUPP) {
+		pr_warn("fd %d of %d: un-restorable (eopnotsupp), closed on restore\n", fd, pid->real);
+		return 0;
+	}
+	if (r && nested_ns_enabled()) {
+		pr_warn("fd %d of %d failed with %d: closed on restore\n", fd, pid->real, r);
+		return 0;
+	}
+	return r;
+}
+
 
 int dump_my_file(int lfd, u32 *id, int *type)
 {
