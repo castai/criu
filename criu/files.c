@@ -416,6 +416,27 @@ static bool mnt_id_is_fuse_in_proc(int pid, int mnt_id)
  * of its parent task after it -- so it is closed on restore, the
  * same way as the ones of the fuse mounts.
  */
+/*
+ * The mnt_id of the fdinfo of a bound unix socket is the one of the
+ * filesystem the socket file was bound on: for the sockets of the
+ * substituted namespaces it misses in the collected tree, but the
+ * socket itself is restorable (it is re-bound in the namespace of
+ * the task on restore, see sk-unix.c), so the fd must not be
+ * dropped by the mount-based checks.
+ */
+static bool fd_is_socket(int pid, int fd)
+{
+	char path[64], link[32];
+	int n;
+
+	snprintf(path, sizeof(path), "/proc/%d/fd/%d", pid, fd);
+	n = readlink(path, link, sizeof(link) - 1);
+	if (n <= 0)
+		return false;
+	link[n] = '\0';
+	return !strncmp(link, "socket:", 7);
+}
+
 bool fd_on_substituted_mount(int pid, int fd)
 {
 	struct fdinfo_common fdinfo = { .mnt_id = -1, .owner = 0 };
@@ -423,7 +444,7 @@ bool fd_on_substituted_mount(int pid, int fd)
 	FILE *f;
 	bool found = false;
 
-	if (!nested_ns_enabled())
+	if (!nested_ns_enabled() || fd_is_socket(pid, fd))
 		return false;
 
 	if (parse_fdinfo_pid(pid, fd, FD_TYPES__UND, &fdinfo))
@@ -457,6 +478,9 @@ bool fd_on_fuse_mount(int pid, int fd)
 {
 	struct fdinfo_common fdinfo = { .mnt_id = -1, .owner = 0 };
 	struct mount_info *mi;
+
+	if (fd_is_socket(pid, fd))
+		return false;
 
 	if (parse_fdinfo_pid(pid, fd, FD_TYPES__UND, &fdinfo))
 		return false; /* can't tell: let the old path sort it out */
