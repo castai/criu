@@ -531,8 +531,15 @@ static int create_ghost(struct ghost_file *gf, GhostFileEntry *gfe, struct cr_im
 	 */
 	rel_path = get_relative_path(path, service_mountpoint(mi));
 	if (!rel_path) {
-		pr_err("Can't get path %s relative to %s\n", path, service_mountpoint(mi));
-		return -1;
+		/*
+		 * The ghost was created in the remap directory of the
+		 * roots yard (it is shared by the mounts of a nested
+		 * tree): the plain path of it is kept as it is, the
+		 * users of the ghost open it as it is.
+		 */
+		pr_debug("The ghost %s is at the remap directory\n", path);
+		snprintf(gf->remap.rpath, PATH_MAX, "%s", path);
+		return 0;
 	}
 
 	rel_mp = get_relative_path(mi->ns_mountpoint, "/");
