@@ -744,7 +744,16 @@ bool nested_ns_pid_ok(struct pstree_item *item, pid_t pid)
 	 * nested_ns_set_tid): it sees itself at its pid of the helper
 	 * one, the vpid.
 	 */
-	if (item->own_ns_pid && item->parent && item->parent->ids &&
+	/*
+	 * The own-ns pid of a task is the one it is seen at by the ones
+	 * living in the pid namespace of its own, i.e. by the ones below
+	 * the level of the root task: the fork made at the level of the
+	 * root one (see nested_ns_set_tid) restores the task with its
+	 * vpid, which is its pid at that level.
+	 */
+	if (item->own_ns_pid && item->parent && item->parent->ids && root_item->ids &&
+	    item->parent != root_item &&
+	    item->parent->ids->pid_ns_id != root_item->ids->pid_ns_id &&
 	    item->parent->pid->state != TASK_HELPER &&
 	    item->parent->ids->pid_ns_id == item->ids->pid_ns_id)
 		expected = item->own_ns_pid;
