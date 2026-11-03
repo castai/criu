@@ -916,8 +916,10 @@ static int __dump_external_socket(struct unix_sk_desc *sk, struct unix_sk_desc *
 	/* Legacy -x|--ext-unix-sk option handling */
 	if (!opts.ext_unix_sk) {
 		show_one_unix("Runaway socket", peer);
-		pr_err("External socket is used. "
-		       "Consider using --" USK_EXT_PARAM " option.\n");
+		pr_err("External socket %x (type %d, name %s) with peer %x (type %d, name %s, state %x) is used. "
+		       "Consider using --" USK_EXT_PARAM " option.\n",
+		       sk->sd.ino, sk->type, sk->name ? (char *)sk->name : "none",
+		       peer->sd.ino, peer->type, peer->name ? (char *)peer->name : "none", peer->state);
 		return -1;
 	}
 
