@@ -378,7 +378,7 @@ bool fd_is_fuse_dev(int pid, int fd)
  * of the task itself still names it and its fstype: the file is
  * never touched on the way, only the /proc entries are read.
  */
-static bool mnt_id_is_fuse_in_proc(int pid, int mnt_id)
+static bool mnt_id_in_proc(int pid, int mnt_id, char *fstype, size_t fstype_len)
 {
 	char path[64], line[2048];
 	FILE *f;
@@ -391,21 +391,30 @@ static bool mnt_id_is_fuse_in_proc(int pid, int mnt_id)
 
 	while (fgets(line, sizeof(line), f)) {
 		int id = -1;
-		char fstype[128], *sep;
+		char fs[128], *sep;
 
 		if (sscanf(line, "%d", &id) != 1 || id != mnt_id)
 			continue;
 		sep = strstr(line, " - ");
 		if (!sep)
 			continue;
-		if (sscanf(sep + 3, "%127s", fstype) == 1 && !strncmp(fstype, "fuse", 4)) {
+		if (sscanf(sep + 3, "%127s", fs) == 1) {
 			ret = true;
+			if (fstype && fstype_len)
+				snprintf(fstype, fstype_len, "%s", fs);
 			break;
 		}
 	}
 
 	fclose(f);
 	return ret;
+}
+
+static bool mnt_id_is_fuse_in_proc(int pid, int mnt_id)
+{
+	char fstype[128];
+
+	return mnt_id_in_proc(pid, mnt_id, fstype, sizeof(fstype)) && !strncmp(fstype, "fuse", 4);
 }
 
 /*
@@ -669,6 +678,26 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 	if (ret < 0) {
 		pr_err("Can't get stat on %d\n", fd);
 		return -1;
+	}
+
+	/*
+	 * A file on a mount which is not in the collected tree (the
+	 * mount namespace of it was substituted at dump, or it is gone
+	 * since the fd was opened): it is not restorable, the fd is
+	 * closed on restore, its lock is not taken into the image.
+	 */
+	if (nested_ns_enabled() && S_ISREG(p.stat.st_mode) && p.mnt_id >= 0) {
+		struct mount_info *mi = lookup_mnt_id(p.mnt_id);
+
+		/* The ids of the mounts of the nested trees are remapped at
+		 * dump: the one of the fd can name an other mount now. */
+		if (mi && mi->s_dev != p.stat.st_dev)
+			mi = NULL;
+		if (mi == NULL) {
+			pr_warn("fd %d of %d is on a mount not taken into the image, it is closed on restore\n", fd,
+				pid->real);
+			return 0;
+		}
 	}
 
 	if (note_file_lock(pid, fd, lfd, &p))

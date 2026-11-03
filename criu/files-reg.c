@@ -1820,6 +1820,10 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 	}
 
 	mi = lookup_mnt_id(p->mnt_id);
+	/* The ids of the mounts of the nested trees are remapped at dump:
+	 * the one of the file can name an other mount now. */
+	if (mi && mi->s_dev != p->stat.st_dev)
+		mi = NULL;
 	if (mi == NULL) {
 		struct statfs fs;
 
