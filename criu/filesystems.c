@@ -715,6 +715,27 @@ static int fuse_restore(struct mount_info *pm)
 	return always_fail(pm);
 }
 
+/*
+ * The mountpoints of the submounts of a stand-in one: the tree of
+ * the restore expects them to exist in the filesystem of their
+ * parent (the is_dir detection of a mount stats its mountpoint in
+ * the plain one of its parent).
+ */
+static void fuse_standin_subtree(struct mount_info *mi, const char *plain)
+{
+	struct mount_info *c;
+	char path[PATH_MAX];
+
+	list_for_each_entry(c, &mi->children, siblings) {
+		const char *rel = get_relative_path(c->ns_mountpoint, mi->ns_mountpoint);
+
+		if (!rel || !rel[0] || snprintf(path, sizeof(path), "%s/%s", plain, rel) >= (int)sizeof(path))
+			continue;
+		mkdir(path, 0755);
+		fuse_standin_subtree(c, path);
+	}
+}
+
 static int fuse_mount(struct mount_info *mi, const char *src, const char *fstype, unsigned long flags)
 {
 	if (nested_ns_enabled()) {
@@ -723,11 +744,14 @@ static int fuse_mount(struct mount_info *mi, const char *src, const char *fstype
 		 * expects a mount at the plain mountpoint of every
 		 * entry (the propagation one is set on it), and a
 		 * placeholder filesystem is as good as none for a
-		 * server which is not restored.
+		 * server which is not restored. The mountpoints of
+		 * the submounts of it are created inside.
 		 */
 		pr_warn("The fuse mount at %s is restored as a tmpfs\n", mi->ns_mountpoint);
+		mkdir(service_mountpoint(mi), 0755);
 		if (mount("none", service_mountpoint(mi), "tmpfs", 0, "") < 0)
 			pr_warn("Can't mount a tmpfs at %s either\n", mi->ns_mountpoint);
+		fuse_standin_subtree(mi, service_mountpoint(mi));
 		return 0;
 	}
 

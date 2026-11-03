@@ -18,6 +18,7 @@
 #include "imgset.h"
 #include "parasite-syscall.h"
 #include "parasite.h"
+#include "nested-ns.h"
 #include "crtools.h"
 #include "namespaces.h"
 #include "kerndat.h"
@@ -253,7 +254,13 @@ int parasite_dump_thread_seized(struct parasite_thread_ctl *tctl, struct parasit
 		return -1;
 	}
 
-	tid->ns[0].virt = args->tid;
+	/* The tid the parasite reports is the one of the pid namespace of
+	 * the task itself: it is translated into the one of the root task,
+	 * the threads of the nested namespaces would collide with the
+	 * pids of the tasks of the outer ones otherwise. */
+	tid->ns[0].virt = nested_ns_dump_vpid(tid->real, args->tid);
+	if (tid->ns[0].virt < 0)
+		return -1;
 	return dump_thread_core(pid, core, args);
 }
 
