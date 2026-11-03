@@ -715,6 +715,17 @@ static int fuse_restore(struct mount_info *pm)
 	return always_fail(pm);
 }
 
+static int fuse_mount(struct mount_info *mi, const char *src, const char *fstype, unsigned long flags)
+{
+	if (nested_ns_enabled()) {
+		pr_warn("The fuse mount at %s is not created\n", mi->ns_mountpoint);
+		return 0;
+	}
+
+	pr_err("Can't mount the fuse filesystem of %s\n", mi->ns_mountpoint);
+	return -1;
+}
+
 static struct fstype fstypes[] = {
 	{
 		.name = "unsupported",
@@ -818,6 +829,7 @@ static struct fstype fstypes[] = {
 		.name = "fuse",
 		.code = FSTYPE__FUSE,
 		.dump = fuse_dump,
+		.mount = fuse_mount,
 		.restore = fuse_restore,
 	},
 	{
