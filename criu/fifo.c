@@ -156,6 +156,18 @@ static int collect_one_fifo(void *o, ProtobufCMessage *base, struct cr_img *i)
 	info->fe = pb_msg(base, FifoEntry);
 	pr_info("Collected fifo entry ID %#x PIPE ID %#x\n", info->fe->id, info->fe->pipe_id);
 
+	/*
+	 * A fifo of a mount of a substituted namespace can come without
+	 * its reg file (the path of it is not taken into the image): it
+	 * is not collected -- the fds of it are closed on restore (see
+	 * collect_fd), instead of failing the restore of the tree.
+	 */
+	if (nested_ns_enabled() &&
+	    !find_file_desc_raw(FD_TYPES__REG, info->fe->has_regf_id ? info->fe->regf_id : info->fe->id)) {
+		pr_warn("The fifo %#x has no reg file in the image, it is not restored\n", info->fe->id);
+		return 1;
+	}
+
 	/* check who will restore the fifo data */
 	list_for_each_entry(f, &fifo_head, list)
 		if (f->fe->pipe_id == info->fe->pipe_id)

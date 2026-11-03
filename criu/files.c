@@ -1792,12 +1792,25 @@ int prepare_fs_pid(struct pstree_item *item)
 
 	ri->cwd = collect_special_file(fe->cwd_id);
 	if (!ri->cwd) {
+		if (nested_ns_enabled()) {
+			/* The cwd of it was on a mount of a substituted
+			 * namespace: the one of the parent task is used. */
+			pr_warn("The cwd of a task is not restored\n");
+			ri->cwd = NULL;
+			goto root_done;
+		}
 		pr_err("Can't find task cwd file\n");
 		goto out_f;
 	}
 
+root_done:
 	ri->root = collect_special_file(fe->root_id);
 	if (!ri->root) {
+		if (nested_ns_enabled()) {
+			pr_warn("The root of a task is not restored\n");
+			ri->root = NULL;
+			goto out;
+		}
 		pr_err("Can't find task root file\n");
 		goto out_f;
 	}

@@ -2616,8 +2616,23 @@ int collect_filemap(struct vma_area *vma)
 		fd = collect_memfd(vma->e->shmid);
 	else
 		fd = collect_special_file(vma->e->shmid);
-	if (!fd)
+	if (!fd) {
+		if (nested_ns_enabled()) {
+			/*
+			 * A vma of a file of a mount of a substituted
+			 * namespace: the entry of the file was not taken
+			 * into the image (e.g. its exe or cwd link hit
+			 * the substituted mount first, and the dump
+			 * tolerated it without writing the entry) -- the
+			 * vma is restored as an anonymous one.
+			 */
+			pr_warn("The mapping at %#lx is restored as an anonymous one\n", (unsigned long)vma->e->start);
+			vma->e->shmid = 0;
+			vma->e->flags |= MAP_ANONYMOUS;
+			return 0;
+		}
 		return -1;
+	}
 
 	vma->vmfd = fd;
 	vma->vm_open = open_filemap;
@@ -2683,7 +2698,7 @@ struct file_desc *try_collect_special_file(u32 id, int optional)
 	fdesc = find_file_desc_raw(FD_TYPES__REG, id);
 	if (fdesc == NULL) {
 		if (!optional)
-			pr_err("No entry for reg-file-ID %#x\n", id);
+			pr_err("No entry for reg-file-ID %#x (caller %p)\n", id, __builtin_return_address(0));
 		return NULL;
 	}
 
