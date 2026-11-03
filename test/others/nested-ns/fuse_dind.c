@@ -60,6 +60,8 @@
 
 static const char *backing, *mnt, *counter, *fdstatus;
 
+static int tree_main(char **argv);
+
 /* The fuse passthrough server: runs in the tier1 namespaces. */
 #define FUSE_USE_VERSION 31
 #include <fuse3/fuse.h>
@@ -336,16 +338,56 @@ int main(int argc, char **argv)
 	char buf[8];
 	int n;
 
+	if (argc == 6) {
+		/* Like a container runtime creates a pid namespace for a
+		 * container: the whole tree runs in one, with its init as
+		 * the session leader of its own, and the dump and the
+		 * restore are run from the outside of it (see fuse-dind.sh,
+		 * the PIDFILE is written with the pid of the init at the
+		 * level of the launcher). */
+		pid_t init;
+		FILE *f;
+
+		CHECK(unshare(CLONE_NEWPID));
+		init = fork();
+		CHECK(init);
+		if (init == 0) {
+			if (setsid() < 0 && errno != EPERM)
+				CHECK(-1);
+			return tree_main(argv);
+		}
+		f = fopen(argv[5], "w");
+		CHECK(f ? 0 : -1);
+		fprintf(f, "%d\n", (int)init);
+		fclose(f);
+		for (;;) /* the runtime launcher */
+			pause();
+	}
+
 	if (argc != 5) {
-		fprintf(stderr, "usage: %s BACKING MNT COUNTER FDSTATUS\n", argv[0]);
+		fprintf(stderr, "usage: %s BACKING MNT COUNTER FDSTATUS [PIDFILE]\n", argv[0]);
 		return 1;
 	}
+	return tree_main(argv);
+}
+
+static int tree_main(char **argv)
+{
+	int syncpipe[2];
+	pid_t tier1, srv;
+	char buf[8];
+	int n;
 
 	/* Like a container init (runc unshares one for it): the root
 	 * task of the dump lives in a mount namespace of its own, not
 	 * in the one of whoever runs the dump. */
 	CHECK(unshare(CLONE_NEWNS));
 	CHECK(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL));
+
+	/* Like a container runtime mounts for a container: the tree sees
+	 * the pids of its own pid namespace in /proc, not the ones of the
+	 * level the dump runs at. */
+	CHECK(mount("proc", "/proc", "proc", 0, NULL));
 
 	backing = argv[1];
 	mnt = argv[2];

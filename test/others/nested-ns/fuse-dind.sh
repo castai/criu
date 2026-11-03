@@ -43,8 +43,17 @@ cc $(pkg-config --cflags fuse3) fuse_dind.c -o "$T/fuse_dind" $(pkg-config --lib
 	exit 1
 }
 
-"$T/fuse_dind" "$BACK" "$MNT" "$COUNTER" "$FDSTATUS" &
-ROOT=$!
+"$T/fuse_dind" "$BACK" "$MNT" "$COUNTER" "$FDSTATUS" "$T/initpid" &
+ROOT=""
+for i in $(seq 1 20); do
+	[ -s "$T/initpid" ] && break
+	sleep 1
+done
+ROOT=$(cat "$T/initpid" 2>/dev/null || echo "")
+[ -n "$ROOT" ] || {
+	echo "FAIL: the wrapped topology did not start"
+	exit 1
+}
 
 # Wait for the helper to be up: the counter grows and the fuse fd is alive
 for i in $(seq 1 20); do
@@ -63,8 +72,11 @@ echo "topology up: $N1 ticks, fuse fd alive"
 # the mountpoints of the image mounts are already there
 mkdir -p "$T/root"/{proc,sys,dev/pts,dev/shm,dev/mqueue,mnt/fuse-dind,tmp,etc,run}
 
-# The dump must not wait for the frozen fuse server
-timeout -k 5 90 $CRIU dump -t "$ROOT" --shell-job -D "$T" -v4 -o dump.log
+# The dump must not wait for the frozen fuse server. Like a runtime
+# (a cri-proxy pod-level one, e.g.), it runs from the outside of the
+# pid namespace of the root task, without --shell-job: the ids of the
+# sessions and the groups of the image are the ones of the tree itself.
+timeout -k 5 90 $CRIU dump -t "$ROOT" -D "$T" -v4 -o dump.log
 RC=$?
 [ $RC -eq 0 ] || {
 	echo "FAIL: dump rc=$RC (124 = the fuse deadlock)"
@@ -78,12 +90,26 @@ grep -q "on a fuse mount is closed on restore" "$T/dump.log" || {
 }
 echo "dump ok: fuse fds closed on restore"
 
-timeout -k 5 90 $CRIU restore --shell-job --root / -D "$T" -v4 -o restore.log -d --pidfile "$T/pid"
+# Like a runtime restore (a runc one, e.g.): a fresh pid namespace
+# is created for the container, criu runs in it, without --shell-job,
+# and the root task of the image (recorded with the pid namespace of
+# its own) is forked into a nested one from it. The sleeps stand for
+# the processes of the runtime itself living in the same one, and
+# the wrapper stays alive like a runtime does: its pid 1 exiting
+# would kill the whole pid namespace of the restored tree with it
+# (the kernel kills the members of one whose init has exited).
+unshare -pf --mount-proc -- bash -c "sleep 300 & sleep 300 & $CRIU restore --root / -D '$T' -v4 -o restore.log -d --pidfile '$T/pid'; echo \$? > '$T/rcriu.rc'; wait" &
+for i in $(seq 1 60); do
+	[ -s "$T/rcriu.rc" ] && break
+	sleep 1
+done
+RC=$(cat "$T/rcriu.rc" 2>/dev/null || echo 1)
+rm -f "$T/rcriu.rc"
 RC=$?
 [ $RC -eq 0 ] || {
 	echo "FAIL: restore rc=$RC"
 	cp -r "$T" /test/out 2>/dev/null
-	tail -40 "$T/restore.log" 2>/dev/null
+	tail -300 "$T/restore.log" 2>/dev/null
 	exit 1
 }
 
@@ -93,6 +119,8 @@ N2=$(wc -l < "$COUNTER" 2>/dev/null || echo 0)
 FDERR=$(cat "$FDSTATUS" 2>/dev/null)
 [ "$N2" -gt "$N1" ] 2>/dev/null || {
 	echo "FAIL: the counter did not grow ($N1 -> $N2)"
+	mkdir -p /test/out
+	cp -r "$T"/ /test/out/ 2>/dev/null
 	exit 1
 }
 [ "$FDERR" = "9" ] || {
@@ -101,5 +129,5 @@ FDERR=$(cat "$FDSTATUS" 2>/dev/null)
 }
 echo "restore ok: counter $N1 -> $N2, fuse fd EBADF"
 
-kill "$(cat "$T/pid")" 2>/dev/null
+kill "$(cat "$T/pid" 2>/dev/null)" 2>/dev/null
 echo PASS

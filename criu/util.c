@@ -410,6 +410,20 @@ inline int open_pid_proc(pid_t pid)
 
 	fd = openat(dfd, path, O_PATH);
 	if (fd < 0) {
+		int _root, _alt = -1;
+		char _p[64], _lnk[64];
+
+		_root = openat(AT_FDCWD, "/proc", O_DIRECTORY | O_PATH);
+		if (_root >= 0)
+			_alt = openat(_root, path, O_PATH);
+		snprintf(_p, sizeof(_p), "/proc/self/fd/%d", dfd);
+		if (readlink(_p, _lnk, sizeof(_lnk) - 1) < 0)
+			_lnk[0] = '\0';
+		pr_err("DIAGPROC %s: dfd=%d (-> %s), cwd-proc has it: %d\n", path, dfd, _lnk, _alt);
+		if (_alt >= 0)
+			close(_alt);
+		if (_root >= 0)
+			close(_root);
 		pr_perror("Can't open %s", path);
 		set_cr_errno(ESRCH);
 		return -1;

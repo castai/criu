@@ -1651,6 +1651,13 @@ static int mount_proc(void)
 		close(fd);
 	}
 
+	if (nested_ns_enabled()) {
+		char _m[64];
+		if (readlink("/proc/self/ns/mnt", _m, sizeof(_m) - 1) < 0)
+			_m[0] = '\0';
+		pr_err("DIAGMOUNTPROC root_ns_mask=%lx mnt=%s\n", root_ns_mask, _m);
+	}
+
 	return ret;
 }
 
@@ -1700,6 +1707,17 @@ static int __restore_task_with_children(void *_arg)
 	int ret;
 
 	current = ca->item;
+
+	/*
+	 * The /proc/self cache of the forking one is inherited with its
+	 * service fds: its pid check (see get_proc_fd()) matches this one's
+	 * getpid() as well when both are pid 1 of their pid namespaces, and
+	 * the cached fd names the forking one instead of this task itself
+	 * (e.g. the timens offsets of the former are set on its behalf then).
+	 * Forget it: the next open_proc(PROC_SELF) re-resolves "self" for
+	 * this one via the /proc of the restore.
+	 */
+	set_proc_self_fd(-1);
 
 	/*
 	 * The root task: the pid counter of the namespace has to be

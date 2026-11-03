@@ -434,7 +434,7 @@ int nested_ns_seed_pid_counter(void)
 	char buf[32];
 	unsigned long max = 0;
 	struct pstree_item *item;
-	int fd, len;
+	int fd, len, mfd;
 
 	if (!nested_ns_enabled())
 		return 0;
@@ -449,7 +449,25 @@ int nested_ns_seed_pid_counter(void)
 
 	len = snprintf(buf, sizeof(buf), "%lu", max + 1000);
 
-	fd = open("/proc/sys/kernel/ns_last_pid", O_WRONLY);
+	/*
+	 * The counter of the pid namespace of this task has to be seeded,
+	 * not the one of the /proc of the forking one (e.g. a root task of
+	 * a nested tree is forked into a pid namespace of its own, while
+	 * the /proc of the restore names the one of the runtime): the
+	 * tasks which are restored with a random pid (see
+	 * nested_ns_pid_can_not_be_set()) are forked by the ones below it,
+	 * and the ones requested by their kin via set_tid would lose their
+	 * pid to them otherwise.
+	 */
+	if (kdat.has_fsopen) {
+		mfd = mount_detached_fs("proc");
+		if (mfd < 0)
+			return -1;
+		fd = openat(mfd, "sys/kernel/ns_last_pid", O_WRONLY);
+		close(mfd);
+	} else {
+		fd = open("/proc/sys/kernel/ns_last_pid", O_WRONLY);
+	}
 	if (fd < 0) {
 		pr_perror("Can't open the pid namespace counter");
 		return -1;
