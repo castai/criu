@@ -420,8 +420,21 @@ static int populate_pid_proc(void)
 	if (nested_ns_pid_not_visible(current))
 		pr_debug("pid not visible in /proc, using /proc/self only\n");
 	else if (open_pid_proc(vpid(current)) < 0) {
-		pr_err("Can't open PROC_SELF\n");
-		return -1;
+		/*
+		 * The vpid of a task of a nested tree can name a pid of
+		 * a pid namespace other than the one the /proc of the
+		 * restore is mounted for (e.g. the root task of a runc
+		 * restore is recorded with its pod-level one, while the
+		 * /proc of the container is the one of its own pid
+		 * namespace): the /proc/self is used for it then.
+		 */
+		if (nested_ns_enabled()) {
+			pr_warn("The pid %d is not visible in the /proc of the restore, using /proc/self\n",
+				vpid(current));
+		} else {
+			pr_err("Can't open PROC_SELF\n");
+			return -1;
+		}
 	}
 	if (open_pid_proc(PROC_SELF) < 0) {
 		pr_err("Can't open PROC_SELF\n");
@@ -1324,6 +1337,39 @@ static inline int fork_with_pid(struct pstree_item *item)
 		ret = clone3_with_pids_noasan(restore_task_with_children, &ca,
 					      (ca.clone_flags & ~(CLONE_NEWNET | CLONE_NEWCGROUP | CLONE_NEWTIME)),
 					      SIGCHLD, set_tid_size ? set_tid : NULL, set_tid_size);
+
+		/*
+		 * The root task of the tree can lose its pid to a leftover
+		 * of a failed restore of the same one: the destination
+		 * container is reused between the attempts of the migration,
+		 * and a task of the failed attempt stays in it (its cleanup
+		 * could not resume it, e.g. its tracer died mid-restore).
+		 * The leftover is killed and the fork is retried once -- it
+		 * is safe for the root only: the pids of the other tasks of
+		 * this restore are alive already, and a collision on those
+		 * means an id clash inside the image itself.
+		 */
+		if (ret < 0 && errno == EEXIST && set_tid_size && item == root_item) {
+			pr_warn("The pid %d of the root task is held by a leftover, retrying\n", set_tid[0]);
+			if (kill(set_tid[0], SIGKILL) < 0 && errno != ESRCH) {
+				pr_perror("Can't kill the leftover %d", set_tid[0]);
+			} else {
+				/* the leftover may take a while to die: it is
+				 * ptrace-stopped, its exit is not instant */
+				int w;
+
+				for (w = 0; w < 100; w++) {
+					if (kill(set_tid[0], 0) < 0 && errno == ESRCH)
+						break;
+					usleep(10000);
+				}
+
+				ret = clone3_with_pids_noasan(restore_task_with_children, &ca,
+							       (ca.clone_flags &
+								~(CLONE_NEWNET | CLONE_NEWCGROUP | CLONE_NEWTIME)),
+							       SIGCHLD, set_tid, set_tid_size);
+			}
+		}
 	} else {
 		/*
 		 * Some kernel modules, such as network packet generator
