@@ -2598,6 +2598,11 @@ int collect_filemap(struct vma_area *vma)
 {
 	struct file_desc *fd;
 
+	/* A vma anonymized at dump (its file was on a mount of a
+	 * substituted namespace): it is restored as a plain one. */
+	if (!vma->e->shmid)
+		return 0;
+
 	if (!vma->e->has_fdflags) {
 		/* Make a wild guess for the fdflags */
 		vma->e->has_fdflags = true;
