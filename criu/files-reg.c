@@ -860,6 +860,14 @@ nomntns:
 		ret = unlink(path);
 
 	if (ret) {
+		if (errno == ENOENT) {
+			/* A ghost of a stand-in mount (a fuse or an overlay one
+			 * of a nested tree): the file of it was never created,
+			 * there is nothing to clean up. */
+			pr_warn("The remap %s is gone already\n", path);
+			remap->rpath[0] = 0;
+			return 0;
+		}
 		pr_perror("Couldn't unlink remap %s", path);
 		return -1;
 	}
