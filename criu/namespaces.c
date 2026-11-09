@@ -448,11 +448,17 @@ int walk_namespaces(struct ns_desc *nd, int (*cb)(struct ns_id *, void *), void 
 	return ret;
 }
 
+/* The nested namespaces of a kind which can be nested, seen before any
+ * nested user namespace of the tree: their failure is deferred to the end
+ * of the collection (see collect_namespaces). */
+static struct ns_desc *nested_ns_deferred[8];
+static int nested_ns_deferred_n;
+static pid_t nested_ns_deferred_pid;
+
 static unsigned int generate_ns_id(int pid, unsigned int kid, struct ns_desc *nd, struct ns_id **ns_ret)
 {
 	struct ns_id *nsid;
 	enum criu_ns_type type;
-
 	nsid = lookup_ns_by_kid(kid, nd);
 	if (nsid)
 		goto found;
@@ -464,22 +470,31 @@ static unsigned int generate_ns_id(int pid, unsigned int kid, struct ns_desc *nd
 			pr_info("Will take %s namespace in the image\n", nd->str);
 			root_ns_mask |= nd->cflag;
 			type = NS_ROOT;
-		} else if (nested_ns_kind(nd)) {
-			/*
-			 * A new namespace of a kind which can be nested.
-			 * The nested user namespace of the tree can be
-			 * seen later than this one (the sysbox tier of
-			 * an envbox workspace has a nested cgroup one
-			 * while it lives in the root user namespace),
-			 * so the support can not wait for it: turn it
-			 * on now. It changes nothing for the classic
-			 * dumps, these namespaces were the fatal
-			 * errors there.
-			 */
+		} else if (nd == &user_ns_desc) {
 			nested_ns_discover(pid);
 		} else if ((nd->cflag & ~CLONE_SUBNS) && !nested_ns_dump_ok(nd)) {
-			pr_err("Can't dump nested %s namespace for %d\n", nd->str, pid);
-			return 0;
+			if (nested_ns_kind(nd)) {
+				/*
+			 * A new namespace of a kind which can be nested,
+			 * seen before any nested user namespace of the tree:
+				 * the support can only be discovered by a user one
+				 * (the sysbox tier of an envbox workspace has a
+				 * nested cgroup namespace while it lives in the
+				 * root user one), so the failure of this one is
+				 * checked once the whole tree has been seen
+				 * instead, and only then: a plain docker-in-docker
+				 * tree nests the pid, ipc, uts and cgroup
+				 * namespaces of its inner containers without any
+				 * user one, and it must keep the classic dump.
+				 */
+				if (!nested_ns_deferred_n)
+					nested_ns_deferred_pid = pid;
+				if (nested_ns_deferred_n < sizeof(nested_ns_deferred) / sizeof(nested_ns_deferred[0]))
+					nested_ns_deferred[nested_ns_deferred_n++] = nd;
+			} else {
+				pr_err("Can't dump nested %s namespace for %d\n", nd->str, pid);
+				return 0;
+			}
 		}
 	} else
 		type = NS_CRIU;
@@ -1662,6 +1677,18 @@ int collect_namespaces(bool for_dump)
 	ret = collect_pid_namespaces(for_dump);
 	if (ret < 0)
 		return ret;
+
+	/* The namespaces deferred at their discovery (see
+		 * generate_ns_id): the whole tree has been seen now,
+		 * and no nested user namespace of it turned the
+		 * support on, so they fail as they would have
+		 * without the deferring.
+		 */
+	if (nested_ns_deferred_n && !nested_ns_enabled()) {
+		pr_err("Can't dump nested %s namespace for %d\n",
+		       nested_ns_deferred[0]->str, nested_ns_deferred_pid);
+		return -1;
+	}
 
 	return 0;
 }
