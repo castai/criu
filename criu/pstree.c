@@ -1019,8 +1019,6 @@ static int prepare_pstree_kobj_ids(void)
 		if (item == root_item) {
 			pr_info("Will restore in %lx namespaces\n", cflags);
 			if (nested_ns_enabled())
-				pr_err("DIAGROOT cflags=%lx root pid_ns=%u root_ids pid_ns=%u own=%u vpid=%u\n", cflags,
-				       item->ids->pid_ns_id, root_ids->pid_ns_id, item->own_ns_pid, vpid(item));
 			root_ns_mask = cflags;
 		} else if ((cflags & ~(root_ns_mask & CLONE_SUBNS)) && !nested_ns_cflags_ok(cflags, item)) {
 			/*

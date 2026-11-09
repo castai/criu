@@ -170,10 +170,27 @@ static int fp_truncate(const char *path, off_t off, struct fuse_file_info *fi)
 	return truncate(fpath, off) < 0 ? -errno : 0;
 }
 
+static int fp_create(const char *path, mode_t mode, struct fuse_file_info *fi)
+{
+	char fpath[4096];
+	int fd;
+
+	if (fp_fill(fpath, path))
+		return -ENAMETOOLONG;
+	/* The plain backing file: the write probe of the launcher creates
+	 * one through the mount after the restore. */
+	fd = open(fpath, fi->flags, mode);
+	if (fd < 0)
+		return -errno;
+	close(fd);
+	return 0;
+}
+
 static struct fuse_operations fp_ops = {
 	.getattr = fp_getattr,
 	.readdir = fp_readdir,
 	.open = fp_open,
+	.create = fp_create,
 	.read = fp_read,
 	.write = fp_write,
 	.flush = fp_flush,
@@ -308,13 +325,31 @@ static void helper(const char *hostfile)
 	}
 
 	for (;;) {
-		char buf[64];
-		int err = 0;
+		char buf[64], mpath[4096], hb[128];
+		int err = 0, mfd, msfd, ok = 0;
 
 		/* Touch the fuse fd to learn its fate */
 		n = read(fusefd, buf, sizeof(buf));
 		if (n < 0)
 			err = errno;
+
+		/* The mount must serve: the daemon of the dump keeps answering
+		 * on the connection the restore hands over to it. Read a
+		 * file of it and write one through it (the write reaches the
+		 * backing dir, which the launcher can see). */
+		snprintf(mpath, sizeof(mpath), "%s/hostname", mnt);
+		mfd = open(mpath, O_RDONLY);
+		if (mfd >= 0) {
+			if (read(mfd, hb, sizeof(hb) - 1) > 0)
+				ok = !strncmp(hb, "testhost", 8);
+			close(mfd);
+		}
+		snprintf(mpath, sizeof(mpath), "%s/probe", mnt);
+		mfd = open(mpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (mfd >= 0) {
+			dprintf(mfd, "tick %lu\n", n_ok);
+			close(mfd);
+		}
 
 		cfd = open(counter, O_WRONLY | O_APPEND | O_CREAT, 0644);
 		CHECK(cfd);
@@ -326,6 +361,12 @@ static void helper(const char *hostfile)
 		CHECK(cfd);
 		dprintf(cfd, "%d\n", err);
 		close(cfd);
+
+		snprintf(mpath, sizeof(mpath), "%s.mnt", fdstatus);
+		msfd = open(mpath, O_WRONLY | O_TRUNC | O_CREAT, 0644);
+		CHECK(msfd);
+		dprintf(msfd, "%s\n", ok ? "ok" : "err");
+		close(msfd);
 
 		sleep(1);
 	}

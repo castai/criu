@@ -127,7 +127,26 @@ FDERR=$(cat "$FDSTATUS" 2>/dev/null)
 	echo "FAIL: the fuse fd is $FDERR, not EBADF (9)"
 	exit 1
 }
-echo "restore ok: counter $N1 -> $N2, fuse fd EBADF"
+# The mount is functional: the daemon of the dump serves it on the
+# connection the restore handed over to it -- the helper inside the
+# tree reads a file of it and writes one through it, and reports to the
+# side channel. The write reaches the backing dir, which is ours.
+MNTSTATUS="$FDSTATUS.mnt"
+for i in $(seq 1 60); do
+	[ "$(cat "$MNTSTATUS" 2>/dev/null)" = "ok" ] && break
+	sleep 1
+done
+[ "$(cat "$MNTSTATUS" 2>/dev/null)" = "ok" ] || {
+	echo "FAIL: the fuse mount does not serve ($(cat "$MNTSTATUS" 2>/dev/null))"
+	exit 1
+}
+PROBE=$(cat "$BACK/probe" 2>/dev/null || echo none)
+case "$PROBE" in
+	tick*) ;;
+	*) echo "FAIL: the write through the fuse mount did not reach the backing ('$PROBE')"
+		exit 1 ;;
+esac
+echo "restore ok: counter $N1 -> $N2, fuse fd EBADF, mount serves ($PROBE)"
 
 kill "$(cat "$T/pid" 2>/dev/null)" 2>/dev/null
 echo PASS

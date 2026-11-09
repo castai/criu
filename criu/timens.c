@@ -97,49 +97,6 @@ int prepare_timens(int id)
 	normalize_timespec(&ts);
 
 	pr_debug("timens: monotonic %" PRId64 " %ld\n", (int64_t)ts.tv_sec, ts.tv_nsec);
-	{
-		char _u[64], _p[64];
-		snprintf(_p, sizeof(_p), "/proc/self/ns/user");
-		if (readlink(_p, _u, sizeof(_u) - 1) < 0)
-			_u[0] = '\0';
-		pr_err("DIAGTIME mono img=%" PRId64 ".%ld computed=%" PRId64 ".%ld user=%s\n",
-		       (int64_t)te->monotonic->tv_sec, te->monotonic->tv_nsec, (int64_t)ts.tv_sec, ts.tv_nsec, _u);
-		{
-			int _t = open("/proc/self/timens_offsets", O_WRONLY);
-			if (_t < 0) {
-				pr_err("DIAGTIME manual open: %s\n", strerror(errno));
-			} else if (dprintf(_t, "1 0 0\n") < 0) {
-				pr_err("DIAGTIME manual write: %s\n", strerror(errno));
-			} else {
-				pr_err("DIAGTIME manual write OK\n");
-			}
-			if (_t >= 0)
-				close(_t);
-		}
-		{
-		char _p3[64], _l3[64], _n[64];
-		snprintf(_p3, sizeof(_p3), "/proc/self");
-		if (readlink(_p3, _l3, sizeof(_l3) - 1) < 0)
-			_l3[0] = '\0';
-		if (readlink("/proc/self/ns/pid", _n, sizeof(_n) - 1) < 0)
-			_n[0] = '\0';
-		pr_err("DIAGPID self=%s pidns=%s getpid=%d\n", _l3, _n, getpid());
-		}
-		/* zero via the very fd that failed */
-	{
-		char _p2[64], _l2[64];
-		int _fl;
-		snprintf(_p2, sizeof(_p2), "/proc/self/fd/%d", fd);
-		if (readlink(_p2, _l2, sizeof(_l2) - 1) < 0)
-			_l2[0] = '\0';
-		_fl = fcntl(fd, F_GETFL);
-		pr_err("DIAGTIME fd=%d fl=%o path=%s\n", fd, _fl, _l2);
-	}
-	if (dprintf(fd, "1 0 0\n") < 0)
-			pr_err("DIAGTIME samefd zero: %s\n", strerror(errno));
-		else
-			pr_err("DIAGTIME samefd zero OK\n");
-	}
 	if (dprintf(fd, "%d %" PRId64 " %ld\n", CLOCK_MONOTONIC, (int64_t)ts.tv_sec, ts.tv_nsec) < 0) {
 		pr_perror("Unable to set a monotonic clock offset");
 		goto err;

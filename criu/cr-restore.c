@@ -1293,9 +1293,6 @@ static inline int fork_with_pid(struct pstree_item *item)
 	pr_info("Forking task with %d pid (flags 0x%lx)\n", pid, ca.clone_flags);
 
 	if (nested_ns_enabled() && item->parent == root_item)
-		pr_err("DIAGCHILD vpid %d: state %d, pgid %d, sid %d, own %d, flags %lx, pidns %u (parent %u)\n",
-		       pid, item->pid->state, item->pgid, item->sid, item->own_ns_pid, ca.clone_flags,
-		       item->ids ? item->ids->pid_ns_id : 0, root_item->ids ? root_item->ids->pid_ns_id : 0);
 
 	pid_not_set = nested_ns_pid_can_not_be_set(item);
 	if (pid_not_set)
@@ -1395,11 +1392,6 @@ static inline int fork_with_pid(struct pstree_item *item)
 	if (ret < 0) {
 		pr_perror("Can't fork for %d", pid);
 		if (errno == EEXIST) {
-			pr_err("DIAGSETTID size %d: [%d, %d]\n", set_tid_size, set_tid_size > 0 ? set_tid[0] : -1,
-			       set_tid_size > 1 ? set_tid[1] : -1);
-			pr_err("DIAGFORK pid %d: clone_flags %lx, own_ns_pid %d, parent %d, state %d, pgid %d, sid %d\n",
-			       pid, ca.clone_flags, current->own_ns_pid,
-			       current->parent ? vpid(current->parent) : -1, item->pid->state, item->pgid, item->sid);
 			set_cr_errno(EEXIST);
 		}
 		goto err_unlock;
@@ -1662,7 +1654,6 @@ static int mount_proc(void)
 		char _m[64];
 		if (readlink("/proc/self/ns/mnt", _m, sizeof(_m) - 1) < 0)
 			_m[0] = '\0';
-		pr_err("DIAGMOUNTPROC root_ns_mask=%lx mnt=%s\n", root_ns_mask, _m);
 	}
 
 	return ret;

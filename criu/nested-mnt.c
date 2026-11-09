@@ -799,6 +799,19 @@ int nested_ns_child_mntns(struct pstree_item *item)
 			else
 				restore_tmpfs_content(mi);
 			break;
+		case FSTYPE__FUSE:
+			/* A live connection of the mount is created and handed
+		 * over to the daemon of the dump (see the
+		 * fuse_connection_mount of filesystems.c), a stand-in
+		 * tmpfs keeps the mount tree of the restore happy
+		 * otherwise. */
+			if (fuse_connection_mount(mi, mi->ns_mountpoint)) {
+				pr_warn("The fuse mount at %s of the nested mntns %d is not restored\n",
+					mi->ns_mountpoint, nsid->id);
+				if (mount("none", mi->ns_mountpoint, "tmpfs", 0, "") < 0)
+					pr_warn("Can't mount a tmpfs at %s either\n", mi->ns_mountpoint);
+			}
+			break;
 		default:
 			/*
 			 * The other mounts of the inner container are not

@@ -1,7 +1,10 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <sys/mount.h>
 
 #include "common/config.h"
@@ -18,6 +21,7 @@
 #include "protobuf.h"
 #include "autofs.h"
 #include "util.h"
+#include "fdstore.h"
 #include "fs-magic.h"
 #include "tty.h"
 
@@ -757,9 +761,206 @@ static int overlay_mount(struct mount_info *mi, const char *src, const char *fst
 	return -1;
 }
 
+#include <linux/fuse.h>
+
+/*
+ * The connection of a fuse mount of a nested tree is created by the
+ * restore, and the fd of it is handed over to the daemon of the mount
+ * (a task of the dump itself): the stub below answers the FUSE_INIT of
+ * the kernel on it, the daemon continues its read loop with the state
+ * of it restored -- no api of the kernel for the replacement of a
+ * daemon is needed, the nodeids of the restored daemon re-resolve
+ * through the fresh lookups of it.
+ */
+static int fuse_connection_init(int fd)
+{
+	struct {
+		struct fuse_in_header in;
+		struct fuse_init_in ia;
+	} *req;
+	struct {
+		struct fuse_out_header out;
+		struct fuse_init_out io;
+	} rep;
+	char *buf;
+	int n;
+
+	/* The kernel rejects a read of a smaller size than the one of
+	 * a request of a daemon (EINVAL): read with the buffer of
+	 * one. */
+	buf = xmalloc(128 * 1024);
+	if (!buf)
+		return -1;
+
+	n = read(fd, buf, 128 * 1024);
+	if (n < (int)sizeof(*req)) {
+		pr_perror("Can't read the fuse init request");
+		xfree(buf);
+		return -1;
+	}
+	req = (void *)buf;
+	if (req->in.opcode != FUSE_INIT) {
+		pr_err("The first request of a fuse connection is not the init one (%u)\n", req->in.opcode);
+		xfree(buf);
+		return -1;
+	}
+
+	memset(&rep, 0, sizeof(rep));
+	rep.out.len = sizeof(rep);
+	rep.out.unique = req->in.unique;
+	rep.io.major = FUSE_KERNEL_VERSION;
+	/* The kernel takes the lower one: report ours if it is older */
+	rep.io.minor = req->ia.minor < FUSE_KERNEL_MINOR_VERSION ? req->ia.minor : FUSE_KERNEL_MINOR_VERSION;
+	rep.io.max_readahead = req->ia.max_readahead;
+	/* The flags of the transport only: the daemon of the dump keeps
+	 * serving with the ops of the session of it. */
+	rep.io.flags = FUSE_ASYNC_READ | FUSE_BIG_WRITES | FUSE_SPLICE_READ | FUSE_SPLICE_WRITE | FUSE_SPLICE_MOVE;
+	rep.io.max_background = 12;
+	rep.io.congestion_threshold = 24;
+	rep.io.max_write = 1 << 20;
+	rep.io.time_gran = 1;
+	xfree(buf);
+
+	if (write(fd, &rep, sizeof(rep)) != (int)sizeof(rep)) {
+		pr_perror("Can't write the fuse init reply");
+		return -1;
+	}
+	pr_info("The fuse connection %d is initialized\n", fd);
+	return 0;
+}
+
+/*
+ * The data of a fuse mount at the restore: the kernel does not report
+ * the fd and the rootmode of the original one in the mountinfo of it
+ * (they are the internal options of it), so they are made anew.
+ */
+static char *fuse_options_new(const char *options, int nfd)
+{
+	char *new;
+
+	if (asprintf(&new, "fd=%d,rootmode=40000%s%s", nfd, options[0] ? "," : "", options) < 0)
+		return NULL;
+	return new;
+}
+
+int fuse_wait_connection(int mnt_id)
+{
+	char key[32];
+	int fd, moved, i;
+
+	snprintf(key, sizeof(key), "fuse-conn/mnt/%d", mnt_id);
+	for (i = 0; i < 300; i++) {
+		fd = fdstore_get_key(key);
+		if (fd >= 0) {
+			/* The fd of it can be a low one (the one of the
+			 * fdstore of the task assembling the mount): move
+			 * it out of the way of the ones the task of the
+			 * daemon restores (stdin & co). */
+			moved = fcntl(fd, F_DUPFD, 100);
+			if (moved >= 0) {
+				close(fd);
+				return moved;
+			}
+			return fd;
+		}
+		usleep(100000);
+	}
+
+	pr_err("The fuse connection of the mount %d did not appear\n", mnt_id);
+	return -1;
+}
+
+static int fuse_connection_publish(int fd, int mnt_id)
+{
+	char key[32];
+	int ret;
+
+	if (fuse_connection_init(fd))
+		return -1;
+
+	snprintf(key, sizeof(key), "fuse-conn/mnt/%d", mnt_id);
+	ret = fdstore_add_key(key, fd);
+	/* The fdstore holds the connection now: the task assembling the
+	 * mount must not keep the fd of it -- the ones forked after it
+	 * inherit it, and a low one of it blocks the restore of their
+	 * own low fds (stdin & co). */
+	close(fd);
+	if (ret < 0) {
+		pr_err("Can't publish the fuse connection of the mount %d\n", mnt_id);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Mount a fuse fs of a nested tree with a live connection: the fd of
+ * it is handed over to the daemon of the dump (published under the id
+ * of the mount). Returns 0 on the live connection, -1 on a failure of
+ * it (the caller mounts a stand-in).
+ */
+int fuse_connection_mount(struct mount_info *mi, const char *mountpoint)
+{
+	char *opts;
+	int err, fd, n_fuse = 0;
+
+	/* Only a tree with the one fuse mount of it has the daemon of
+	 * it paired with the fd of the connection at the dump (see
+	 * dump_one_reg_file: the kernel does not name the connection
+	 * of an fd, so the daemon of a mount of many can not be
+	 * found). A live connection of an unpaired mount would never
+	 * be served by a daemon: the requests of the ones touching it
+	 * during the later steps of the restore (the bind sources
+	 * opened by their /proc/self/fd paths, e.g.) would hang the
+	 * whole assembly -- such a mount is a stand-in one like
+	 * before. */
+	for (struct mount_info *it = mntinfo; it; it = it->next) {
+		if (it->fstype->code == FSTYPE__FUSE)
+			n_fuse++;
+	}
+	if (n_fuse != 1)
+		return -1;
+
+	fd = open("/dev/fuse", O_RDWR);
+	if (fd < 0)
+		return -1;
+
+	opts = fuse_options_new(mi->options, fd);
+	if (!opts)
+		goto err_close;
+
+	if (mount("fuse", mountpoint, "fuse", mi->sb_flags & ~MS_PROPAGATE, opts))
+		goto err_close;
+
+	if (fuse_connection_publish(fd, mi->mnt_id)) {
+		/* The publish failed: it closed the fd already, but the
+		 * mount of the connection is up -- umount it before the
+		 * caller mounts the stand-in one. */
+		free(opts);
+		if (umount2(mountpoint, MNT_DETACH))
+			pr_warn("Can't umount the connection-less fuse mount at %s\n", mountpoint);
+		return -1;
+	}
+
+	pr_info("The fuse mount at %s is restored with a live connection\n", mountpoint);
+	free(opts);
+	return 0;
+
+err_close:
+	err = errno;
+	close(fd);
+	free(opts);
+	errno = err;
+	return -1;
+}
+
 static int fuse_mount(struct mount_info *mi, const char *src, const char *fstype, unsigned long flags)
 {
 	if (nested_ns_enabled()) {
+		if (!fuse_connection_mount(mi, service_mountpoint(mi))) {
+			fuse_standin_subtree(mi, service_mountpoint(mi));
+			return 0;
+		}
+
 		/*
 		 * A stand-in tmpfs: the mount tree of the restore
 		 * expects a mount at the plain mountpoint of every

@@ -21,6 +21,10 @@ struct fstype {
 
 extern struct fstype *fstype_auto(void);
 
+/* Mount a fuse fs of a nested tree with a live connection, handed over
+ * to the daemon of the dump (filesystems.c). */
+int fuse_connection_mount(struct mount_info *mi, const char *mountpoint);
+
 /* callback for AUFS support */
 extern int aufs_parse(struct mount_info *mi);
 

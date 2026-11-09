@@ -601,6 +601,17 @@ static const struct fdtype_ops *get_misc_dev_ops(int minor)
 		return &tunfile_dump_ops;
 	case AUTOFS_MINOR:
 		return &regfile_dump_ops;
+	case FUSE_DEV_MINOR:
+		/*
+		 * The fd of a connection of a fuse mount of a nested tree:
+		 * it is dumped as a regular file one (the name of it is the
+		 * /dev/fuse path), and the restore hands the new connection
+		 * of the mount over to the daemon holding it (see the
+		 * fuse_mount of filesystems.c).
+		 */
+		if (nested_ns_enabled())
+			return &regfile_dump_ops;
+		break;
 	};
 
 	return NULL;
@@ -700,8 +711,6 @@ static int __dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opt
 		 * namespace was entered, or on a mount unmounted since). */
 		if (mi && !mnt_id_in_proc(pid->real, p.mnt_id, NULL, 0))
 			mi = NULL;
-		pr_err("DIAG8 fd %d of %d: mnt %d mi %p inproc %d\n", fd, pid->real, p.mnt_id, (void *)mi,
-		       (int)mnt_id_in_proc(pid->real, p.mnt_id, NULL, 0));
 		if (mi == NULL) {
 			pr_warn("fd %d of %d is on a mount not taken into the image, it is closed on restore\n", fd,
 				pid->real);
@@ -904,10 +913,6 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, s
 		}
 		if (fd_on_fuse_mount(item->pid->real, dfds->fds[i])) {
 			pr_warn("fd %d of %d on a fuse mount is closed on restore\n", dfds->fds[i], item->pid->real);
-			continue;
-		}
-		if (nested_ns_enabled() && fd_is_fuse_dev(item->pid->real, dfds->fds[i])) {
-			pr_warn("fd %d of %d on /dev/fuse is closed on restore\n", dfds->fds[i], item->pid->real);
 			continue;
 		}
 		dfds->fds[off++] = dfds->fds[i];

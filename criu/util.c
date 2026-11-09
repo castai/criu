@@ -419,7 +419,6 @@ inline int open_pid_proc(pid_t pid)
 		snprintf(_p, sizeof(_p), "/proc/self/fd/%d", dfd);
 		if (readlink(_p, _lnk, sizeof(_lnk) - 1) < 0)
 			_lnk[0] = '\0';
-		pr_err("DIAGPROC %s: dfd=%d (-> %s), cwd-proc has it: %d\n", path, dfd, _lnk, _alt);
 		if (_alt >= 0)
 			close(_alt);
 		if (_root >= 0)

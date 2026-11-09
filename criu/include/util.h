@@ -132,6 +132,9 @@ extern int do_open_proc(pid_t pid, int flags, const char *fmt, ...) __attribute_
 
 #define DEVZERO (makedev(1, 5))
 
+/* The minor of the /dev/fuse on the misc device. */
+#define FUSE_DEV_MINOR 229
+
 #define KDEV_MINORBITS 20
 #define KDEV_MINORMASK ((1UL << KDEV_MINORBITS) - 1)
 #define MKKDEV(ma, mi) (((ma) << KDEV_MINORBITS) | (mi))

@@ -22,6 +22,24 @@ static struct fdstore_desc {
 	int next_id;
 	mutex_t lock; /* to protect a peek offset */
 } *desc;
+
+/*
+ * The keyed storage: the ids of it are positional, which can not name
+ * a connection two tasks of a restore agree on -- the keys of the fuse
+ * connections of the nested trees are published by the task assembling
+ * the mount of one and fetched by the task restoring the daemon of it,
+ * which are forked independently (see fuse_mount of filesystems.c).
+ */
+#define FDSTORE_KEYS_MAX 32
+struct fdstore_keyed {
+	char key[64];
+	int id;
+	bool used;
+};
+static struct fdstore_keys {
+	struct fdstore_keyed keys[FDSTORE_KEYS_MAX];
+	mutex_t lock;
+} *keys;
 /* clang-format on */
 
 int fdstore_init(void)
@@ -39,6 +57,12 @@ int fdstore_init(void)
 
 	desc->next_id = 0;
 	mutex_init(&desc->lock);
+
+	keys = shmalloc(sizeof(*keys));
+	if (!keys)
+		return -1;
+	memset(keys, 0, sizeof(*keys));
+	mutex_init(&keys->lock);
 
 	sk = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
 	if (sk < 0) {
@@ -145,4 +169,53 @@ int fdstore_get(int id)
 	mutex_unlock(&desc->lock);
 
 	return fd;
+}
+
+int fdstore_add_key(const char *key, int fd)
+{
+	int id, i;
+
+	id = fdstore_add(fd);
+	if (id < 0)
+		return -1;
+
+	mutex_lock(&keys->lock);
+	for (i = 0; i < FDSTORE_KEYS_MAX; i++) {
+		if (keys->keys[i].used)
+			continue;
+		keys->keys[i].used = true;
+		if (snprintf(keys->keys[i].key, sizeof(keys->keys[i].key), "%s", key) >=
+		    (int)sizeof(keys->keys[i].key)) {
+			keys->keys[i].used = false;
+			mutex_unlock(&keys->lock);
+			pr_err("The fdstore key %s is too long\n", key);
+			return -1;
+		}
+		keys->keys[i].id = id;
+		mutex_unlock(&keys->lock);
+		return id;
+	}
+	mutex_unlock(&keys->lock);
+
+	pr_err("The fdstore key table is full\n");
+	return -1;
+}
+
+int fdstore_get_key(const char *key)
+{
+	int i, id = -1;
+
+	mutex_lock(&keys->lock);
+	for (i = 0; i < FDSTORE_KEYS_MAX; i++) {
+		if (keys->keys[i].used && !strcmp(keys->keys[i].key, key)) {
+			id = keys->keys[i].id;
+			break;
+		}
+	}
+	mutex_unlock(&keys->lock);
+
+	if (id < 0)
+		return -1;
+
+	return fdstore_get(id);
 }

@@ -189,6 +189,11 @@ extern int shared_fdt_prepare(struct pstree_item *item);
 
 extern struct collect_image_info ext_file_cinfo;
 bool fd_on_fuse_mount(int pid, int fd);
+
+/* The connection of a fuse mount of a nested tree, once the task
+ * assembling the mount has published it (see the fuse_mount of
+ * filesystems.c). Waits for it for a while. */
+int fuse_wait_connection(int orig_fd);
 bool fd_on_substituted_mount(int pid, int fd);
 bool fd_is_fuse_dev(int pid, int fd);
 
