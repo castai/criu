@@ -1826,7 +1826,7 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 	 * the one of the file can name an other mount now. The files of
 	 * an overlay report the device of the layer, not of the mount:
 	 * those are trusted by the id alone. */
-	if (mi && mi->fstype->code != FSTYPE__OVERLAYFS && mi->s_dev != p->stat.st_dev)
+	if (mi && mi->fstype->code != FSTYPE__OVERLAYFS && !sdev_matches_stat(mi->s_dev, p->stat.st_dev))
 		mi = NULL;
 	if (mi == NULL) {
 		struct statfs fs;

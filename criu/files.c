@@ -693,7 +693,7 @@ static int __dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opt
 		 * dump: the one of the fd can name an other mount now. The
 		 * files of an overlay report the device of the layer, not
 		 * of the mount: those are trusted by the id alone. */
-		if (mi && mi->fstype->code != FSTYPE__OVERLAYFS && mi->s_dev != p.stat.st_dev)
+		if (mi && mi->fstype->code != FSTYPE__OVERLAYFS && !sdev_matches_stat(mi->s_dev, p.stat.st_dev))
 			mi = NULL;
 		/* The mount of the fd is not in the mountinfo of its own
 		 * task: it is gone (the fd was opened before the mount
