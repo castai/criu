@@ -1,7 +1,10 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <sys/mount.h>
 
 #include "common/config.h"
@@ -10,6 +13,7 @@
 #include "xmalloc.h"
 #include "cr_options.h"
 #include "filesystems.h"
+#include "nested-ns.h"
 #include "namespaces.h"
 #include "mount.h"
 #include "pstree.h"
@@ -17,6 +21,7 @@
 #include "protobuf.h"
 #include "autofs.h"
 #include "util.h"
+#include "fdstore.h"
 #include "fs-magic.h"
 #include "tty.h"
 
@@ -416,11 +421,24 @@ static int tmpfs_dump(struct mount_info *pm)
 	if (root_ns_mask & CLONE_NEWUSER)
 		userns_pid = root_item->pid->real;
 
-	ret = cr_system_userns(fd, img_raw_fd(img), -1, "tar",
-			       (char *[]){ "tar", "--create", "--gzip", "--no-unquote", "--no-wildcards",
-					   "--one-file-system", "--check-links", "--preserve-permissions", "--sparse",
-					   "--numeric-owner", "--directory", "/proc/self/fd/0", ".", NULL },
-			       0, userns_pid);
+	if (nested_ns_tmpfs_plain(pm))
+		/*
+		 * The tmpfs content of a nested user namespace is extracted
+		 * by the task living in it, where only a busybox tar may be
+		 * available: the gzip compression and the GNU sparse format
+		 * are not used for it.
+		 */
+		ret = cr_system_userns(fd, img_raw_fd(img), -1, "tar",
+				       (char *[]){ "tar", "--create", "--no-unquote", "--no-wildcards",
+						   "--one-file-system", "--check-links", "--preserve-permissions",
+						   "--numeric-owner", "--directory", "/proc/self/fd/0", ".", NULL },
+				       0, userns_pid);
+	else
+		ret = cr_system_userns(fd, img_raw_fd(img), -1, "tar",
+				       (char *[]){ "tar", "--create", "--gzip", "--no-unquote", "--no-wildcards",
+						   "--one-file-system", "--check-links", "--preserve-permissions", "--sparse",
+						   "--numeric-owner", "--directory", "/proc/self/fd/0", ".", NULL },
+				       0, userns_pid);
 
 	if (ret)
 		pr_err("Can't dump tmpfs content\n");
@@ -450,10 +468,17 @@ static int tmpfs_restore(struct mount_info *pm)
 		return -1;
 	}
 
-	ret = cr_system(img_raw_fd(img), -1, -1, "tar",
-			(char *[]){ "tar", "--extract", "--gzip", "--no-unquote", "--no-wildcards", "--directory",
-				    service_mountpoint(pm), NULL },
-			0);
+	/* See tmpfs_dump: the archives of the nested ones are not compressed. */
+	if (tmpfs_img_is_gzip(img) == 0)
+		ret = cr_system(img_raw_fd(img), -1, -1, "tar",
+				(char *[]){ "tar", "--extract", "--no-unquote", "--no-wildcards", "--directory",
+					    service_mountpoint(pm), NULL },
+				0);
+	else
+		ret = cr_system(img_raw_fd(img), -1, -1, "tar",
+				(char *[]){ "tar", "--extract", "--gzip", "--no-unquote", "--no-wildcards", "--directory",
+					    service_mountpoint(pm), NULL },
+				0);
 	close_image(img);
 
 	if (ret) {
@@ -664,6 +689,298 @@ static int always_fail(struct mount_info *pm)
 	return -1;
 }
 
+/*
+ * The fuse mounts of the mount namespaces owned by a nested user
+ * namespace (the sysboxfs ones of the inner container of an envbox
+ * workspace) are not restored: the dump takes them into the image
+ * and the nested restore skips them.
+ */
+static int fuse_dump(struct mount_info *pm)
+{
+	if (nested_ns_enabled())
+		return 0;
+
+	return always_fail(pm);
+}
+
+/*
+ * A fuse mount of a dump of a nested tree is never restored: the
+ * server of it is a part of the dump itself, and no fuse connection
+ * survives it (there is no api for the replacement of a daemon of
+ * a mount).
+ */
+static int fuse_restore(struct mount_info *pm)
+{
+	if (nested_ns_enabled()) {
+		pr_warn("The fuse mount at %s is not restored\n", pm->ns_mountpoint);
+		return 0;
+	}
+
+	return always_fail(pm);
+}
+
+/*
+ * The mountpoints of the submounts of a stand-in one: the tree of
+ * the restore expects them to exist in the filesystem of their
+ * parent (the is_dir detection of a mount stats its mountpoint in
+ * the plain one of its parent).
+ */
+static void fuse_standin_subtree(struct mount_info *mi, const char *plain)
+{
+	struct mount_info *c;
+	char path[PATH_MAX];
+
+	list_for_each_entry(c, &mi->children, siblings) {
+		const char *rel = get_relative_path(c->ns_mountpoint, mi->ns_mountpoint);
+
+		if (!rel || !rel[0] || snprintf(path, sizeof(path), "%s/%s", plain, rel) >= (int)sizeof(path))
+			continue;
+		mkdir(path, 0755);
+		fuse_standin_subtree(c, path);
+	}
+}
+
+/*
+ * The rootfs overlays of the inner containers of an envbox workspace
+ * (the ones sysbox-runc mounts in the outer container namespace) are
+ * backed by the runtime directories of the latter, which do not exist
+ * on the destination node: such a mount is restored as a stand-in
+ * tmpfs too.
+ */
+static int overlay_mount(struct mount_info *mi, const char *src, const char *fstype, unsigned long flags)
+{
+	if (nested_ns_enabled()) {
+		pr_warn("The overlay mount at %s is restored as a tmpfs\n", mi->ns_mountpoint);
+		mkdir(service_mountpoint(mi), 0755);
+		if (mount("none", service_mountpoint(mi), "tmpfs", 0, "") < 0)
+			pr_warn("Can't mount a tmpfs at %s either\n", mi->ns_mountpoint);
+		fuse_standin_subtree(mi, service_mountpoint(mi));
+		return 0;
+	}
+
+	return -1;
+}
+
+#include <linux/fuse.h>
+
+/*
+ * The connection of a fuse mount of a nested tree is created by the
+ * restore, and the fd of it is handed over to the daemon of the mount
+ * (a task of the dump itself): the stub below answers the FUSE_INIT of
+ * the kernel on it, the daemon continues its read loop with the state
+ * of it restored -- no api of the kernel for the replacement of a
+ * daemon is needed, the nodeids of the restored daemon re-resolve
+ * through the fresh lookups of it.
+ */
+static int fuse_connection_init(int fd)
+{
+	struct {
+		struct fuse_in_header in;
+		struct fuse_init_in ia;
+	} *req;
+	struct {
+		struct fuse_out_header out;
+		struct fuse_init_out io;
+	} rep;
+	char *buf;
+	int n;
+
+	/* The kernel rejects a read of a smaller size than the one of
+	 * a request of a daemon (EINVAL): read with the buffer of
+	 * one. */
+	buf = xmalloc(128 * 1024);
+	if (!buf)
+		return -1;
+
+	n = read(fd, buf, 128 * 1024);
+	if (n < (int)sizeof(*req)) {
+		pr_perror("Can't read the fuse init request");
+		xfree(buf);
+		return -1;
+	}
+	req = (void *)buf;
+	if (req->in.opcode != FUSE_INIT) {
+		pr_err("The first request of a fuse connection is not the init one (%u)\n", req->in.opcode);
+		xfree(buf);
+		return -1;
+	}
+
+	memset(&rep, 0, sizeof(rep));
+	rep.out.len = sizeof(rep);
+	rep.out.unique = req->in.unique;
+	rep.io.major = FUSE_KERNEL_VERSION;
+	/* The kernel takes the lower one: report ours if it is older */
+	rep.io.minor = req->ia.minor < FUSE_KERNEL_MINOR_VERSION ? req->ia.minor : FUSE_KERNEL_MINOR_VERSION;
+	rep.io.max_readahead = req->ia.max_readahead;
+	/* The flags of the transport only: the daemon of the dump keeps
+	 * serving with the ops of the session of it. */
+	rep.io.flags = FUSE_ASYNC_READ | FUSE_BIG_WRITES | FUSE_SPLICE_READ | FUSE_SPLICE_WRITE | FUSE_SPLICE_MOVE;
+	rep.io.max_background = 12;
+	rep.io.congestion_threshold = 24;
+	rep.io.max_write = 1 << 20;
+	rep.io.time_gran = 1;
+	xfree(buf);
+
+	if (write(fd, &rep, sizeof(rep)) != (int)sizeof(rep)) {
+		pr_perror("Can't write the fuse init reply");
+		return -1;
+	}
+	pr_info("The fuse connection %d is initialized\n", fd);
+	return 0;
+}
+
+/*
+ * The data of a fuse mount at the restore: the kernel does not report
+ * the fd and the rootmode of the original one in the mountinfo of it
+ * (they are the internal options of it), so they are made anew.
+ */
+static char *fuse_options_new(const char *options, int nfd)
+{
+	char *new;
+
+	if (asprintf(&new, "fd=%d,rootmode=40000%s%s", nfd, options[0] ? "," : "", options) < 0)
+		return NULL;
+	return new;
+}
+
+int fuse_wait_connection(int mnt_id)
+{
+	char key[32];
+	int fd, moved, i;
+
+	snprintf(key, sizeof(key), "fuse-conn/mnt/%d", mnt_id);
+	for (i = 0; i < 300; i++) {
+		fd = fdstore_get_key(key);
+		if (fd >= 0) {
+			/* The fd of it can be a low one (the one of the
+			 * fdstore of the task assembling the mount): move
+			 * it out of the way of the ones the task of the
+			 * daemon restores (stdin & co). */
+			moved = fcntl(fd, F_DUPFD, 100);
+			if (moved >= 0) {
+				close(fd);
+				return moved;
+			}
+			return fd;
+		}
+		usleep(100000);
+	}
+
+	pr_err("The fuse connection of the mount %d did not appear\n", mnt_id);
+	return -1;
+}
+
+static int fuse_connection_publish(int fd, int mnt_id)
+{
+	char key[32];
+	int ret;
+
+	if (fuse_connection_init(fd))
+		return -1;
+
+	snprintf(key, sizeof(key), "fuse-conn/mnt/%d", mnt_id);
+	ret = fdstore_add_key(key, fd);
+	/* The fdstore holds the connection now: the task assembling the
+	 * mount must not keep the fd of it -- the ones forked after it
+	 * inherit it, and a low one of it blocks the restore of their
+	 * own low fds (stdin & co). */
+	close(fd);
+	if (ret < 0) {
+		pr_err("Can't publish the fuse connection of the mount %d\n", mnt_id);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Mount a fuse fs of a nested tree with a live connection: the fd of
+ * it is handed over to the daemon of the dump (published under the id
+ * of the mount). Returns 0 on the live connection, -1 on a failure of
+ * it (the caller mounts a stand-in).
+ */
+int fuse_connection_mount(struct mount_info *mi, const char *mountpoint)
+{
+	char *opts;
+	int err, fd, n_fuse = 0;
+
+	/* Only a tree with the one fuse mount of it has the daemon of
+	 * it paired with the fd of the connection at the dump (see
+	 * dump_one_reg_file: the kernel does not name the connection
+	 * of an fd, so the daemon of a mount of many can not be
+	 * found). A live connection of an unpaired mount would never
+	 * be served by a daemon: the requests of the ones touching it
+	 * during the later steps of the restore (the bind sources
+	 * opened by their /proc/self/fd paths, e.g.) would hang the
+	 * whole assembly -- such a mount is a stand-in one like
+	 * before. */
+	for (struct mount_info *it = mntinfo; it; it = it->next) {
+		if (it->fstype->code == FSTYPE__FUSE)
+			n_fuse++;
+	}
+	if (n_fuse != 1)
+		return -1;
+
+	fd = open("/dev/fuse", O_RDWR);
+	if (fd < 0)
+		return -1;
+
+	opts = fuse_options_new(mi->options, fd);
+	if (!opts)
+		goto err_close;
+
+	if (mount("fuse", mountpoint, "fuse", mi->sb_flags & ~MS_PROPAGATE, opts))
+		goto err_close;
+
+	if (fuse_connection_publish(fd, mi->mnt_id)) {
+		/* The publish failed: it closed the fd already, but the
+		 * mount of the connection is up -- umount it before the
+		 * caller mounts the stand-in one. */
+		free(opts);
+		if (umount2(mountpoint, MNT_DETACH))
+			pr_warn("Can't umount the connection-less fuse mount at %s\n", mountpoint);
+		return -1;
+	}
+
+	pr_info("The fuse mount at %s is restored with a live connection\n", mountpoint);
+	free(opts);
+	return 0;
+
+err_close:
+	err = errno;
+	close(fd);
+	free(opts);
+	errno = err;
+	return -1;
+}
+
+static int fuse_mount(struct mount_info *mi, const char *src, const char *fstype, unsigned long flags)
+{
+	if (nested_ns_enabled()) {
+		if (!fuse_connection_mount(mi, service_mountpoint(mi))) {
+			fuse_standin_subtree(mi, service_mountpoint(mi));
+			return 0;
+		}
+
+		/*
+		 * A stand-in tmpfs: the mount tree of the restore
+		 * expects a mount at the plain mountpoint of every
+		 * entry (the propagation one is set on it), and a
+		 * placeholder filesystem is as good as none for a
+		 * server which is not restored. The mountpoints of
+		 * the submounts of it are created inside.
+		 */
+		pr_warn("The fuse mount at %s is restored as a tmpfs\n", mi->ns_mountpoint);
+		mkdir(service_mountpoint(mi), 0755);
+		if (mount("none", service_mountpoint(mi), "tmpfs", 0, "") < 0)
+			pr_warn("Can't mount a tmpfs at %s either\n", mi->ns_mountpoint);
+		fuse_standin_subtree(mi, service_mountpoint(mi));
+		return 0;
+	}
+
+	pr_err("Can't mount the fuse filesystem of %s\n", mi->ns_mountpoint);
+	return -1;
+}
+
 static struct fstype fstypes[] = {
 	{
 		.name = "unsupported",
@@ -766,13 +1083,15 @@ static struct fstype fstypes[] = {
 	{
 		.name = "fuse",
 		.code = FSTYPE__FUSE,
-		.dump = always_fail,
-		.restore = always_fail,
+		.dump = fuse_dump,
+		.mount = fuse_mount,
+		.restore = fuse_restore,
 	},
 	{
 		.name = "overlay",
 		.code = FSTYPE__OVERLAYFS,
 		.parse = overlayfs_parse,
+		.mount = overlay_mount,
 	},
 	{
 		.name = "autofs",

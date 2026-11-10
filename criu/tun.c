@@ -308,7 +308,7 @@ static int dump_tunfile(int lfd, u32 id, const struct fd_parms *p)
 	}
 
 	if (kdat.tun_ns) {
-		ns = get_socket_ns(lfd);
+		ns = get_socket_ns(lfd, p->pid);
 		if (!ns) {
 			pr_err("No net_ns for tun device\n");
 			return -1;

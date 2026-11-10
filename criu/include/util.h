@@ -132,6 +132,9 @@ extern int do_open_proc(pid_t pid, int flags, const char *fmt, ...) __attribute_
 
 #define DEVZERO (makedev(1, 5))
 
+/* The minor of the /dev/fuse on the misc device. */
+#define FUSE_DEV_MINOR 229
+
 #define KDEV_MINORBITS 20
 #define KDEV_MINORMASK ((1UL << KDEV_MINORBITS) - 1)
 #define MKKDEV(ma, mi) (((ma) << KDEV_MINORBITS) | (mi))
@@ -157,6 +160,20 @@ static inline dev_t kdev_to_odev(u32 kdev)
 	unsigned minor = kdev_minor(kdev);
 
 	return makedev(major, minor);
+}
+
+static inline bool sdev_matches_stat(u32 s_dev, dev_t st_dev)
+{
+	/*
+	 * The device of a mount is named by the kernel in the mountinfo
+	 * of it with the kdev encoding, but the stat of the files of it
+	 * can report the very same one in the old userspace encoding
+	 * (e.g. the statx of the OrbStack kernel does): a mount with a
+	 * minor above 255 has different numbers there. Compare the one
+	 * of the mount with the stat device and with the other encoding
+	 * of it both, they are equal for one of them on any kernel.
+	 */
+	return s_dev == (u32)st_dev || s_dev == (u32)kdev_to_odev((u32)st_dev);
 }
 
 extern int copy_file(int fd_in, int fd_out, size_t bytes);

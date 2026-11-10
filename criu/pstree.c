@@ -6,9 +6,11 @@
 #include "types.h"
 #include "cr_options.h"
 #include "pstree.h"
+#include "proc_parse.h"
 #include "rst-malloc.h"
 #include "common/lock.h"
 #include "namespaces.h"
+#include "nested-ns.h"
 #include "files.h"
 #include "tty.h"
 #include "mount.h"
@@ -224,6 +226,7 @@ struct pstree_item *__alloc_pstree_item(bool rst)
 
 	item->pid->ns[0].virt = -1;
 	item->pid->real = -1;
+	item->own_ns_pid = 0;
 	item->pid->state = TASK_UNDEF;
 	item->pid->stop_signo = -1;
 	item->born_sid = -1;
@@ -320,6 +323,22 @@ int dump_pstree(struct pstree_item *root_item)
 		e.pgid = item->pgid;
 		e.sid = item->sid;
 		e.n_threads = item->nr_threads;
+
+		/*
+		 * A task living in a pid namespace nested in the one of
+		 * the root task of the dump is known by its pid in it to
+		 * its own kin: the one which has forked it, the ones it
+		 * lives with. Record it, so the restore forks it with the
+		 * pid at the level of its parent as well.
+		 */
+		{
+			pid_t own = nested_ns_dump_own_pid(item->pid->real, vpid(item));
+
+			if (own != vpid(item)) {
+				e.own_pid = own;
+				e.has_own_pid = true;
+			}
+		}
 
 		e.threads = xmalloc(sizeof(e.threads[0]) * e.n_threads);
 		if (!e.threads)
@@ -481,6 +500,9 @@ void pstree_insert_pid(struct pid *pid_node)
 
 	n = lookup_create_pid(pid_node->ns[0].virt, pid_node);
 
+	if (n != pid_node)
+		pr_err("Duplicate vpid %d (real %d) in the pid tree: the existing one is real %d\n",
+		       pid_node->ns[0].virt, pid_node->real, n->real);
 	BUG_ON(n != pid_node);
 }
 
@@ -577,6 +599,7 @@ static int read_one_pstree_item(struct cr_img *img, pid_t *pid_max)
 	pi->pid->ns[0].virt = e->pid;
 	if (e->pid > *pid_max)
 		*pid_max = e->pid;
+	pi->own_ns_pid = e->has_own_pid ? e->own_pid : e->pid;
 	pi->pgid = e->pgid;
 	if (e->pgid > *pid_max)
 		*pid_max = e->pgid;
@@ -798,8 +821,28 @@ static int prepare_pstree_ids(pid_t pid)
 			}
 
 			if (parent == NULL) {
-				pr_err("Can't find a session leader for %d\n", item->sid);
-				return -1;
+				/*
+				 * The session leader has died and been
+				 * reaped, and the member was adopted by
+				 * a subreaper deep in the tree (the way
+				 * the daemons of the inner containers
+				 * of an envbox workspace are). The
+				 * session of a dead leader can not be
+				 * restored: the member becomes a leader
+				 * of its own one -- the marks the walk
+				 * has left on the old ancestors are
+				 * cleared, they would mislead the fork
+				 * order at restore.
+				 */
+				for (parent = item->parent; parent; parent = parent->parent)
+					if (parent->born_sid == item->sid)
+						parent->born_sid = -1;
+
+				pr_warn("The session of %d is not restored: its leader is gone, it inherits the one of its parent\n",
+					vpid(item));
+				item->sid = item->parent->sid;
+				item->pgid = 0; /* the group of the forking task */
+				continue;
 			}
 
 			continue;
@@ -808,6 +851,7 @@ static int prepare_pstree_ids(pid_t pid)
 
 	/* All other helpers are session leaders for own sessions */
 	list_splice(&helpers, &root_item->children);
+
 
 	/* Add a process group leader if it is absent  */
 	for_each_pstree_item(item) {
@@ -865,6 +909,8 @@ static unsigned long get_clone_mask(TaskKobjIdsEntry *i, TaskKobjIdsEntry *p)
 		mask |= CLONE_NEWIPC;
 	if (i->uts_ns_id != p->uts_ns_id)
 		mask |= CLONE_NEWUTS;
+	if (nested_ns_enabled() && i->cgroup_ns_id != p->cgroup_ns_id)
+		mask |= CLONE_NEWCGROUP;
 	if (i->time_ns_id != p->time_ns_id)
 		mask |= CLONE_NEWTIME;
 	if (i->mnt_ns_id != p->mnt_ns_id)
@@ -930,12 +976,18 @@ static int prepare_pstree_kobj_ids(void)
 		}
 
 		rsti(item)->clone_flags = cflags;
-		if (parent)
+		if (parent && !nested_ns_skip_mntns(item))
 			/*
 			 * Mount namespaces are setns()-ed at
 			 * restore_task_mnt_ns() explicitly,
 			 * no need in creating it with its own
 			 * temporary namespace.
+			 *
+			 * A task entering a nested user namespace
+			 * with its own mount namespace is born in
+			 * a copy of the parent's one, owned by the
+			 * new user namespace, which it fills in
+			 * by itself.
 			 *
 			 * Root task is exceptional -- it will
 			 * be born in a fresh new mount namespace
@@ -945,17 +997,30 @@ static int prepare_pstree_kobj_ids(void)
 			rsti(item)->clone_flags &= ~CLONE_NEWNS;
 
 		/**
-		 * Only child reaper can clone with CLONE_NEWPID
+		 * Only child reaper can clone with CLONE_NEWPID.
+		 *
+		 * A task entering a nested user namespace with its own pid
+		 * namespace is the child reaper of the new one, even though
+		 * its vpid is not the INIT_PID of the root one. The root
+		 * task is the child reaper of its own pid namespace too:
+		 * a dump of a nested tree records it with the pid it has at
+		 * the level of the dump (a pod-level one), but the pid
+		 * namespace of its own is created by the task at restore
+		 * (a runtime restore, e.g. a runc one, enters the namespace
+		 * of the root one of the dump, not the one of the root task).
 		 */
-		if (vpid(item) != INIT_PID)
+		if (item != root_item && vpid(item) != INIT_PID &&
+		    !(nested_ns_task_nested(item) && item->parent && item->parent->ids &&
+		      item->ids->pid_ns_id != item->parent->ids->pid_ns_id))
 			rsti(item)->clone_flags &= ~CLONE_NEWPID;
 
 		cflags &= CLONE_ALLNS;
 
 		if (item == root_item) {
 			pr_info("Will restore in %lx namespaces\n", cflags);
+			if (nested_ns_enabled())
 			root_ns_mask = cflags;
-		} else if (cflags & ~(root_ns_mask & CLONE_SUBNS)) {
+		} else if ((cflags & ~(root_ns_mask & CLONE_SUBNS)) && !nested_ns_cflags_ok(cflags, item)) {
 			/*
 			 * Namespaces from CLONE_SUBNS can be nested, but in
 			 * this case nobody can't share external namespaces of
@@ -970,6 +1035,14 @@ static int prepare_pstree_kobj_ids(void)
 			return -1;
 		}
 	}
+
+	/*
+	 * Only the first task of each nested user namespace creates it at
+	 * restore: the others (the ones which have entered it at dump, e.g.
+	 * the docker exec-ed processes of an inner container) are forked
+	 * without CLONE_NEWUSER and join the created one instead.
+	 */
+	nested_ns_fixup_clone_flags();
 
 	pr_debug("NS mask to use %lx\n", root_ns_mask);
 	return 0;
@@ -1039,6 +1112,16 @@ int prepare_pstree(void)
 
 	pid = getpid();
 
+	/*
+	 * Re-parent the tasks which have entered the namespaces of an
+	 * inner container (e.g. the docker exec-ed ones) under the init
+	 * one of it, before the clone flags are derived from the parent
+	 * relationships, so they are forked from it and inherit the
+	 * namespaces instead of creating their own copies of them.
+	 */
+	if (!ret)
+		nested_ns_prepare_pstree();
+
 	if (!ret)
 		/*
 		 * Shell job may inherit sid/pgid from the current
@@ -1057,6 +1140,17 @@ int prepare_pstree(void)
 		 * pstree with properly injected helper tasks.
 		 */
 		ret = prepare_pstree_ids(pid);
+	if (!ret)
+		/*
+		 * The session helpers above stack the tasks with a dead
+		 * leader under a task of the root pid namespace: the ones
+		 * which have entered the namespaces of an inner container
+		 * (e.g. the docker exec-ed ones) are re-parented under the
+		 * init one of it again, so they are forked from it (the
+		 * clone flags of them were derived from it before the
+		 * helpers ran).
+		 */
+		nested_ns_prepare_pstree();
 	if (!ret)
 		/*
 		 * We need to alloc shared buffers for RseqEntry'es

@@ -159,6 +159,7 @@ extern void mnt_entry_free(struct mount_info *mi);
 
 extern int __mntns_get_root_fd(pid_t pid);
 extern int mntns_get_root_fd(struct ns_id *ns);
+extern int mntns_set_root_fd(pid_t pid, int fd);
 extern int mntns_get_root_by_mnt_id(int mnt_id);
 extern struct ns_id *lookup_nsid_by_mnt_id(int mnt_id);
 

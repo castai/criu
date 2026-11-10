@@ -208,6 +208,10 @@ struct cr_options {
 	int deprecated_ok;
 	int display_stats;
 	int weak_sysctls;
+	int nested_ns;			/* the nested user namespaces support:
+					 * turned on by the dump when a task
+					 * lives in a nested one, and by the
+					 * restore from the images */
 	int status_fd;
 	bool orphan_pts_master;
 	int stream;

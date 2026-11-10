@@ -1,0 +1,4 @@
+{
+    'flavor': 'uns',
+    'flags': 'suid crfail',
+}

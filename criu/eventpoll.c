@@ -1,4 +1,6 @@
 #include <unistd.h>
+
+#include "nested-ns.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -278,6 +280,26 @@ static int dump_one_eventpoll(int lfd, u32 id, const struct fd_parms *p)
 	fe->type = FD_TYPES__EVENTPOLL;
 	fe->id = e->id;
 	fe->epfd = e;
+
+	/*
+	 * The fds of the fuse mounts are closed on restore (see
+	 * dump_task_files_seized): the kernel removes the epoll
+	 * registrations of a closed fd itself, so the entries of
+	 * them are dropped from the image the same way.
+	 */
+	for (i = 0; i < e->n_tfd;) {
+		if (fd_on_substituted_mount(p->pid, e->tfd[i]->tfd) ||
+		    fd_on_fuse_mount(p->pid, e->tfd[i]->tfd) ||
+		    (nested_ns_enabled() && fd_is_fuse_dev(p->pid, e->tfd[i]->tfd))) {
+			pr_warn("eventpoll: tfd %d of %d is on a fuse mount, the registration is dropped\n",
+				e->tfd[i]->tfd, p->pid);
+			eventpoll_tfd_entry__free_unpacked(e->tfd[i], NULL);
+			memmove(&e->tfd[i], &e->tfd[i + 1], (e->n_tfd - i - 1) * sizeof(e->tfd[i]));
+			e->n_tfd--;
+			continue;
+		}
+		i++;
+	}
 
 	/*
 	 * In regular case there is no so many dup'ed

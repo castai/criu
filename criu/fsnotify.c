@@ -22,6 +22,7 @@
 #include "common/compiler.h"
 #include "imgset.h"
 #include "fsnotify.h"
+#include "nested-ns.h"
 #include "fdinfo.h"
 #include "mount.h"
 #include "filesystems.h"
@@ -227,6 +228,40 @@ int check_open_handle(unsigned int s_dev, unsigned long i_ino, FhEntry *f_handle
 {
 	char *path, *irmap_path;
 	struct mount_info *mi;
+
+	if (nested_ns_enabled()) {
+		/*
+		 * Watches on cgroupfs (e.g. the ones the inner
+		 * containerd-shims of a docker-in-docker put on their
+		 * cgroups) can not be resolved into paths: the filesystem
+		 * has no irmap-able entries, and the watched cgroups are
+		 * re-created on restore, so the handles are stale there
+		 * anyway. Dump the watch with its handle only: it is dropped
+		 * on restore, the watchers track their containers by other
+		 * means (pidfd, waitpid) as well. Watches on a fuse mount
+		 * (the sysboxfs ones of the inner container of an envbox
+		 * workspace) are the same: the mount is not restored, and
+		 * the server of it is frozen by the dump itself, so an
+		 * attempt to open or to stat the watched files would wait
+		 * for it forever.
+		 */
+		/*
+		 * The dir-restricted lookup_mnt_sdev() is for the ones
+		 * which open the mount found: a fuse mountpoint can be
+		 * unstat-able for the dumper (the server of it is
+		 * frozen), so the fstype check takes any mount of the
+		 * dev, not a dir one only.
+		 */
+		for (mi = mntinfo; mi; mi = mi->next)
+			if (mi->s_dev == s_dev)
+				break;
+		if (mi && (mi->fstype->code == FSTYPE__CGROUP || mi->fstype->code == FSTYPE__CGROUP2 ||
+			   mi->fstype->code == FSTYPE__FUSE)) {
+			pr_debug("\tHandle 0x%x:0x%lx is on cgroupfs or a fuse mount, dumping with the handle only\n",
+				 s_dev, i_ino);
+			goto out_nopath;
+		}
+	}
 
 	if (fault_injected(FI_CHECK_OPEN_HANDLE))
 		goto fault;
@@ -534,12 +569,53 @@ err:
 	return path;
 }
 
+/*
+ * The restore counterpart of the dump-side check: the fuse mounts of
+ * the nested namespaces are not assembled, but their entries stay in
+ * the mount list, so the watch is told apart by the fstype of the
+ * mount of its device. The dir-restricted lookup_mnt_sdev() is not
+ * for here: a not-assembled mount has no mountpoint to open.
+ */
+static struct mount_info *watch_mnt(unsigned int s_dev)
+{
+	struct mount_info *mi;
+
+	for (mi = mntinfo; mi; mi = mi->next)
+		if (mi->s_dev == s_dev)
+			return mi;
+	return NULL;
+}
+
+static bool stale_nested_watch(unsigned int s_dev)
+{
+	struct mount_info *mi = watch_mnt(s_dev);
+
+	return mi && (mi->fstype->code == FSTYPE__CGROUP || mi->fstype->code == FSTYPE__CGROUP2 ||
+		      mi->fstype->code == FSTYPE__FUSE);
+}
+
 static int restore_one_inotify(int inotify_fd, struct fsnotify_mark_info *info)
 {
 	InotifyWdEntry *iwe = info->iwe;
 	int ret = -1, target = -1;
 	char buf[PSFDS], *path;
 	uint32_t mask;
+
+	if (nested_ns_enabled()) {
+		/*
+		 * The watches on cgroupfs or on the fuse mounts of the
+		 * nested namespaces are dumped with their handle only
+		 * (see check_open_handle): the cgroups they were put on
+		 * are re-created on restore and the fuse mounts are not
+		 * assembled, so the handles are stale. Drop the watches,
+		 * the watchers track their containers by other means
+		 * (pidfd, waitpid) as well.
+		 */
+		if (stale_nested_watch(iwe->s_dev)) {
+			pr_warn("\tDropping the stale cgroupfs or fuse watch %#08x:%#016lx\n", iwe->s_dev, iwe->i_ino);
+			return 0;
+		}
+	}
 
 	path = get_mark_path("inotify", info->remap, iwe->f_handle, iwe->i_ino, iwe->s_dev, buf, &target);
 	if (!path)
@@ -618,6 +694,11 @@ static int restore_one_fanotify(int fd, struct fsnotify_mark_info *mark)
 		snprintf(buf, sizeof(buf), "/proc/self/fd/%d", target);
 		path = buf;
 	} else if (fme->type == MARK_TYPE__INODE) {
+		if (nested_ns_enabled() && stale_nested_watch(fme->s_dev)) {
+			pr_warn("\tDropping the stale cgroupfs or fuse mark %#08x:%#016lx\n", fme->s_dev, fme->ie->i_ino);
+			return 0;
+		}
+
 		path = get_mark_path("fanotify", mark->remap, fme->ie->f_handle, fme->ie->i_ino, fme->s_dev, buf,
 				     &target);
 		if (!path)

@@ -11,4 +11,11 @@ message uid_gid_extent {
 message userns_entry {
 	repeated uid_gid_extent uid_map	= 1;
 	repeated uid_gid_extent gid_map = 2;
+
+	// CAST AI fields
+	/* The pid (in the root task's pid namespace) of the task which has
+	 * created a nested user namespace: the one which re-creates it on
+	 * restore. The high number keeps the field from colliding with the
+	 * ones the upstream criu keeps adding to this message. */
+	optional uint32		creator_pid	= 1000;
 }

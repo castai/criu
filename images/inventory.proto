@@ -34,4 +34,10 @@ message inventory_entry {
 	// network locking rule.
 	optional string                 dump_criu_run_id        = 13;
 	optional bool			allow_uprobes	= 14;
+
+	// CAST AI fields
+	/* The images were dumped with --nested-ns: the restore needs it as
+	 * well. The high number keeps the field from colliding with the ones
+	 * the upstream criu keeps adding to this message. */
+	optional bool			nested_ns	= 1000;
 }

@@ -33,4 +33,12 @@ message reg_file_entry {
 	 * of the checksum, if it could be obtained.
 	 */
 	optional uint32 	checksum_parameter 	= 14;
+
+	/*
+	 * The fd number the daemon of a fuse mount of a nested tree held the
+	 * /dev/fuse connection of it with at the dump: the restore hands the
+	 * new connection of the mount over to the daemon (see the fuse_mount
+	 * of filesystems.c).
+	 */
+	optional uint32 	fuse_conn_mnt 		= 1001;
 }

@@ -23,6 +23,7 @@
 #include "util.h"
 #include "util-pie.h"
 #include "sockets.h"
+#include "nested-ns.h"
 #include "sk-queue.h"
 #include "sk-unix-shared.h"
 #include "mount.h"
@@ -377,6 +378,8 @@ static int dump_one_unix_fd(int lfd, uint32_t id, const struct fd_parms *p)
 	*fown = p->fown;
 
 	sk = (struct unix_sk_desc *)lookup_socket(p->stat.st_ino, PF_UNIX, 0);
+	if (IS_ERR_OR_NULL(sk) && nested_ns_enabled() && !collect_substituted_sockets(p->pid))
+		sk = (struct unix_sk_desc *)lookup_socket(p->stat.st_ino, PF_UNIX, 0);
 	if (IS_ERR_OR_NULL(sk)) {
 		pr_err("Unix socket %d not found\n", (int)p->stat.st_ino);
 		goto err;
@@ -531,10 +534,18 @@ static int dump_one_unix_fd(int lfd, uint32_t id, const struct fd_parms *p)
 			/*
 			 * There's no known way to get data out of the write
 			 * queue of an icon socket. The only good solution for
-			 * now is to fail the migration.
+			 * now is to fail the migration. A task of a nested
+			 * namespace (e.g. an inner container of a
+			 * docker-in-docker) is not reachable by its vpid, so
+			 * the connection it is served by is dropped at restore
+			 * anyway: losing the queued data is fine, as a
+			 * connection without it is.
 			 */
-			pr_err("Non-empty write queue on an in-flight socket %#x\n", ue->ino);
-			goto err;
+			if (!nested_ns_enabled()) {
+				pr_err("Non-empty write queue on an in-flight socket %#x\n", ue->ino);
+				goto err;
+			}
+			pr_warn("Non-empty write queue on an in-flight socket %#x: dropping it\n", ue->ino);
 		}
 
 		ue->peer = e->sk_desc->sd.ino;
@@ -902,11 +913,27 @@ static int __dump_external_socket(struct unix_sk_desc *sk, struct unix_sk_desc *
 		return 0;
 	}
 
+	if (nested_ns_enabled()) {
+		/*
+		 * A socket of a nested tree with a peer outside of the
+		 * dumped one (e.g. the /dev/log forwarding to the
+		 * journald of the host, which the runtime sets up for
+		 * the containers): the peer can not be restored, so the
+		 * connection is not taken into the image -- the holder
+		 * of the socket re-connects it if it needs the peer.
+		 */
+		pr_warn("The unix socket %x is dumped without its external peer %x\n", sk->sd.ino, peer->sd.ino);
+		sk->ue->peer = 0;
+		return 0;
+	}
+
 	/* Legacy -x|--ext-unix-sk option handling */
 	if (!opts.ext_unix_sk) {
 		show_one_unix("Runaway socket", peer);
-		pr_err("External socket is used. "
-		       "Consider using --" USK_EXT_PARAM " option.\n");
+		pr_err("External socket %x (type %d, name %s) with peer %x (type %d, name %s, state %x) is used. "
+		       "Consider using --" USK_EXT_PARAM " option.\n",
+		       sk->sd.ino, sk->type, sk->name ? (char *)sk->name : "none",
+		       peer->sd.ino, peer->type, peer->name ? (char *)peer->name : "none", peer->state);
 		return -1;
 	}
 
@@ -1393,6 +1420,19 @@ static int prep_unix_sk_cwd(struct unix_sk_info *ui, int *prev_cwd_fd, int *prev
 		int ns_fd;
 
 		if (mntns == NULL) {
+			/*
+			 * A socket of a mount namespace substituted at
+			 * dump: the namespace is not restored, the file
+			 * of the socket is created in the one of the
+			 * task itself (the one of its parent task after
+			 * it) instead.
+			 */
+			if (nested_ns_enabled()) {
+				pr_warn("The mount %d of the socket is not restored, binding in the current namespace\n",
+					ui->ue->mnt_id);
+				*prev_mntns_fd = -1;
+				return 0;
+			}
 			pr_err("Unable to find the %d mount\n", ui->ue->mnt_id);
 			goto err;
 		}

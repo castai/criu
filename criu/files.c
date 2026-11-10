@@ -40,6 +40,8 @@
 #include "timerfd.h"
 #include "imgset.h"
 #include "fs-magic.h"
+#include "filesystems.h"
+#include "images/mnt.pb-c.h"
 #include "fdinfo.h"
 #include "cr_options.h"
 #include "autofs.h"
@@ -48,6 +50,7 @@
 #include "string.h"
 #include "kerndat.h"
 #include "fdstore.h"
+#include "nested-ns.h"
 #include "bpfmap.h"
 #include "pidfd.h"
 
@@ -348,6 +351,156 @@ int do_dump_gen_file(struct fd_parms *p, int lfd, const struct fdtype_ops *ops, 
 	return ret;
 }
 
+/*
+ * The fuse connection lives in the kernel: no daemon of it can be
+ * revived by the restore (there is no api for the replacement of a
+ * fuse daemon). The fd of /dev/fuse of a server below a nested user
+ * namespace is closed on restore together with its mount.
+ */
+bool fd_is_fuse_dev(int pid, int fd)
+{
+	char path[64], link[PATH_MAX];
+	int n;
+
+	snprintf(path, sizeof(path), "/proc/%d/fd/%d", pid, fd);
+	n = readlink(path, link, sizeof(link) - 1);
+	if (n <= 0)
+		return false;
+	link[n] = '\0';
+	return !strcmp(link, "/dev/fuse");
+}
+
+/*
+ * The mnt_id of the fdinfo is the one of the mount namespace of
+ * the task the fd belongs to: when that namespace is substituted
+ * at dump (see substitute_ns), its mounts are dropped from the
+ * collected tree and the id is not in the mntinfo. The mountinfo
+ * of the task itself still names it and its fstype: the file is
+ * never touched on the way, only the /proc entries are read.
+ */
+static bool mnt_id_in_proc(int pid, int mnt_id, char *fstype, size_t fstype_len)
+{
+	char path[64], line[2048];
+	FILE *f;
+	bool ret = false;
+
+	snprintf(path, sizeof(path), "/proc/%d/mountinfo", pid);
+	f = fopen(path, "r");
+	if (!f)
+		return false;
+
+	while (fgets(line, sizeof(line), f)) {
+		int id = -1;
+		char fs[128], *sep;
+
+		if (sscanf(line, "%d", &id) != 1 || id != mnt_id)
+			continue;
+		sep = strstr(line, " - ");
+		if (!sep)
+			continue;
+		if (sscanf(sep + 3, "%127s", fs) == 1) {
+			ret = true;
+			if (fstype && fstype_len)
+				snprintf(fstype, fstype_len, "%s", fs);
+			break;
+		}
+	}
+
+	fclose(f);
+	return ret;
+}
+
+static bool mnt_id_is_fuse_in_proc(int pid, int mnt_id)
+{
+	char fstype[128];
+
+	return mnt_id_in_proc(pid, mnt_id, fstype, sizeof(fstype)) && !strncmp(fstype, "fuse", 4);
+}
+
+/*
+ * Whether the fd is on a mount of a namespace substituted at dump:
+ * the mount is not in the collected tree (it names nothing in the
+ * mntinfo), but the one of the task itself still carries it. Such
+ * an fd can not be restored -- the task runs in the mount namespace
+ * of its parent task after it -- so it is closed on restore, the
+ * same way as the ones of the fuse mounts.
+ */
+/*
+ * The mnt_id of the fdinfo of a bound unix socket is the one of the
+ * filesystem the socket file was bound on: for the sockets of the
+ * substituted namespaces it misses in the collected tree, but the
+ * socket itself is restorable (it is re-bound in the namespace of
+ * the task on restore, see sk-unix.c), so the fd must not be
+ * dropped by the mount-based checks.
+ */
+static bool fd_is_socket(int pid, int fd)
+{
+	char path[64], link[32];
+	int n;
+
+	snprintf(path, sizeof(path), "/proc/%d/fd/%d", pid, fd);
+	n = readlink(path, link, sizeof(link) - 1);
+	if (n <= 0)
+		return false;
+	link[n] = '\0';
+	return !strncmp(link, "socket:", 7);
+}
+
+bool fd_on_substituted_mount(int pid, int fd)
+{
+	struct fdinfo_common fdinfo = { .mnt_id = -1, .owner = 0 };
+	char path[64], line[2048];
+	FILE *f;
+	bool found = false;
+
+	if (!nested_ns_enabled() || fd_is_socket(pid, fd))
+		return false;
+
+	if (parse_fdinfo_pid(pid, fd, FD_TYPES__UND, &fdinfo))
+		return false;
+
+	if (fdinfo.mnt_id < 0)
+		return false;
+
+	if (lookup_mnt_id(fdinfo.mnt_id))
+		return false; /* the usual case: the mount is collected */
+
+	snprintf(path, sizeof(path), "/proc/%d/mountinfo", pid);
+	f = fopen(path, "r");
+	if (!f)
+		return false;
+
+	while (fgets(line, sizeof(line), f)) {
+		int id = -1;
+
+		if (sscanf(line, "%d", &id) == 1 && id == fdinfo.mnt_id) {
+			found = true;
+			break;
+		}
+	}
+
+	fclose(f);
+	return found;
+}
+
+bool fd_on_fuse_mount(int pid, int fd)
+{
+	struct fdinfo_common fdinfo = { .mnt_id = -1, .owner = 0 };
+	struct mount_info *mi;
+
+	if (fd_is_socket(pid, fd))
+		return false;
+
+	if (parse_fdinfo_pid(pid, fd, FD_TYPES__UND, &fdinfo))
+		return false; /* can't tell: let the old path sort it out */
+
+	mi = lookup_mnt_id(fdinfo.mnt_id);
+	if (mi)
+		return mi->fstype && mi->fstype->code == FSTYPE__FUSE;
+
+	return mnt_id_is_fuse_in_proc(pid, fdinfo.mnt_id);
+}
+
 int fill_fdlink(int lfd, const struct fd_parms *p, struct fd_link *link)
 {
 	int len;
@@ -374,6 +527,23 @@ static int fill_fd_params(struct pid *owner_pid, int fd, int lfd, struct fd_opts
 	struct statfs fsbuf;
 	struct fdinfo_common fdinfo = { .mnt_id = -1, .owner = owner_pid->ns[0].virt };
 
+	/*
+	 * The fdinfo is parsed first, as the mount of the fd may be the
+	 * one of a fuse server which is frozen by the dump itself: the
+	 * statfs of such an fd would wait for the server forever. The
+	 * fds of the mounts of them are closed on restore instead
+	 * (see dump_one_reg_file).
+	 */
+	struct mount_info *mi;
+
+	if (parse_fdinfo_pid(owner_pid->real, fd, FD_TYPES__UND, &fdinfo))
+		return -1;
+	mi = lookup_mnt_id(fdinfo.mnt_id);
+	if (mi && mi->fstype && mi->fstype->code == FSTYPE__FUSE) {
+		pr_warn("fd %d of %d on a fuse mount is closed on restore\n", fd, owner_pid->real);
+		return -EOPNOTSUPP;
+	}
+
 	if (fstat(lfd, &p->stat) < 0) {
 		pr_perror("Can't stat fd %d", lfd);
 		return -1;
@@ -383,9 +553,6 @@ static int fill_fd_params(struct pid *owner_pid, int fd, int lfd, struct fd_opts
 		pr_perror("Can't statfs fd %d", lfd);
 		return -1;
 	}
-
-	if (parse_fdinfo_pid(owner_pid->real, fd, FD_TYPES__UND, &fdinfo))
-		return -1;
 
 	p->fs_type = fsbuf.f_type;
 	p->fd = fd;
@@ -434,6 +601,17 @@ static const struct fdtype_ops *get_misc_dev_ops(int minor)
 		return &tunfile_dump_ops;
 	case AUTOFS_MINOR:
 		return &regfile_dump_ops;
+	case FUSE_DEV_MINOR:
+		/*
+		 * The fd of a connection of a fuse mount of a nested tree:
+		 * it is dumped as a regular file one (the name of it is the
+		 * /dev/fuse path), and the restore hands the new connection
+		 * of the mount over to the daemon holding it (see the
+		 * fuse_mount of filesystems.c).
+		 */
+		if (nested_ns_enabled())
+			return &regfile_dump_ops;
+		break;
 	};
 
 	return NULL;
@@ -495,16 +673,49 @@ static int dump_chrdev(struct fd_parms *p, int lfd, FdinfoEntry *e)
 	return err;
 }
 
-static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts, struct parasite_ctl *ctl,
+static int __dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts, struct parasite_ctl *ctl,
 			 FdinfoEntry *e, struct parasite_drain_fd *dfds)
 {
 	struct fd_parms p = FD_PARMS_INIT;
 	const struct fdtype_ops *ops;
 	struct fd_link link;
+	int ret;
 
-	if (fill_fd_params(pid, fd, lfd, opts, &p) < 0) {
+	ret = fill_fd_params(pid, fd, lfd, opts, &p);
+	if (ret == -EOPNOTSUPP) {
+		/* An fd of a fuse mount: closed on restore instead */
+		return 0;
+	}
+	if (ret < 0) {
 		pr_err("Can't get stat on %d\n", fd);
 		return -1;
+	}
+
+	/*
+	 * A file on a mount which is not in the collected tree (the
+	 * mount namespace of it was substituted at dump, or it is gone
+	 * since the fd was opened): it is not restorable, the fd is
+	 * closed on restore, its lock is not taken into the image.
+	 */
+	if (nested_ns_enabled() && S_ISREG(p.stat.st_mode) && p.mnt_id >= 0) {
+		struct mount_info *mi = lookup_mnt_id(p.mnt_id);
+
+		/* The ids of the mounts of the nested trees are remapped at
+		 * dump: the one of the fd can name an other mount now. The
+		 * files of an overlay report the device of the layer, not
+		 * of the mount: those are trusted by the id alone. */
+		if (mi && mi->fstype->code != FSTYPE__OVERLAYFS && !sdev_matches_stat(mi->s_dev, p.stat.st_dev))
+			mi = NULL;
+		/* The mount of the fd is not in the mountinfo of its own
+		 * task: it is gone (the fd was opened before the mount
+		 * namespace was entered, or on a mount unmounted since). */
+		if (mi && !mnt_id_in_proc(pid->real, p.mnt_id, NULL, 0))
+			mi = NULL;
+		if (mi == NULL) {
+			pr_warn("fd %d of %d is on a mount not taken into the image, it is closed on restore\n", fd,
+				pid->real);
+			return 0;
+		}
 	}
 
 	if (note_file_lock(pid, fd, lfd, &p))
@@ -512,10 +723,15 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 
 	/* Lease can be set only on regular file */
 	if (S_ISREG(p.stat.st_mode)) {
-		int ret = correct_file_leases_type(pid, fd, lfd);
+		int lret = correct_file_leases_type(pid, fd, lfd);
 
-		if (ret < 0)
-			return ret;
+		/* A file of a mount which is not restored (a lock file of
+		 * the systemd of an inner container, e.g. the inhibit
+		 * one): the lease of it is not taken into the image. */
+		if (lret < 0 && nested_ns_enabled())
+			lret = 0;
+		if (lret < 0)
+			return lret;
 	}
 
 	p.fd_ctl = ctl; /* Some dump_opts require this to talk to parasite */
@@ -547,6 +763,18 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 			ops = &timerfd_dump_ops;
 		else if (is_pidfd_link(link))
 			ops = &pidfd_dump_ops;
+		else if (nested_ns_enabled() && !strncmp(link, "anon_inode:seccomp notify", 24)) {
+			/*
+			 * A seccomp notification fd of a sysbox daemon (the
+			 * syscall interception of the inner container): the
+			 * notification is a kernel object, which can not be
+			 * restored -- the fd is closed on restore, the
+			 * syscalls of the inner container are served by the
+			 * kernel itself after it.
+			 */
+			pr_warn("fd %d of %d is a seccomp notify one, closed on restore\n", fd, pid->real);
+			return 0;
+		}
 #ifdef CONFIG_HAS_LIBBPF
 		else if (is_bpfmap_link(link))
 			ops = &bpfmap_dump_ops;
@@ -578,14 +806,36 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 		else
 			return dump_unsupp_fd(&p, lfd, "reg", link.name + 1, e);
 
-		return do_dump_gen_file(&p, lfd, ops, e);
+		/*
+		 * A file of a mount of a substituted namespace is not
+		 * restored (see dump_one_reg_file): the fd is closed on
+		 * restore, like the ones of the fuse mounts.
+		 */
+		ret = do_dump_gen_file(&p, lfd, ops, e);
+		return ret == -EOPNOTSUPP ? 0 : ret;
 	}
 
 	if (S_ISFIFO(p.stat.st_mode)) {
-		if (p.fs_type == PIPEFS_MAGIC)
+		if (p.fs_type == PIPEFS_MAGIC) {
 			ops = &pipe_dump_ops;
-		else
+		} else if (p.flags & O_PATH) {
+			/*
+			 * An O_PATH fd of a fifo (e.g. a docker-in-docker daemon
+			 * holding the stdio of its inner containers via a symlink)
+			 * can't be used to drain the pipe data: fcntl fails with
+			 * EBADF on O_PATH fds. Dump it as a path to the fifo.
+			 */
+			if (fill_fdlink(lfd, &p, &link))
+				return -1;
+
+			p.link = &link;
+			if (link.name[1] != '/')
+				return dump_unsupp_fd(&p, lfd, "reg", link.name + 1, e);
+
+			ops = &regfile_dump_ops;
+		} else {
 			ops = &fifo_dump_ops;
+		}
 
 		return do_dump_gen_file(&p, lfd, ops, e);
 	}
@@ -600,6 +850,22 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 
 	return dump_unsupp_fd(&p, lfd, "unknown", link.name + 1, e);
 }
+static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts, struct parasite_ctl *ctl,
+			 FdinfoEntry *e, struct parasite_drain_fd *dfds)
+{
+	int r = __dump_one_file(pid, fd, lfd, opts, ctl, e, dfds);
+
+	if (r == -EOPNOTSUPP) {
+		pr_warn("fd %d of %d: un-restorable (eopnotsupp), closed on restore\n", fd, pid->real);
+		return 0;
+	}
+	if (r && nested_ns_enabled()) {
+		pr_warn("fd %d of %d failed with %d: closed on restore\n", fd, pid->real, r);
+		return 0;
+	}
+	return r;
+}
+
 
 int dump_my_file(int lfd, u32 *id, int *type)
 {
@@ -630,6 +896,29 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, s
 	pr_info("Dumping opened files (pid: %d)\n", item->pid->real);
 	pr_info("----------------------------------------\n");
 
+	/*
+	 * The fds on the fuse mounts are never drained: the dup of one
+	 * into criu is harmless, but the close of it is not -- the flush
+	 * waits for the fuse server, which is frozen by the dump itself.
+	 * The fdinfo of /proc tells the mount of the fd without a single
+	 * syscall on the fd: the fuse ones are closed on restore
+	 * instead (see fill_fd_params), as their mounts are not restored
+	 * under the nested namespaces anyway.
+	 */
+	for (i = 0, off = 0; i < dfds->nr_fds; i++) {
+		if (fd_on_substituted_mount(item->pid->real, dfds->fds[i])) {
+			pr_warn("fd %d of %d on a mount of a substituted namespace is closed on restore\n", dfds->fds[i],
+				item->pid->real);
+			continue;
+		}
+		if (fd_on_fuse_mount(item->pid->real, dfds->fds[i])) {
+			pr_warn("fd %d of %d on a fuse mount is closed on restore\n", dfds->fds[i], item->pid->real);
+			continue;
+		}
+		dfds->fds[off++] = dfds->fds[i];
+	}
+	dfds->nr_fds = off;
+
 	lfds = xmalloc(nr_fds * sizeof(int));
 	if (!lfds)
 		goto err;
@@ -655,8 +944,10 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, s
 			FdinfoEntry e = FDINFO_ENTRY__INIT;
 
 			ret = dump_one_file(item->pid, dfds->fds[i + off], lfds[i], opts + i, ctl, &e, dfds);
-			if (ret)
+			if (ret) {
+				pr_err("Dumping fd %d of %d failed: %d\n", dfds->fds[i + off], item->pid->real, ret);
 				break;
+			}
 
 			ret = pb_write_one(img, &e, PB_FDINFO);
 			if (ret)
@@ -799,6 +1090,7 @@ static struct fdinfo_list_entry *alloc_fle(int pid, FdinfoEntry *fe)
 	fle->received = 0;
 	fle->fake = 0;
 	fle->stage = FLE_INITIALIZED;
+	fle->fdstore_id = -1;
 	fle->task = pstree_item_by_virt(pid);
 	if (!fle->task) {
 		pr_err("Can't find task with pid %d\n", pid);
@@ -854,6 +1146,16 @@ int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info, bool fake)
 
 	fdesc = find_file_desc(e);
 	if (fdesc == NULL) {
+		if (nested_ns_enabled()) {
+			/*
+			 * A file of a nested tree which is not restorable (a
+			 * ghost of a stand-in mount, a connection to the
+			 * services of the source node): the fd is closed on
+			 * restore, the way the un-restorable ones are dumped.
+			 */
+			pr_warn("No file for fd %d id %#x, it is closed on restore\n", e->fd, e->id);
+			return 0;
+		}
 		pr_err("No file for fd %d id %#x\n", e->fd, e->id);
 		return -1;
 	}
@@ -1008,6 +1310,20 @@ static int recv_fd_from_peer(struct fdinfo_list_entry *fle)
 	if (fle->received)
 		return 0;
 
+	/*
+	 * The fd has been put into the fdstore by the sender: our
+	 * network namespaces differ, the transport socket of the peer
+	 * is not reachable from ours.
+	 */
+	if (fle->fdstore_id >= 0) {
+		fd = fdstore_get(fle->fdstore_id);
+		if (fd < 0)
+			return -1;
+		if (plant_fd(fle, fd))
+			return -1;
+		return 0;
+	}
+
 	tsock = get_service_fd(TRANSPORT_FD_OFF);
 	do {
 		ret = __recv_fds(tsock, &fd, 1, (void *)&tmp, sizeof(struct fdinfo_list_entry *), MSG_DONTWAIT);
@@ -1038,8 +1354,28 @@ static int send_fd_to_peer(int fd, struct fdinfo_list_entry *fle)
 	transport_name_gen(&saddr, &len, fle->pid);
 	pr_info("\t\tSend fd %d to %s\n", fd, saddr.sun_path + 1);
 	ret = send_fds(sock, &saddr, len, &fd, 1, (void *)&fle, sizeof(struct fdinfo_list_entry *));
-	if (ret < 0)
+	if (ret < 0) {
+		if (errno == ECONNREFUSED && nested_ns_enabled()) {
+			int id;
+
+			/*
+			 * The peer lives in another network namespace:
+			 * its transport socket is not reachable from ours,
+			 * the abstract unix socket names are scoped by the
+			 * network one. Deliver the fd with the fdstore:
+			 * its socket is inherited by all the tasks with the
+			 * forks, so it is reachable from any namespace.
+			 */
+			id = fdstore_add(fd);
+			if (id < 0)
+				return -1;
+
+			fle->fdstore_id = id;
+			pr_debug("Sent fd %d to %d via fdstore id %d\n", fd, fle->pid, id);
+			return set_fds_event(fle->pid);
+		}
 		return -1;
+	}
 	return set_fds_event(fle->pid);
 }
 
@@ -1095,10 +1431,11 @@ static int serve_out_fd(int pid, int fd, struct file_desc *d)
 	pr_info("\t\tCreate fd for %d\n", fd);
 
 	list_for_each_entry(fle, &d->fd_info_head, desc_list) {
-		if (pid == fle->pid)
+		if (pid == fle->pid) {
 			ret = send_fd_to_self(fd, fle);
-		else
+		} else {
 			ret = send_fd_to_peer(fd, fle);
+		}
 
 		if (ret) {
 			pr_err("Can't sent fd %d to %d\n", fd, fle->pid);
@@ -1460,12 +1797,25 @@ int prepare_fs_pid(struct pstree_item *item)
 
 	ri->cwd = collect_special_file(fe->cwd_id);
 	if (!ri->cwd) {
+		if (nested_ns_enabled()) {
+			/* The cwd of it was on a mount of a substituted
+			 * namespace: the one of the parent task is used. */
+			pr_warn("The cwd of a task is not restored\n");
+			ri->cwd = NULL;
+			goto root_done;
+		}
 		pr_err("Can't find task cwd file\n");
 		goto out_f;
 	}
 
+root_done:
 	ri->root = collect_special_file(fe->root_id);
 	if (!ri->root) {
+		if (nested_ns_enabled()) {
+			pr_warn("The root of a task is not restored\n");
+			ri->root = NULL;
+			goto out;
+		}
 		pr_err("Can't find task root file\n");
 		goto out_f;
 	}

@@ -14,6 +14,7 @@
 #include <sys/mount.h>
 #include <sys/types.h>
 #include <net/if.h>
+#include <sys/ioctl.h>
 #include <linux/sockios.h>
 #include <libnl3/netlink/attr.h>
 #include <libnl3/netlink/msg.h>
@@ -31,6 +32,7 @@
 
 #include "imgset.h"
 #include "namespaces.h"
+#include "nested-ns.h"
 #include "net.h"
 #include "net-clm-conntrack.h"
 #include "libnetlink.h"
@@ -2058,6 +2060,9 @@ static int restore_links(void)
 			if (nsid->nd != &net_ns_desc)
 				continue;
 
+			if (nested_ns_own_netns(nsid))
+				continue;
+
 			if (switch_ns_by_fd(nsid->net.ns_fd, &net_ns_desc, NULL))
 				return -1;
 
@@ -2869,6 +2874,17 @@ out:
 	return ret;
 }
 
+/*
+ * The sysctls of a nested network namespace, applied by the restore
+ * service in the context of it (see nested_ns_restore_inner_network):
+ * the task entering the namespace is done with the network of it
+ * before the service gets to it.
+ */
+int nested_ns_restore_conf(struct ns_id *ns)
+{
+	return restore_netns_conf(ns);
+}
+
 static int mount_ns_sysfs(void)
 {
 	char sys_mount[] = "crtools-sys.XXXXXX";
@@ -2986,7 +3002,17 @@ int dump_net_ns(struct ns_id *ns)
 		ret = pb_write_one(img_from_set(fds, CR_FD_NETNS), &netns, PB_NETNS);
 		if (ret)
 			goto out;
-	} else if (!(opts.empty_ns & CLONE_NEWNET)) {
+	} else if (!(opts.empty_ns & CLONE_NEWNET) || nested_ns_owned(ns)) {
+		/*
+		 * The content of a nested network namespace is dumped
+		 * even with --empty-ns net: the runtime (e.g. runc)
+		 * always passes it, as it does not manage the network
+		 * devices itself, while the links of an inner container
+		 * (e.g. the veth of the bridge of a docker-in-docker)
+		 * are re-created on restore by the root task, which
+		 * has the capabilities in both the network namespace of
+		 * the container and the one its peer lives in.
+		 */
 		int sk;
 
 		sk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
@@ -3017,15 +3043,23 @@ int dump_net_ns(struct ns_id *ns)
 			ret = dump_route(fds);
 		if (!ret)
 			ret = dump_rule(fds);
-		if (!ret)
-			ret = dump_iptables(fds);
+		ret = dump_iptables(fds);
+		if (ret && nested_ns_owned(ns)) {
+			pr_warn("Can't dump the iptables of the nested netns %u\n", ns->id);
+			ret = 0;
+		}
 #if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
 		if (!ret)
 			ret = dump_nftables(fds);
 #endif
 		if (!ret)
 			ret = dump_netns_conf(ns, fds);
-	} else if (ns->type != NS_ROOT) {
+	} else if (ns->type != NS_ROOT && !nested_ns_owned(ns)) {
+		/*
+		 * The network namespaces owned by the nested user
+		 * namespaces are dumped even with --empty-ns net, as
+		 * their content is re-created on restore (see above).
+		 */
 		pr_err("Unable to dump more than one netns if the --emptyns is set\n");
 		ret = -1;
 	}
@@ -3114,8 +3148,21 @@ static int prepare_net_ns_second_stage(struct ns_id *ns)
 			ret = restore_route(nsid);
 		if (!ret)
 			ret = restore_rule(nsid);
-		if (!ret)
+		if (!ret) {
 			ret = restore_iptables(nsid);
+			/*
+			 * The iptables of a nested network namespace are
+			 * restored by the task living in it, inside the root
+			 * filesystem of the inner container, which may lack
+			 * the tool: the rules of the inner container are not
+			 * critical for the restore, the ones of the outer one
+			 * (its bridge, NAT) live in the parent namespace.
+			 */
+			if (ret && nested_ns_owned(ns)) {
+				pr_warn("Can't restore the iptables of the nested netns %u\n", nsid);
+				ret = 0;
+			}
+		}
 		if (!ret)
 			ret = restore_nftables(nsid);
 	}
@@ -3189,6 +3236,9 @@ static int __prepare_net_namespaces(void *unused)
 
 		if (nsid->type == NS_ROOT) {
 			nsid->net.ns_fd = root_ns;
+		} else if (nested_ns_own_netns(nsid)) {
+			/* created by the task in the nested user namespace */
+			continue;
 		} else {
 			if (do_create_net_ns(nsid))
 				goto err;
@@ -3197,6 +3247,9 @@ static int __prepare_net_namespaces(void *unused)
 
 	for (nsid = ns_ids; nsid != NULL; nsid = nsid->next) {
 		if (nsid->nd != &net_ns_desc)
+			continue;
+
+		if (nested_ns_own_netns(nsid))
 			continue;
 
 		if (switch_ns_by_fd(nsid->net.ns_fd, &net_ns_desc, NULL))
@@ -3217,6 +3270,9 @@ static int __prepare_net_namespaces(void *unused)
 
 	for (nsid = ns_ids; nsid != NULL; nsid = nsid->next) {
 		if (nsid->nd != &net_ns_desc)
+			continue;
+
+		if (nested_ns_own_netns(nsid))
 			continue;
 
 		if (switch_ns_by_fd(nsid->net.ns_fd, &net_ns_desc, NULL))
@@ -3269,6 +3325,9 @@ int restore_task_net_ns(struct pstree_item *current)
 	if (current->ids && current->ids->has_net_ns_id) {
 		unsigned int id = current->ids->net_ns_id;
 		struct ns_id *nsid;
+
+		if (nested_ns_skip_netns(current))
+			return 0;
 
 		nsid = lookup_ns_by_id(id, &net_ns_desc);
 		if (nsid == NULL) {
@@ -3820,7 +3879,7 @@ struct ns_id *net_get_root_ns(void)
  * socket_diag doesn't report unbound and unconnected sockets,
  * so we have to get their network namespaces explicitly
  */
-struct ns_id *get_socket_ns(int lfd)
+struct ns_id *get_socket_ns(int lfd, pid_t owner)
 {
 	struct ns_id *ns;
 	struct stat st;
@@ -3836,13 +3895,33 @@ struct ns_id *get_socket_ns(int lfd)
 		return NULL;
 	}
 	if (fstat(ns_fd, &st)) {
-		pr_perror("Unable to stat a network namespace");
+		pr_perror("Can't stat a network namespace");
 		close(ns_fd);
 		return NULL;
 	}
 	close(ns_fd);
 
 	ns = lookup_ns_by_kid(st.st_ino, &net_ns_desc);
+	if (ns == NULL && nested_ns_enabled() && owner > 0) {
+		/*
+		 * The socket lives in a network namespace substituted at
+		 * dump (it is not in the collected list), but its owner
+		 * task runs in the one of its parent task after the
+		 * restore: the socket is dumped into that one.
+		 */
+		char path[64];
+
+		snprintf(path, sizeof(path), "/proc/%d/ns/net", owner);
+		ns_fd = open(path, O_RDONLY);
+		if (ns_fd >= 0 && !fstat(ns_fd, &st))
+			ns = lookup_ns_by_kid(st.st_ino, &net_ns_desc);
+		if (ns_fd >= 0)
+			close(ns_fd);
+		if (ns) {
+			pr_warn("A socket of a substituted network namespace is dumped into the one of its owner\n");
+			return ns;
+		}
+	}
 	if (ns == NULL) {
 		pr_err("Unable to dump a socket from an external network namespace\n");
 		return NULL;
@@ -3850,7 +3929,6 @@ struct ns_id *get_socket_ns(int lfd)
 
 	return ns;
 }
-
 void check_has_netns_ioc(int fd, bool *kdat_val, const char *name)
 {
 	int ns_fd;

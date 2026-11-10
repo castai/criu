@@ -24,6 +24,7 @@
 #include "common/compiler.h"
 
 #include "linux/rseq.h"
+#include "asm/thread_pointer.h"
 
 #ifdef __has_include
 #if __has_include("sys/rseq.h")
@@ -56,6 +57,7 @@
 #include "crtools.h"
 #include "uffd.h"
 #include "namespaces.h"
+#include "nested-ns.h"
 #include "mem.h"
 #include "mount.h"
 #include "fsnotify.h"
@@ -409,9 +411,30 @@ static int populate_root_fd_off(void)
 
 static int populate_pid_proc(void)
 {
-	if (open_pid_proc(vpid(current)) < 0) {
-		pr_err("Can't open PROC_SELF\n");
-		return -1;
+	/*
+	 * A task in a nested pid namespace is not visible by its vpid in
+	 * the /proc of its mount namespace, nor is one restored with a
+	 * random pid, as its parent could not set it: only the /proc/self
+	 * entry is used for those.
+	 */
+	if (nested_ns_pid_not_visible(current))
+		pr_debug("pid not visible in /proc, using /proc/self only\n");
+	else if (open_pid_proc(vpid(current)) < 0) {
+		/*
+		 * The vpid of a task of a nested tree can name a pid of
+		 * a pid namespace other than the one the /proc of the
+		 * restore is mounted for (e.g. the root task of a runc
+		 * restore is recorded with its pod-level one, while the
+		 * /proc of the container is the one of its own pid
+		 * namespace): the /proc/self is used for it then.
+		 */
+		if (nested_ns_enabled()) {
+			pr_warn("The pid %d is not visible in the /proc of the restore, using /proc/self\n",
+				vpid(current));
+		} else {
+			pr_err("Can't open PROC_SELF\n");
+			return -1;
+		}
 	}
 	if (open_pid_proc(PROC_SELF) < 0) {
 		pr_err("Can't open PROC_SELF\n");
@@ -601,6 +624,10 @@ static int open_cores(int pid, CoreEntry *leader_core)
 		if (tpid == pid)
 			cores[i] = leader_core;
 		else if (open_core(tpid, &cores[i]))
+			goto err;
+
+		/* The ids of a thread of a nested user namespace, like the leader's ones */
+		if (tpid != pid && nested_ns_fix_task_creds(current, cores[i]))
 			goto err;
 	}
 
@@ -1127,6 +1154,9 @@ static bool needs_prep_creds(struct pstree_item *item)
 	 * Before the 4.13 kernel, it was impossible to set
 	 * an exe_file if uid or gid isn't zero.
 	 */
+	if (nested_ns_needs_prep_creds(item))
+		return true;
+
 	return (!item->parent && ((root_ns_mask & CLONE_NEWUSER) || getuid()));
 }
 
@@ -1156,6 +1186,9 @@ static inline int fork_with_pid(struct pstree_item *item)
 	struct cr_clone_arg ca;
 	struct ns_id *pid_ns = NULL;
 	bool external_pidns = false;
+	bool pid_not_set = false;
+	pid_t set_tid[2] = { 0, 0 };
+	int set_tid_size = 0;
 	int ret = -1;
 	pid_t pid = vpid(item);
 
@@ -1164,6 +1197,15 @@ static inline int fork_with_pid(struct pstree_item *item)
 			return -1;
 
 		if (check_core(ca.core, item))
+			return -1;
+
+		/*
+		 * The ids of the credentials of a task living in a nested
+		 * user namespace are dumped in the view of the criu process
+		 * which has dumped it: translate them into the one of the
+		 * user namespace of the task, as they are restored in it.
+		 */
+		if (nested_ns_fix_task_creds(item, ca.core))
 			return -1;
 
 		item->pid->state = ca.core->tc->task_state;
@@ -1245,7 +1287,16 @@ static inline int fork_with_pid(struct pstree_item *item)
 
 	BUG_ON(ca.clone_flags & CLONE_VM);
 
+	if (nested_ns_child_init(item, ca.clone_flags))
+		return -1;
+
 	pr_info("Forking task with %d pid (flags 0x%lx)\n", pid, ca.clone_flags);
+
+	if (nested_ns_enabled() && item->parent == root_item)
+
+	pid_not_set = nested_ns_pid_can_not_be_set(item);
+	if (pid_not_set)
+		pr_warn("The pid of the task %d can not be set: it will be restored with a random one\n", pid);
 
 	if (!(ca.clone_flags & CLONE_NEWPID)) {
 		lock_last_pid();
@@ -1267,19 +1318,59 @@ static inline int fork_with_pid(struct pstree_item *item)
 				goto err_unlock;
 			}
 		}
-	} else {
+	} else if (!nested_ns_enabled()) {
 		if (!external_pidns) {
 			if (pid != INIT_PID) {
-				pr_err("First PID in a PID namespace needs to be %d and not %d\n", pid, INIT_PID);
+				pr_err("First PID in a PID namespace needs to be %d and not %d\n", INIT_PID, pid);
 				return -1;
 			}
 		}
 	}
 
 	if (kdat.has_clone3_set_tid) {
-		ret = clone3_with_pid_noasan(restore_task_with_children, &ca,
-					     (ca.clone_flags & ~(CLONE_NEWNET | CLONE_NEWCGROUP | CLONE_NEWTIME)),
-					     SIGCHLD, pid);
+		/*
+		 * The pids to request: the one of the task, or, in a
+		 * nested pid namespace, the one at each level the forking
+		 * task can set (see nested_ns_set_tid()).
+		 */
+		set_tid_size = nested_ns_set_tid(item, pid, set_tid, ARRAY_SIZE(set_tid));
+
+		ret = clone3_with_pids_noasan(restore_task_with_children, &ca,
+					      (ca.clone_flags & ~(CLONE_NEWNET | CLONE_NEWCGROUP | CLONE_NEWTIME)),
+					      SIGCHLD, set_tid_size ? set_tid : NULL, set_tid_size);
+
+		/*
+		 * The root task of the tree can lose its pid to a leftover
+		 * of a failed restore of the same one: the destination
+		 * container is reused between the attempts of the migration,
+		 * and a task of the failed attempt stays in it (its cleanup
+		 * could not resume it, e.g. its tracer died mid-restore).
+		 * The leftover is killed and the fork is retried once -- it
+		 * is safe for the root only: the pids of the other tasks of
+		 * this restore are alive already, and a collision on those
+		 * means an id clash inside the image itself.
+		 */
+		if (ret < 0 && errno == EEXIST && set_tid_size && item == root_item) {
+			pr_warn("The pid %d of the root task is held by a leftover, retrying\n", set_tid[0]);
+			if (kill(set_tid[0], SIGKILL) < 0 && errno != ESRCH) {
+				pr_perror("Can't kill the leftover %d", set_tid[0]);
+			} else {
+				/* the leftover may take a while to die: it is
+				 * ptrace-stopped, its exit is not instant */
+				int w;
+
+				for (w = 0; w < 100; w++) {
+					if (kill(set_tid[0], 0) < 0 && errno == ESRCH)
+						break;
+					usleep(10000);
+				}
+
+				ret = clone3_with_pids_noasan(restore_task_with_children, &ca,
+							       (ca.clone_flags &
+								~(CLONE_NEWNET | CLONE_NEWCGROUP | CLONE_NEWTIME)),
+							       SIGCHLD, set_tid, set_tid_size);
+			}
+		}
 	} else {
 		/*
 		 * Some kernel modules, such as network packet generator
@@ -1300,14 +1391,21 @@ static inline int fork_with_pid(struct pstree_item *item)
 
 	if (ret < 0) {
 		pr_perror("Can't fork for %d", pid);
-		if (errno == EEXIST)
+		if (errno == EEXIST) {
 			set_cr_errno(EEXIST);
+		}
 		goto err_unlock;
 	}
 
 	if (item == root_item) {
 		item->pid->real = ret;
 		pr_debug("PID: real %d virt %d\n", item->pid->real, vpid(item));
+	}
+
+	/* ret is the pid of the child in our pid namespace */
+	if (nested_ns_child_forked(item, ca.clone_flags, ret)) {
+		ret = -1;
+		goto err_unlock;
 	}
 
 	arch_shstk_unlock(item, ca.core, pid);
@@ -1432,15 +1530,18 @@ static void restore_sid(void)
 	 */
 
 	if (vpid(current) == current->sid) {
+		/* In a nested pid namespace setsid() returns the pid of the task in it */
+		pid_t expected = nested_ns_expected_sid(current);
+
 		pr_info("Restoring %d to %d sid\n", vpid(current), current->sid);
 		sid = setsid();
-		if (sid != current->sid) {
-			pr_perror("Can't restore sid (%d)", sid);
+		if (sid != expected) {
+			pr_err("Can't restore sid (%d), expected %d\n", sid, expected);
 			exit(1);
 		}
 	} else {
 		sid = getsid(0);
-		if (sid != current->sid) {
+		if (sid != current->sid && !nested_ns_inherited_sid_ok(current, sid)) {
 			/* Skip the root task if it's not init */
 			if (current == root_item && vpid(root_item) != INIT_PID)
 				return;
@@ -1461,14 +1562,21 @@ static void restore_pgid(void)
 	 * We do this _before_ finishing the forking stage to make sure
 	 * helpers are still with us.
 	 */
+	pid_t pgid, my_pgid = current->pgid, set_pgid;
 
-	pid_t pgid, my_pgid = current->pgid;
+	/*
+	 * In a nested pid namespace the group is known by the pid of
+	 * its leader in it; a group led from outside of the namespace
+	 * can not be joined, the inherited one is kept.
+	 */
+	if (!nested_ns_pgid(current, &set_pgid))
+		return;
 
 	pr_info("Restoring %d to %d pgid\n", vpid(current), my_pgid);
 
 	pgid = getpgrp();
-	if (my_pgid == pgid)
-		return;
+	if (set_pgid == pgid)
+		goto done;
 
 	if (my_pgid != vpid(current)) {
 		struct pstree_item *leader;
@@ -1487,11 +1595,17 @@ static void restore_pgid(void)
 	}
 
 	pr_info("\twill call setpgid, mine pgid is %d\n", pgid);
-	if (setpgid(0, my_pgid) != 0) {
+	if (setpgid(0, set_pgid) != 0) {
 		pr_perror("Can't restore pgid (%d/%d->%d)", vpid(current), pgid, current->pgid);
 		exit(1);
 	}
 
+done:
+	/*
+	 * The leader of the group lets the members join it, also when
+	 * it is in the group already (e.g. the init of a nested pid
+	 * namespace, its own group after setsid()).
+	 */
 	if (my_pgid == vpid(current))
 		futex_set_and_wake(&rsti(current)->pgrp_set, 1);
 }
@@ -1534,6 +1648,12 @@ static int mount_proc(void)
 	if (fd >= 0) {
 		ret = set_proc_fd(fd);
 		close(fd);
+	}
+
+	if (nested_ns_enabled()) {
+		char _m[64];
+		if (readlink("/proc/self/ns/mnt", _m, sizeof(_m) - 1) < 0)
+			_m[0] = '\0';
 	}
 
 	return ret;
@@ -1586,6 +1706,26 @@ static int __restore_task_with_children(void *_arg)
 
 	current = ca->item;
 
+	/*
+	 * The /proc/self cache of the forking one is inherited with its
+	 * service fds: its pid check (see get_proc_fd()) matches this one's
+	 * getpid() as well when both are pid 1 of their pid namespaces, and
+	 * the cached fd names the forking one instead of this task itself
+	 * (e.g. the timens offsets of the former are set on its behalf then).
+	 * Forget it: the next open_proc(PROC_SELF) re-resolves "self" for
+	 * this one via the /proc of the restore.
+	 */
+	set_proc_self_fd(-1);
+
+	/*
+	 * The root task: the pid counter of the namespace has to be
+	 * above every requested pid before the first task with a random
+	 * one (see nested_ns_seed_pid_counter) is forked by the tasks
+	 * below.
+	 */
+	if (current == root_item && nested_ns_seed_pid_counter())
+		goto err;
+
 	if (current != root_item) {
 		char buf[12];
 		int fd;
@@ -1604,10 +1744,14 @@ static int __restore_task_with_children(void *_arg)
 
 		current->pid->real = atoi(buf);
 		pr_debug("PID: real %d virt %d\n", current->pid->real, vpid(current));
+
+		if (nested_ns_child_report(current))
+			goto err;
 	}
 
 	pid = getpid();
-	if (vpid(current) != pid) {
+	/* In a nested pid namespace the task sees itself at its pid in it */
+	if (!nested_ns_pid_ok(current, pid)) {
 		pr_err("Pid %d do not match expected %d\n", pid, vpid(current));
 		set_task_cr_err(EEXIST);
 		goto err;
@@ -1656,7 +1800,14 @@ static int __restore_task_with_children(void *_arg)
 			goto err;
 	}
 
+	if (nested_ns_child_wait(current))
+		goto err;
+
 	if (needs_prep_creds(current) && (prepare_userns_creds()))
+		goto err;
+
+	/* Fill in the mount namespace of our nested user namespace */
+	if (nested_ns_child_mntns(current))
 		goto err;
 
 	/*
@@ -1694,6 +1845,23 @@ static int __restore_task_with_children(void *_arg)
 		if (prepare_namespace(current, ca->clone_flags))
 			goto err;
 
+		/*
+		 * Pin the root fds of the nested mount namespaces now, with
+		 * the mount ones assembled: the tasks restoring the files
+		 * (e.g. the unix sockets) of a nested one may fork after the
+		 * first task of it, which pins its root too late for them.
+		 */
+		if (nested_ns_pin_roots())
+			goto err;
+
+		/*
+		 * The tasks of the nested user namespaces run as the
+		 * remapped users: let them read the images, from here
+		 * until the end of the restore (nested_ns_images_restore()).
+		 */
+		if (nested_ns_images_open())
+			goto err;
+
 		if (restore_finish_ns_stage(CR_STATE_PREPARE_NAMESPACES, CR_STATE_FORKING) < 0)
 			goto err;
 
@@ -1722,6 +1890,14 @@ static int __restore_task_with_children(void *_arg)
 	}
 
 	if (open_transport_socket())
+		goto err;
+
+	/*
+	 * Create the namespaces owned by our nested user namespace after
+	 * the transport socket is set up, as the fd transport uses unix
+	 * sockets, which are not visible from the parent network one.
+	 */
+	if (nested_ns_child_namespaces(current))
 		goto err;
 
 	timing_start(TIME_FORK);
@@ -1753,6 +1929,14 @@ static int __restore_task_with_children(void *_arg)
 		if (restore_wait_other_tasks())
 			goto err;
 		fini_restore_mntns();
+
+		/*
+		 * The start times of all the restored processes are known
+		 * now: update the ones in the state files of the inner
+		 * runtimes, which have recorded the ones of the dump time.
+		 */
+		nested_ns_patch_runc_states();
+
 		__restore_switch_stage(CR_STATE_RESTORE);
 	} else {
 		if (restore_finish_stage(task_entries, CR_STATE_FORKING) < 0)
@@ -1765,6 +1949,7 @@ static int __restore_task_with_children(void *_arg)
 	return 0;
 
 err:
+	nested_ns_child_abort(current);
 	if (current->parent == NULL)
 		futex_abort_and_wake(&task_entries->nr_in_progress);
 	exit(1);
@@ -2245,6 +2430,10 @@ skip_ns_bouncing:
 	if (ret < 0)
 		goto out_kill;
 
+	ret = nested_ns_restore_inner_network();
+	if (ret < 0)
+		goto out_kill;
+
 	ret = prepare_cgroup_properties();
 	if (ret < 0)
 		goto out_kill;
@@ -2358,6 +2547,8 @@ skip_ns_bouncing:
 	/* This has the effect of dismissing the image streamer */
 	close_image_dir();
 
+	nested_ns_images_restore();
+
 	ret = run_scripts(ACT_POST_RESUME);
 	if (ret != 0)
 		pr_err("Post-resume script ret code %d\n", ret);
@@ -2393,6 +2584,7 @@ out_kill:
 	}
 
 out:
+	nested_ns_images_restore();
 	depopulate_roots_yard(mnt_ns_fd, true);
 	stop_usernsd();
 	__restore_switch_stage(CR_STATE_FAIL);
@@ -2487,6 +2679,16 @@ int cr_restore_tasks(void)
 		goto err;
 
 	if (crtools_prepare_shared() < 0)
+		goto err;
+
+	/*
+	 * The pid counter of the namespace has to be above every
+	 * requested pid BEFORE any helper of the restore is forked:
+	 * the helpers (the cgroupd one, e.g.) are forked with random
+	 * pids, which would take the ones the tasks of the tree ask
+	 * for with the set_tid of theirs.
+	 */
+	if (nested_ns_seed_pid_counter())
 		goto err;
 
 	if (prepare_cgroup())

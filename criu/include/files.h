@@ -90,6 +90,17 @@ struct fdinfo_list_entry {
 	u8 received : 1;
 	u8 stage : 3;
 	u8 fake : 1;
+	/*
+	 * The fd of a task living in another network namespace can not
+	 * be delivered with the transport socket: the abstract unix
+	 * socket names are scoped by the network namespace, and the one
+	 * of the peer is not reachable from ours. Such an fd is put into
+	 * the fdstore instead (which is inherited by all the tasks with
+	 * the forks, so it is reachable from any namespace), and this
+	 * field holds its id there, written by the sender. It lives in
+	 * the shared memory: readable by the receiver task.
+	 */
+	int fdstore_id;
 };
 
 extern int inh_fd_max;
@@ -177,6 +188,15 @@ extern int close_old_fds(void);
 extern int shared_fdt_prepare(struct pstree_item *item);
 
 extern struct collect_image_info ext_file_cinfo;
+bool fd_on_fuse_mount(int pid, int fd);
+
+/* The connection of a fuse mount of a nested tree, once the task
+ * assembling the mount has published it (see the fuse_mount of
+ * filesystems.c). Waits for it for a while. */
+int fuse_wait_connection(int orig_fd);
+bool fd_on_substituted_mount(int pid, int fd);
+bool fd_is_fuse_dev(int pid, int fd);
+
 extern int dump_unsupp_fd(struct fd_parms *p, int lfd, char *more, char *info, FdinfoEntry *);
 
 extern int inherit_fd_parse(char *optarg);

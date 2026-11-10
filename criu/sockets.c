@@ -14,6 +14,7 @@
 #include "bitops.h"
 #include "libnetlink.h"
 #include "sockets.h"
+#include "nested-ns.h"
 #include "unix_diag.h"
 #include "inet_diag.h"
 #include "packet_diag.h"
@@ -484,7 +485,14 @@ int sk_setbufs(int sk, uint32_t *bufs)
 
 	if (setsockopt(sk, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf, sizeof(sndbuf)) ||
 	    setsockopt(sk, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf))) {
-		if (opts.unprivileged) {
+		/*
+		 * SO_SNDBUFFORCE/SO_RCVBUFFORCE needs CAP_NET_ADMIN in
+		 * the initial user namespace: a task of a nested one
+		 * can not set them, so fall back to the capped
+		 * SO_SNDBUF/SO_RCVBUF, the same way as the
+		 * unprivileged one does.
+		 */
+		if (opts.unprivileged || nested_ns_task_nested(current)) {
 			pr_info("Unable to set SO_SNDBUFFORCE/SO_RCVBUFFORCE, falling back to SO_SNDBUF/SO_RCVBUF\n");
 			if (setsockopt(sk, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) ||
 			    setsockopt(sk, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf))) {
@@ -868,6 +876,104 @@ static int collect_err(int err, struct ns_id *ns, void *arg)
 	return err;
 }
 
+/*
+ * The sockets of the network namespaces substituted at dump are not
+ * collected with the rest of the tree (the namespaces are dropped
+ * from it). The fd of one names its owner task, and the network
+ * namespace of it is entered to collect the sockets of it: the
+ * owner task runs in the namespace of its parent task after the
+ * restore, the sockets are dumped into that one (see
+ * get_socket_ns).
+ */
+struct collected_ns {
+	struct collected_ns *next;
+	unsigned long ino;
+};
+
+static struct collected_ns *collected_ns;
+static struct ns_id *sub_sock_ns;
+
+static int collect_ns_sockets(unsigned long ino, int netfd)
+{
+	struct collected_ns *cn;
+	int curfd, nl, ret = -1;
+
+	for (cn = collected_ns; cn; cn = cn->next)
+		if (cn->ino == ino)
+			return 0; /* already collected */
+
+	curfd = open("/proc/self/ns/net", O_RDONLY);
+	if (curfd < 0)
+		return -1;
+
+	if (setns(netfd, CLONE_NEWNET) == 0) {
+		nl = socket(PF_NETLINK, SOCK_RAW, NETLINK_INET_DIAG);
+		if (nl >= 0) {
+			sub_sock_ns->net.nlsk = nl;
+			ret = collect_sockets(sub_sock_ns);
+			close(nl);
+		}
+		setns(curfd, CLONE_NEWNET);
+	}
+
+	close(curfd);
+
+	if (ret == 0) {
+		cn = xmalloc(sizeof(*cn));
+		if (!cn)
+			return -1;
+		cn->ino = ino;
+		cn->next = collected_ns;
+		collected_ns = cn;
+	}
+
+	return ret;
+}
+
+/*
+ * The sockets of the whole dumped tree are collected: the peer of a
+ * socket of a substituted network namespace may live in another one
+ * of them, so the namespaces of every task of the tree are walked,
+ * not only the one of the owner of the fd.
+ */
+int collect_substituted_sockets(int pid)
+{
+	struct pstree_item *item;
+	char path[64];
+	struct stat st;
+	int netfd;
+
+	if (!sub_sock_ns) {
+		sub_sock_ns = xzalloc(sizeof(*sub_sock_ns));
+		if (!sub_sock_ns)
+			return -1;
+		sub_sock_ns->type = NS_OTHER;
+		sub_sock_ns->nd = &net_ns_desc;
+		sub_sock_ns->id = -2;
+		sub_sock_ns->net.nlsk = -1;
+	}
+
+	for_each_pstree_item(item) {
+		if (!item->pid || !item->pid->real)
+			continue;
+
+		snprintf(path, sizeof(path), "/proc/%d/ns/net", item->pid->real);
+		netfd = open(path, O_RDONLY);
+		if (netfd < 0)
+			continue;
+
+		if (fstat(netfd, &st)) {
+			close(netfd);
+			continue;
+		}
+
+		collect_ns_sockets(st.st_ino, netfd);
+		close(netfd);
+	}
+
+	return 0;
+}
+
 int collect_sockets(struct ns_id *ns)
 {
 	int err = 0, tmp;
@@ -909,13 +1015,17 @@ int collect_sockets(struct ns_id *ns)
 	if (tmp)
 		err = tmp;
 
-	/* Collect IPv4 UDP-lite sockets */
+	/*
+	 * Collect IPv4 UDP-lite sockets. The protocol was removed from
+	 * the kernel (7.x): its diag request fails with ENOENT there,
+	 * which is not an error, there can be no such sockets.
+	 */
 	req.r.i.sdiag_family = AF_INET;
 	req.r.i.sdiag_protocol = IPPROTO_UDPLITE;
 	req.r.i.idiag_ext = 0;
 	req.r.i.idiag_states = -1; /* All */
 	tmp = do_collect_req(nl, &req, sizeof(req), inet_receive_one, collect_err, ns, &req.r.i);
-	if (tmp)
+	if (tmp && tmp != -ENOENT)
 		err = tmp;
 
 	/* Collect IPv4 RAW sockets */
@@ -955,13 +1065,13 @@ int collect_sockets(struct ns_id *ns)
 	if (tmp)
 		err = tmp;
 
-	/* Collect IPv6 UDP-lite sockets */
+	/* Collect IPv6 UDP-lite sockets (see the IPv4 ones above) */
 	req.r.i.sdiag_family = AF_INET6;
 	req.r.i.sdiag_protocol = IPPROTO_UDPLITE;
 	req.r.i.idiag_ext = 0;
 	req.r.i.idiag_states = -1; /* All */
 	tmp = do_collect_req(nl, &req, sizeof(req), inet_receive_one, collect_err, ns, &req.r.i);
-	if (tmp)
+	if (tmp && tmp != -ENOENT)
 		err = tmp;
 
 	/* Collect IPv6 RAW sockets */
@@ -1039,6 +1149,21 @@ int set_netns(uint32_t ns_id)
 	if (nsfd < 0)
 		return -1;
 	if (setns(nsfd, CLONE_NEWNET)) {
+		if (nested_ns_task_nested(current)) {
+			/*
+			 * A task forked into its own copy of the user namespace
+			 * of the container (e.g. a docker exec-ed one) is in a
+			 * sibling of the one owning the namespace, and can not
+			 * enter it. The socket is restored in the network
+			 * namespace of the fork: for the filesystem bound ones
+			 * it is the same, as they are not scoped by the network
+			 * namespace.
+			 */
+			pr_warn("Unable to switch to the network namespace %u (%s): restoring the socket in the fork one\n",
+				ns_id, strerror(errno));
+			close(nsfd);
+			return 0;
+		}
 		pr_perror("Unable to switch a network namespace");
 		close(nsfd);
 		return -1;

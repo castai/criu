@@ -10,6 +10,7 @@
 #include "cr_options.h"
 #include "servicefd.h"
 #include "mem.h"
+#include "nested-ns.h"
 #include "mman.h"
 #include "parasite-syscall.h"
 #include "parasite.h"
@@ -747,8 +748,15 @@ int prepare_mm_pid(struct pstree_item *i)
 	if (ret <= 0)
 		return ret;
 
-	if (collect_special_file(ri->mm->exe_file_id) == NULL)
-		return -1;
+	if (ri->mm->exe_file_id && collect_special_file(ri->mm->exe_file_id) == NULL) {
+		if (nested_ns_enabled()) {
+			/* The exe file of it was on a mount of a substituted
+			 * namespace: the link is not restored. */
+			pr_warn("The exe of a task is not restored\n");
+			ri->mm->exe_file_id = 0;
+		} else
+			return -1;
+	}
 
 	pr_debug("Found %zd VMAs in image\n", ri->mm->n_vmas);
 	img = NULL;

@@ -1,0 +1,7 @@
+{
+    'flavor': 'uns',
+    'flags': 'suid',
+    'deps': ['/bin/sh', '/sbin/ip|/bin/ip', '/bin/tar',
+             '/sbin/iptables-restore|/usr/sbin/iptables-restore',
+             '/sbin/ip6tables-restore|/usr/sbin/ip6tables-restore'],
+}

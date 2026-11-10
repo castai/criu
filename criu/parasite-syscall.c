@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <sched.h>
 #include <inttypes.h>
 
 #include <sys/stat.h>
@@ -17,6 +18,7 @@
 #include "imgset.h"
 #include "parasite-syscall.h"
 #include "parasite.h"
+#include "nested-ns.h"
 #include "crtools.h"
 #include "namespaces.h"
 #include "kerndat.h"
@@ -43,7 +45,27 @@
 #include "infect-rpc.h"
 #include "pie/parasite-blob.h"
 
-unsigned long get_exec_start(struct vm_area_list *vmas)
+/*
+ * The area the syscall instruction is injected into has to be writable
+ * through ptrace: a shared sealed mapping (e.g. the memfd holding the
+ * packed binary of upx, which maps it read-only sealed) rejects even
+ * the forced writes of ptrace. Probe the candidate with a write of the
+ * word it holds: the ones which reject it are skipped, the next
+ * executable one is used instead.
+ */
+static bool exec_start_writable(pid_t pid, unsigned long addr)
+{
+	unsigned long word;
+
+	errno = 0;
+	word = ptrace(PTRACE_PEEKDATA, pid, addr, 0);
+	if (errno != 0)
+		return false;
+
+	return ptrace(PTRACE_POKEDATA, pid, addr, (void *)word) == 0;
+}
+
+unsigned long get_exec_start(struct vm_area_list *vmas, pid_t pid)
 {
 	struct vma_area *vma_area;
 
@@ -58,6 +80,12 @@ unsigned long get_exec_start(struct vm_area_list *vmas)
 		len = vma_area_len(vma_area);
 		if (len < PARASITE_START_AREA_MIN) {
 			pr_warn("Suspiciously short VMA @%#lx\n", (unsigned long)vma_area->e->start);
+			continue;
+		}
+
+		if (pid > 0 && !exec_start_writable(pid, vma_area->e->start)) {
+			pr_debug("Skipping the non-writable executable VMA @%#lx\n",
+				 (unsigned long)vma_area->e->start);
 			continue;
 		}
 
@@ -226,7 +254,13 @@ int parasite_dump_thread_seized(struct parasite_thread_ctl *tctl, struct parasit
 		return -1;
 	}
 
-	tid->ns[0].virt = args->tid;
+	/* The tid the parasite reports is the one of the pid namespace of
+	 * the task itself: it is translated into the one of the root task,
+	 * the threads of the nested namespaces would collide with the
+	 * pids of the tasks of the outer ones otherwise. */
+	tid->ns[0].virt = nested_ns_dump_vpid(tid->real, args->tid);
+	if (tid->ns[0].virt < 0)
+		return -1;
 	return dump_thread_core(pid, core, args);
 }
 
@@ -389,7 +423,7 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
 
 	BUG_ON(item->threads[0].real != pid);
 
-	p = get_exec_start(vma_area_list);
+	p = get_exec_start(vma_area_list, pid);
 	if (!p) {
 		pr_err("No suitable VM found\n");
 		return NULL;
@@ -411,7 +445,93 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
 	ictx->orig_handler.sa_flags = SA_SIGINFO | SA_RESTART;
 	sigemptyset(&ictx->orig_handler.sa_mask);
 	sigaddset(&ictx->orig_handler.sa_mask, SIGCHLD);
-	ictx->sock = dmpi(item)->netns->net.seqsk;
+	/*
+	 * A task with a substituted network namespace is dumped into
+	 * the one of its parent task, but the parasite transport (an
+	 * abstract unix socket) is reachable in the network namespace
+	 * the parasite is injected in only: a dedicated listener is
+	 * created in the real one of such a task.
+	 */
+	if (dmpi(item)->netns_substituted) {
+		static struct psock_ns {
+			struct psock_ns *next;
+			unsigned long ino;
+			int sk;
+		} *psock_ns;
+		struct psock_ns *pn;
+		struct sockaddr_un addr;
+		struct stat st;
+		char nspath[64];
+		int netfd, curfd, sk;
+
+		snprintf(nspath, sizeof(nspath), "/proc/%d/ns/net", item->pid->real);
+		netfd = open(nspath, O_RDONLY);
+		if (netfd < 0) {
+			pr_perror("Can't open the network namespace of %d", item->pid->real);
+			return NULL;
+		}
+		if (fstat(netfd, &st)) {
+			close(netfd);
+			return NULL;
+		}
+
+		sk = -1;
+		for (pn = psock_ns; pn; pn = pn->next)
+			if (pn->ino == st.st_ino) {
+				sk = pn->sk;
+				break;
+			}
+
+		if (sk < 0) {
+			curfd = open("/proc/self/ns/net", O_RDONLY);
+			if (curfd < 0) {
+				pr_perror("Can't open the current network namespace");
+				close(netfd);
+				return NULL;
+			}
+
+			if (setns(netfd, CLONE_NEWNET) == 0) {
+				sk = socket(PF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK, 0);
+				if (sk >= 0) {
+					socklen_t alen = compel_gen_parasite_saddr(&addr, getpid());
+
+					if (bind(sk, &addr, alen) < 0 || listen(sk, 1) < 0) {
+						pr_perror("Can't bind a parasite socket in the network namespace of %d",
+						  item->pid->real);
+						close(sk);
+						sk = -1;
+					}
+				}
+				setns(curfd, CLONE_NEWNET);
+			} else
+				pr_perror("Can't enter the network namespace of %d", item->pid->real);
+
+			close(curfd);
+
+			if (sk >= 0) {
+				pn = xmalloc(sizeof(*pn));
+				if (!pn) {
+					close(sk);
+					close(netfd);
+					return NULL;
+				}
+				pn->ino = st.st_ino;
+				pn->sk = sk;
+				pn->next = psock_ns;
+				psock_ns = pn;
+			}
+		}
+
+		close(netfd);
+		if (sk < 0) {
+			pr_err("Can't create a parasite socket in the network namespace of %d\n",
+			       item->pid->real);
+			return NULL;
+		}
+		ictx->sock = sk;
+	} else {
+		ictx->sock = dmpi(item)->netns->net.seqsk;
+	}
 	ictx->save_regs = save_task_regs;
 	ictx->make_sigframe = make_sigframe;
 	ictx->regs_arg = item->core[0];

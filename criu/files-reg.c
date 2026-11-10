@@ -42,6 +42,9 @@
 #include "file-ids.h"
 #include "mount.h"
 #include "files.h"
+#include "filesystems.h"
+#include "images/mnt.pb-c.h"
+#include "nested-ns.h"
 #include "common/list.h"
 #include "rst-malloc.h"
 #include "fs-magic.h"
@@ -530,8 +533,15 @@ static int create_ghost(struct ghost_file *gf, GhostFileEntry *gfe, struct cr_im
 	 */
 	rel_path = get_relative_path(path, service_mountpoint(mi));
 	if (!rel_path) {
-		pr_err("Can't get path %s relative to %s\n", path, service_mountpoint(mi));
-		return -1;
+		/*
+		 * The ghost was created in the remap directory of the
+		 * roots yard (it is shared by the mounts of a nested
+		 * tree): the plain path of it is kept as it is, the
+		 * users of the ghost open it as it is.
+		 */
+		pr_debug("The ghost %s is at the remap directory\n", path);
+		snprintf(gf->remap.rpath, PATH_MAX, "%s", path);
+		return 0;
 	}
 
 	rel_mp = get_relative_path(mi->ns_mountpoint, "/");
@@ -859,6 +869,14 @@ nomntns:
 		ret = unlink(path);
 
 	if (ret) {
+		if (errno == ENOENT) {
+			/* A ghost of a stand-in mount (a fuse or an overlay one
+			 * of a nested tree): the file of it was never created,
+			 * there is nothing to clean up. */
+			pr_warn("The remap %s is gone already\n", path);
+			remap->rpath[0] = 0;
+			return 0;
+		}
 		pr_perror("Couldn't unlink remap %s", path);
 		return -1;
 	}
@@ -1804,9 +1822,39 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 	}
 
 	mi = lookup_mnt_id(p->mnt_id);
+	/* The ids of the mounts of the nested trees are remapped at dump:
+	 * the one of the file can name an other mount now. The files of
+	 * an overlay report the device of the layer, not of the mount:
+	 * those are trusted by the id alone. */
+	if (mi && mi->fstype->code != FSTYPE__OVERLAYFS && !sdev_matches_stat(mi->s_dev, p->stat.st_dev))
+		mi = NULL;
 	if (mi == NULL) {
+		struct statfs fs;
+
 		if (opts.shell_job && is_tty(p->stat.st_rdev, p->stat.st_dev)) {
 			skip_for_shell_job = true;
+		} else if (!fstatfs(lfd, &fs) &&
+			   (fs.f_type == CGROUP2_SUPER_MAGIC || fs.f_type == CGROUP_SUPER_MAGIC)) {
+			/*
+			 * A file of a cgroup filesystem opened before the
+			 * mount namespace was entered or via the one of the
+			 * parent: the mounts of them are re-created as fresh
+			 * ones on restore, so the fd is closed instead (the
+			 * task can open the file again if it needs it).
+			 */
+			pr_warn("fd %d on a cgroup file is closed on restore\n", p->fd);
+			return 0;
+		} else if (nested_ns_enabled()) {
+			/*
+			 * A file of a mount of a namespace substituted at
+			 * dump (e.g. a mapped one of the tmpfs of the
+			 * /run of the systemd of an inner container):
+			 * the mount is not restored, so the file of it is
+			 * neither -- the holder re-opens it from the
+			 * namespace of its parent task if it needs it.
+			 */
+			pr_warn("fd %d on a mount of a substituted namespace is closed on restore\n", p->fd);
+			return -EOPNOTSUPP;
 		} else {
 			pr_err("Can't lookup mount=%d for fd=%d path=%s\n", p->mnt_id, p->fd, link->name + 1);
 			return -1;
@@ -1844,6 +1892,36 @@ ext:
 	rfe.fown = (FownEntry *)&p->fown;
 	rfe.has_mode = true;
 	rfe.mode = p->stat.st_mode;
+
+	if (nested_ns_enabled() && S_ISCHR(p->stat.st_mode) && major(p->stat.st_rdev) == MISC_MAJOR &&
+	    minor(p->stat.st_rdev) == FUSE_DEV_MINOR && !strcmp(link->name + 1, "/dev/fuse")) {
+		/*
+		 * The fd of a connection of a fuse mount of a nested
+		 * tree: the restore creates the connection of the mount
+		 * and hands it over to the daemon of it (see the
+		 * fuse_connection_mount of filesystems.c). The mount is
+		 * named by the id of it: the daemon of the one fuse
+		 * mount of the tree is the holder (the pairing of many
+		 * mounts with many daemons needs a kernel api for the
+		 * name of the connection of an fd, which is not there).
+		 */
+		struct mount_info *mi = NULL;
+		int n_fuse = 0;
+
+		for (struct mount_info *it = mntinfo; it; it = it->next) {
+			if (it->fstype->code != FSTYPE__FUSE)
+				continue;
+			mi = it;
+			n_fuse++;
+		}
+		if (n_fuse == 1) {
+			rfe.fuse_conn_mnt = mi->mnt_id;
+			rfe.has_fuse_conn_mnt = true;
+		} else {
+			pr_warn("The tree has %d fuse mounts: the fd %d of %d is closed on restore\n",
+				n_fuse, p->fd, p->pid);
+		}
+	}
 
 	if (S_ISREG(p->stat.st_mode) && should_check_size(rfe.flags) && !store_validation_data(&rfe, p, lfd))
 		return -1;
@@ -2366,6 +2444,17 @@ int do_open_reg_noseek_flags(int ns_root_fd, struct reg_file_info *rfi, void *ar
 	u32 flags = *(u32 *)arg;
 	int fd;
 
+	if (rfi->rfe->has_fuse_conn_mnt) {
+		/*
+		 * The fd of a connection of a fuse mount of a nested
+		 * tree: the connection of the mount is published by the
+		 * task assembling it (see the fuse_connection_mount of
+		 * filesystems.c), which can be forked later than the
+		 * daemon of it holding the entry -- wait for it.
+		 */
+		return fuse_wait_connection(rfi->rfe->fuse_conn_mnt);
+	}
+
 	/* unnamed temporary files are restored as ghost files */
 	flags &= ~O_TMPFILE;
 
@@ -2393,9 +2482,11 @@ static int do_open_reg(int ns_root_fd, struct reg_file_info *rfi, void *arg)
 
 	/*
 	 * O_PATH opened files carry empty fops in kernel,
-	 * just ignore positioning at all.
+	 * just ignore positioning at all. The one of a fuse
+	 * connection is not seekable either (the daemon of it
+	 * reads the requests of it from the start).
 	 */
-	if (!(rfi->rfe->flags & O_PATH)) {
+	if (!(rfi->rfe->flags & O_PATH) && !rfi->rfe->has_fuse_conn_mnt) {
 		if (rfi->rfe->pos != -1ULL && lseek(fd, rfi->rfe->pos, SEEK_SET) < 0) {
 			pr_perror("Can't restore file pos");
 			close(fd);
@@ -2550,6 +2641,11 @@ int collect_filemap(struct vma_area *vma)
 {
 	struct file_desc *fd;
 
+	/* A vma anonymized at dump (its file was on a mount of a
+	 * substituted namespace): it is restored as a plain one. */
+	if (!vma->e->shmid)
+		return 0;
+
 	if (!vma->e->has_fdflags) {
 		/* Make a wild guess for the fdflags */
 		vma->e->has_fdflags = true;
@@ -2563,8 +2659,23 @@ int collect_filemap(struct vma_area *vma)
 		fd = collect_memfd(vma->e->shmid);
 	else
 		fd = collect_special_file(vma->e->shmid);
-	if (!fd)
+	if (!fd) {
+		if (nested_ns_enabled()) {
+			/*
+			 * A vma of a file of a mount of a substituted
+			 * namespace: the entry of the file was not taken
+			 * into the image (e.g. its exe or cwd link hit
+			 * the substituted mount first, and the dump
+			 * tolerated it without writing the entry) -- the
+			 * vma is restored as an anonymous one.
+			 */
+			pr_warn("The mapping at %#lx is restored as an anonymous one\n", (unsigned long)vma->e->start);
+			vma->e->shmid = 0;
+			vma->e->flags |= MAP_ANONYMOUS;
+			return 0;
+		}
 		return -1;
+	}
 
 	vma->vmfd = fd;
 	vma->vm_open = open_filemap;

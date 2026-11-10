@@ -1,6 +1,11 @@
 #!/bin/bash
 set -x -e
 
+# CAST AI: the LIVE tests run the production flavor of the fork: the
+# statically linked binary without the gnutls support (see the top
+# Makefile).
+export CASTAI_STATIC=y
+
 CI_PKGS=()
 
 X86_64_PKGS=(gcc-multilib)

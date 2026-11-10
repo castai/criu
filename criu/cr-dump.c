@@ -42,6 +42,7 @@
 #include "ptrace-compat.h"
 #include "util.h"
 #include "namespaces.h"
+#include "nested-ns.h"
 #include "image.h"
 #include "proc_parse.h"
 #include "parasite.h"
@@ -328,6 +329,12 @@ static int dump_task_exe_link(pid_t pid, MmEntry *mm)
 		return -1;
 
 	ret = dump_one_reg_file_cond(fd, &mm->exe_file_id, &params);
+	if (ret == -EOPNOTSUPP) {
+		/* The exe file is on a mount of a substituted namespace:
+		 * the link of it is not restored. */
+		mm->exe_file_id = 0;
+		ret = 0;
+	}
 
 	close(fd);
 	return ret;
@@ -350,6 +357,12 @@ static int dump_task_fs(pid_t pid, struct parasite_dump_misc *misc, struct cr_im
 		return -1;
 
 	ret = dump_one_reg_file_cond(fd, &fe.cwd_id, &p);
+	if (ret == -EOPNOTSUPP) {
+		/* The cwd is on a mount of a substituted namespace:
+		 * the task is restored with the one of its parent. */
+		fe.cwd_id = 0;
+		ret = 0;
+	}
 	if (ret < 0)
 		return ret;
 
@@ -363,6 +376,12 @@ static int dump_task_fs(pid_t pid, struct parasite_dump_misc *misc, struct cr_im
 		return -1;
 
 	ret = dump_one_reg_file_cond(fd, &fe.root_id, &p);
+	if (ret == -EOPNOTSUPP) {
+		/* The root is on a mount of a substituted namespace:
+		 * the link of it is not restored. */
+		fe.root_id = 0;
+		ret = 0;
+	}
 	if (ret < 0)
 		return ret;
 
@@ -465,6 +484,21 @@ static int dump_filemap(struct vma_area *vma_area, int fd)
 		ret = dump_one_memfd_cond(fd, &id, &p);
 	else
 		ret = dump_one_reg_file_cond(fd, &id, &p);
+
+	if (ret == -EOPNOTSUPP) {
+		/*
+		 * A mapped file of a mount of a substituted namespace:
+		 * it is not restored, the vma is dumped as an anonymous
+		 * one -- the private pages of it are in the memory
+		 * image already.
+		 */
+		pr_warn("The mapping at %#lx is restored as an anonymous one\n",
+			vma->start);
+		vma->shmid = 0;
+		vma->status &= ~VMA_AREA_MEMFD;
+		vma->flags |= MAP_ANONYMOUS;
+		return 0;
+	}
 
 	vma->shmid = id;
 	return ret;
@@ -923,7 +957,10 @@ static int dump_task_thread(struct parasite_ctl *parasite_ctl, const struct pstr
 		pr_err("Can't dump thread for pid %d\n", pid);
 		goto err;
 	}
-	pstree_insert_pid(tid);
+	/* The threads of a task of a nested tree share the vpid of
+	 * their leader: the pid of it is in the tree already. */
+	if (tid->ns[0].virt != vpid(item))
+		pstree_insert_pid(tid);
 
 	core->thread_core->creds->lsm_profile = dmpi(item)->thread_lsms[id]->profile;
 	core->thread_core->creds->lsm_sockcreate = dmpi(item)->thread_lsms[0]->sockcreate;
@@ -1382,7 +1419,9 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 		goto err_cure;
 	}
 
-	item->pid->ns[0].virt = misc.pid;
+	item->pid->ns[0].virt = nested_ns_dump_vpid(pid, misc.pid);
+	if (item->pid->ns[0].virt < 0)
+		goto err_cure;
 
 	mdc.pre_dump = true;
 	mdc.lazy = false;
@@ -1517,10 +1556,15 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
-	item->pid->ns[0].virt = misc.pid;
+	item->pid->ns[0].virt = nested_ns_dump_vpid(pid, misc.pid);
+	if (item->pid->ns[0].virt < 0)
+		goto err_cure;
 	pstree_insert_pid(item->pid);
 	item->sid = misc.sid;
 	item->pgid = misc.pgid;
+	/* The sid and the pgid of a task in a nested pid namespace need a translation */
+	if (nested_ns_dump_session(pid, &item->pgid, &item->sid))
+		goto err_cure;
 
 	pr_info("sid=%d pgid=%d pid=%d\n", item->sid, item->pgid, vpid(item));
 
