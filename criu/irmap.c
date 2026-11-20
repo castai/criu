@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <sys/stat.h>
@@ -239,6 +240,48 @@ invalid:
 
 static bool doing_predump = false;
 
+/*
+ * Can a walk of root reach files of st_dev == dev at all? A file of the
+ * device lives only inside mounts of it, so the root covers the device when
+ * the mount the root itself sits in is of that device (the walk stays
+ * inside it), or when a mount of the device hangs below the root (the walk
+ * descends into it). Path chains are cut at mount boundaries: a root under
+ * the NFS mount cannot reach overlay files, however deep the mount tree.
+ * Roots that cover nothing are skipped before any walk: a path list that
+ * includes an unrelated or network mount (a walk of which is one round
+ * trip per entry) cannot stall the dump on trees the watch cannot be in
+ * anyway. A device missing from the mount table keeps the blind behavior.
+ */
+static bool root_covers_dev(char *root, unsigned int dev)
+{
+	struct mount_info *m, *containing = NULL;
+	size_t root_len = strlen(root);
+	bool known = false;
+
+	for (m = mntinfo; m; m = m->next) {
+		if (m->s_dev != dev)
+			continue;
+		known = true;
+		if (is_sub_path(m->ns_mountpoint, root))
+			return true;
+	}
+
+	for (m = mntinfo; m; m = m->next) {
+		size_t len = strlen(m->ns_mountpoint);
+
+		if (len > root_len || !is_sub_path(root, m->ns_mountpoint))
+			continue;
+		/* Ties are impossible: mountpoints are unique. */
+		if (!containing || len >= strlen(containing->ns_mountpoint))
+			containing = m;
+	}
+
+	if (containing && containing->s_dev == dev)
+		return true;
+
+	return !known;
+}
+
 char *irmap_lookup(unsigned int s_dev, unsigned long i_ino)
 {
 	struct irmap *c, *h, **p;
@@ -279,6 +322,10 @@ char *irmap_lookup(unsigned int s_dev, unsigned long i_ino)
 	 * about them, hopefully they're more interesting than our hints.
 	 */
 	list_for_each_entry(o, &opts.irmap_scan_paths, node) {
+		if (!root_covers_dev(o->ir->path, s_dev)) {
+			pr_debug("Skipping %s: no mount of %#x under it\n", o->ir->path, s_dev);
+			continue;
+		}
 		c = irmap_scan(o->ir, s_dev, i_ino);
 		if (c) {
 			pr_debug("\tScanned %s\n", c->path);
@@ -288,6 +335,10 @@ char *irmap_lookup(unsigned int s_dev, unsigned long i_ino)
 	}
 
 	for (h = hints; h->path; h++) {
+		if (!root_covers_dev(h->path, s_dev)) {
+			pr_debug("Skipping %s hint: no mount of %#x under it\n", h->path, s_dev);
+			continue;
+		}
 		pr_debug("Scanning %s hint\n", h->path);
 		c = irmap_scan(h, s_dev, i_ino);
 		if (c) {
