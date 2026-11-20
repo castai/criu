@@ -28,6 +28,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
 
 COPY . /work
 WORKDIR /work
+RUN make -j $(nproc) mrproper
 RUN make -j $(nproc) criu cuda_plugin
 
 FROM scratch

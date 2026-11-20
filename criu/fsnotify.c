@@ -266,6 +266,33 @@ static char *find_path_on_overlay(struct mount_info *m,
 	return found;
 }
 
+/*
+ * Watches no resolution path could map. check_open_handle() defers them
+ * here instead of deciding on the spot: only fsnotify_resolve_pending(),
+ * running once every file of every task has been dumped and the ghost
+ * registry is complete, may let a watch stay in the image without a path —
+ * a watch on a file dumped as ghost (deleted while still open), which
+ * restore re-attaches via lookup_ghost_remap. A live target with no
+ * resolved path is a resolution bug and fails the dump there.
+ */
+struct pending_watch {
+	struct list_head list;
+	u32 s_dev;
+	u64 i_ino;
+};
+static LIST_HEAD(pending_watches);
+
+static int add_pending_watch(u32 s_dev, u64 i_ino)
+{
+	struct pending_watch *p = xmalloc(sizeof(*p));
+	if (!p)
+		return -1;
+	p->s_dev = s_dev;
+	p->i_ino = i_ino;
+	list_add_tail(&p->list, &pending_watches);
+	return 0;
+}
+
 static char *alloc_openable(unsigned int s_dev, unsigned long i_ino, FhEntry *f_handle)
 {
 	struct mount_info *m;
@@ -467,15 +494,13 @@ fault:
 	irmap_path = irmap_lookup(s_dev, i_ino);
 	if (!irmap_path) {
 		/*
-		 * The watch target has no name anywhere: it was deleted and
-		 * unlinked, or no scan root covers its mount. Keep the watch
-		 * with no path instead of failing the whole dump. At restore it
-		 * is either re-attached to the ghost file dumped for the
-		 * target's last open fd (inotify_resolve_remap ->
-		 * lookup_ghost_remap), resolved by open_handle, or skipped by
-		 * restore_one_inotify when nothing references the inode anymore.
+		 * No path anywhere yet. Keep the watch without one and defer
+		 * the decision to fsnotify_resolve_pending(), which runs after
+		 * every file has been dumped and the ghost registry is complete.
 		 */
-		pr_warn("\tHandle 0x%x:0x%lx has no path, keeping the watch without one\n", s_dev, i_ino);
+		pr_warn("\tHandle 0x%x:0x%lx has no path yet\n", s_dev, i_ino);
+		if (add_pending_watch(s_dev, i_ino))
+			goto err;
 		goto out_nopath;
 	}
 	path = xstrdup(irmap_path);
@@ -488,6 +513,36 @@ out_nopath:
 	return 0;
 err:
 	return -1;
+}
+
+/*
+ * Decide the fate of the watches no resolution path could map. Must run after
+ * every file of every task has been dumped, so the ghost registry is
+ * complete. In the final dump a watch may stay pathless only when its target
+ * was dumped as a ghost file; a live target that nothing could map is a
+ * resolution bug and fails the dump instead of silently dropping the watch.
+ * Pre-dump writes no ghost files, so there it only drains the list: the final
+ * dump decides.
+ */
+int fsnotify_resolve_pending(int strict)
+{
+	struct pending_watch *p, *n;
+
+	list_for_each_entry_safe(p, n, &pending_watches, list) {
+		if (lookup_ghost_remap(p->s_dev, p->i_ino)) {
+			pr_info("watch 0x%x:0x%lx target dumped as ghost file, restore will re-attach\n",
+				 p->s_dev, p->i_ino);
+		} else if (strict) {
+			pr_err("watch 0x%x:0x%lx target is live but has no resolved path\n",
+				p->s_dev, p->i_ino);
+			return -1;
+		} else {
+			pr_warn("watch 0x%x:0x%lx unresolved in pre-dump\n", p->s_dev, p->i_ino);
+		}
+		list_del(&p->list);
+		xfree(p);
+	}
+	return 0;
 }
 
 static int check_one_wd(InotifyWdEntry *we)

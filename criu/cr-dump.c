@@ -20,6 +20,7 @@
 
 #include "types.h"
 #include "protobuf.h"
+#include "fsnotify.h"
 #include "images/fdinfo.pb-c.h"
 #include "images/fs.pb-c.h"
 #include "images/mm.pb-c.h"
@@ -1856,6 +1857,16 @@ int cr_pre_dump_tasks(pid_t pid)
 		if (pre_dump_one_task(item, parent_ie))
 			goto err;
 
+	/* Pre-dump writes no ghost files, so nothing strict to resolve. */
+	if (fsnotify_resolve_pending(0))
+		goto err;
+
+	if (parent_ie) {
+		inventory_entry__free_unpacked(parent_ie, NULL);
+		parent_ie = NULL;
+	}
+
+>>>>>>> ae5a3ecb7 (fsnotify: resolve ghost watches up front, fail loudly on live unresolvable ones)
 	ret = cr_dump_shmem();
 	if (ret)
 		goto err;
@@ -2125,12 +2136,25 @@ int cr_dump_tasks(pid_t pid)
 	}
 
 	/*
+	 * Every file is dumped now, so the ghost registry is complete: any
+	 * watch still without a path must be on a dumped ghost file, or the
+	 * dump fails here instead of silently dropping a live watch.
+	 */
+	if (fsnotify_resolve_pending(1))
+		goto err;
+
+	/*
 	 * This hook finalizes global device state. Run every implementation so
 	 * that one plugin cannot prevent another from completing its work.
 	 */
 	ret = run_plugins_all(DUMP_DEVICES_LATE, pid);
 	if (ret && ret != -ENOTSUP)
 		goto err;
+
+	if (parent_ie) {
+		inventory_entry__free_unpacked(parent_ie, NULL);
+		parent_ie = NULL;
+	}
 
 	/*
 	 * It may happen that a process has completed but its files in
