@@ -466,8 +466,17 @@ fault:
 	pr_warn("\tHandle 0x%x:0x%lx cannot be opened\n", s_dev, i_ino);
 	irmap_path = irmap_lookup(s_dev, i_ino);
 	if (!irmap_path) {
-		pr_err("\tCan't dump that handle\n");
-		return -1;
+		/*
+		 * The watch target has no name anywhere: it was deleted and
+		 * unlinked, or no scan root covers its mount. Keep the watch
+		 * with no path instead of failing the whole dump. At restore it
+		 * is either re-attached to the ghost file dumped for the
+		 * target's last open fd (inotify_resolve_remap ->
+		 * lookup_ghost_remap), resolved by open_handle, or skipped by
+		 * restore_one_inotify when nothing references the inode anymore.
+		 */
+		pr_warn("\tHandle 0x%x:0x%lx has no path, keeping the watch without one\n", s_dev, i_ino);
+		goto out_nopath;
 	}
 	path = xstrdup(irmap_path);
 	if (!path)
@@ -773,9 +782,21 @@ static int restore_one_inotify(int inotify_fd, struct fsnotify_mark_info *info)
 	uint32_t mask;
 
 	path = get_mark_path("inotify", info->remap, iwe->f_handle, iwe->i_ino, iwe->s_dev, buf, &target);
+	path = get_mark_path("inotify", info->remap, iwe->f_handle, iwe->i_ino, iwe->s_dev, buf, &target);
 	if (!path) {
-		pr_err("Failed to get path for inotify wd %#x (dev %#x ino %#" PRIx64 " mask %#x)\n",
-		       iwe->wd, iwe->s_dev, iwe->i_ino, iwe->mask);
+		/*
+		 * Dumped with no path and nothing to attach to: the watch
+		 * target is gone. Dropping one watch beats failing the restore
+		 * of everything else; INOTIFY_IOC_SETNEXTWD keeps the wd
+		 * numbering of the remaining watches exact across the gap.
+		 */
+		if (!iwe->f_handle->path && !info->remap && kdat.has_inotify_setnextwd) {
+			pr_warn("Skipping watch 0x%x:0x%lx, target is gone\n", iwe->s_dev, iwe->i_ino);
+			ret = 0;
+		} else {
+			pr_err("Failed to get path for inotify wd %#x (dev %#x ino %#" PRIx64 " mask %#x)\n",
+			       iwe->wd, iwe->s_dev, iwe->i_ino, iwe->mask);
+		}
 		goto err;
 	}
 
@@ -859,9 +880,19 @@ static int restore_one_fanotify(int fd, struct fsnotify_mark_info *mark)
 	} else if (fme->type == MARK_TYPE__INODE) {
 		path = get_mark_path("fanotify", mark->remap, fme->ie->f_handle, fme->ie->i_ino, fme->s_dev, buf,
 				     &target);
+	} else if (fme->type == MARK_TYPE__INODE) {
+		path = get_mark_path("fanotify", mark->remap, fme->ie->f_handle, fme->ie->i_ino, fme->s_dev, buf,
+				     &target);
 		if (!path) {
-			pr_err("Failed to get path for fanotify mark (dev %#x ino %#" PRIx64 " mask %#x)\n",
-			       fme->s_dev, fme->ie->i_ino, fme->mask);
+			/* see restore_one_inotify */
+			if (!fme->ie->f_handle->path && !mark->remap) {
+				pr_warn("Skipping fanotify mark 0x%x:0x%lx, target is gone\n",
+					 fme->s_dev, fme->ie->i_ino);
+				ret = 0;
+			} else {
+				pr_err("Failed to get path for fanotify mark (dev %#x ino %#" PRIx64 " mask %#x)\n",
+				       fme->s_dev, fme->ie->i_ino, fme->mask);
+			}
 			goto err;
 		}
 	} else {
