@@ -251,29 +251,52 @@ static bool doing_predump = false;
  * includes an unrelated or network mount (a walk of which is one round
  * trip per entry) cannot stall the dump on trees the watch cannot be in
  * anyway. A device missing from the mount table keeps the blind behavior.
+ *
+ * ns_mountpoint values are relative to the mount namespace root and carry
+ * a "./" prefix ("." alone for the root mount), while scan roots are
+ * absolute: normalize before comparing, or every containment test fails
+ * and the root mount ends up covering everything.
  */
 static bool root_covers_dev(char *root, unsigned int dev)
 {
 	struct mount_info *m, *containing = NULL;
-	size_t root_len = strlen(root);
 	bool known = false;
+	char root_buf[PATH_MAX];
+	char *root_norm;
+	size_t containing_len = 0;
+
+	root_norm = root;
+	if (root[0] != '/') {
+		snprintf(root_buf, sizeof(root_buf), "/%s", root);
+		root_norm = root_buf;
+	}
 
 	for (m = mntinfo; m; m = m->next) {
+		char *mnp;
+
 		if (m->s_dev != dev)
 			continue;
 		known = true;
-		if (is_sub_path(m->ns_mountpoint, root))
+		mnp = !strcmp(m->ns_mountpoint, ".") ? "/" :
+			strncmp(m->ns_mountpoint, "./", 2) ? m->ns_mountpoint : m->ns_mountpoint + 1;
+		if (is_sub_path(mnp, root_norm))
 			return true;
 	}
 
 	for (m = mntinfo; m; m = m->next) {
-		size_t len = strlen(m->ns_mountpoint);
+		char *mnp;
+		size_t len;
 
-		if (len > root_len || !is_sub_path(root, m->ns_mountpoint))
+		mnp = !strcmp(m->ns_mountpoint, ".") ? "/" :
+			strncmp(m->ns_mountpoint, "./", 2) ? m->ns_mountpoint : m->ns_mountpoint + 1;
+		len = strlen(mnp);
+		if (!is_sub_path(root_norm, mnp))
 			continue;
 		/* Ties are impossible: mountpoints are unique. */
-		if (!containing || len >= strlen(containing->ns_mountpoint))
+		if (!containing || len >= containing_len) {
 			containing = m;
+			containing_len = len;
+		}
 	}
 
 	if (containing && containing->s_dev == dev)
@@ -514,8 +537,29 @@ int irmap_load_cache(void)
 	int ret;
 	struct cr_img *img;
 
+	/*
+	 * The cache is a pure optimization: every entry is revalidated with
+	 * fstatat before use. irmap_predump_run() rewrites it with O_TRUNC at
+	 * the end of every pre-dump, so a dump killed between truncate and
+	 * rewrite leaves it short. Skip a short file before open_image_at()
+	 * prints an error for it: the log line alone is enough for callers
+	 * that collect CRIU error output to fail the whole dump.
+	 */
+	{
+		struct stat st;
+
+		if (!stat("irmap-cache", &st) && st.st_size < 3 * sizeof(u32)) {
+			pr_info("irmap cache is short (%ld bytes), ignoring\n", (long)st.st_size);
+			return 0;
+		}
+	}
+
 	ret = open_irmap_cache(&img);
-	if (ret <= 0)
+	if (ret < 0) {
+		pr_warn("irmap cache unreadable, ignoring\n");
+		return 0;
+	}
+	if (ret == 0)
 		return ret;
 
 	pr_info("Loading irmap cache\n");
@@ -534,6 +578,16 @@ int irmap_load_cache(void)
 	}
 
 	close_image(img);
+	/*
+	 * The cache is a pure optimization: every entry is revalidated with
+	 * fstatat before use. A truncated or corrupt file — a dump retry can
+	 * rewrite it while a straggling reader is still in it — must skip the
+	 * rest of the cache, not fail the dump.
+	 */
+	if (ret < 0) {
+		pr_warn("irmap cache corrupt, ignoring the rest\n");
+		ret = 0;
+	}
 	return ret;
 }
 
