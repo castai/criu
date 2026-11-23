@@ -31,6 +31,8 @@
 #include "images/fsnotify.pb-c.h"
 #include "images/fh.pb-c.h"
 
+#include "live_irmap.c"
+
 #undef LOG_PREFIX
 #define LOG_PREFIX "irmap: "
 
@@ -240,70 +242,6 @@ invalid:
 
 static bool doing_predump = false;
 
-/*
- * Can a walk of root reach files of st_dev == dev at all? A file of the
- * device lives only inside mounts of it, so the root covers the device when
- * the mount the root itself sits in is of that device (the walk stays
- * inside it), or when a mount of the device hangs below the root (the walk
- * descends into it). Path chains are cut at mount boundaries: a root under
- * the NFS mount cannot reach overlay files, however deep the mount tree.
- * Roots that cover nothing are skipped before any walk: a path list that
- * includes an unrelated or network mount (a walk of which is one round
- * trip per entry) cannot stall the dump on trees the watch cannot be in
- * anyway. A device missing from the mount table keeps the blind behavior.
- *
- * ns_mountpoint values are relative to the mount namespace root and carry
- * a "./" prefix ("." alone for the root mount), while scan roots are
- * absolute: normalize before comparing, or every containment test fails
- * and the root mount ends up covering everything.
- */
-static bool root_covers_dev(char *root, unsigned int dev)
-{
-	struct mount_info *m, *containing = NULL;
-	bool known = false;
-	char root_buf[PATH_MAX];
-	char *root_norm;
-	size_t containing_len = 0;
-
-	root_norm = root;
-	if (root[0] != '/') {
-		snprintf(root_buf, sizeof(root_buf), "/%s", root);
-		root_norm = root_buf;
-	}
-
-	for (m = mntinfo; m; m = m->next) {
-		char *mnp;
-
-		if (m->s_dev != dev)
-			continue;
-		known = true;
-		mnp = !strcmp(m->ns_mountpoint, ".") ? "/" :
-			strncmp(m->ns_mountpoint, "./", 2) ? m->ns_mountpoint : m->ns_mountpoint + 1;
-		if (is_sub_path(mnp, root_norm))
-			return true;
-	}
-
-	for (m = mntinfo; m; m = m->next) {
-		char *mnp;
-		size_t len;
-
-		mnp = !strcmp(m->ns_mountpoint, ".") ? "/" :
-			strncmp(m->ns_mountpoint, "./", 2) ? m->ns_mountpoint : m->ns_mountpoint + 1;
-		len = strlen(mnp);
-		if (!is_sub_path(root_norm, mnp))
-			continue;
-		/* Ties are impossible: mountpoints are unique. */
-		if (!containing || len >= containing_len) {
-			containing = m;
-			containing_len = len;
-		}
-	}
-
-	if (containing && containing->s_dev == dev)
-		return true;
-
-	return !known;
-}
 
 char *irmap_lookup(unsigned int s_dev, unsigned long i_ino)
 {
@@ -345,7 +283,7 @@ char *irmap_lookup(unsigned int s_dev, unsigned long i_ino)
 	 * about them, hopefully they're more interesting than our hints.
 	 */
 	list_for_each_entry(o, &opts.irmap_scan_paths, node) {
-		if (!root_covers_dev(o->ir->path, s_dev)) {
+		if (!live_irmap_root_covers_dev(o->ir->path, s_dev)) {
 			pr_debug("Skipping %s: no mount of %#x under it\n", o->ir->path, s_dev);
 			continue;
 		}
@@ -358,7 +296,7 @@ char *irmap_lookup(unsigned int s_dev, unsigned long i_ino)
 	}
 
 	for (h = hints; h->path; h++) {
-		if (!root_covers_dev(h->path, s_dev)) {
+		if (!live_irmap_root_covers_dev(h->path, s_dev)) {
 			pr_debug("Skipping %s hint: no mount of %#x under it\n", h->path, s_dev);
 			continue;
 		}

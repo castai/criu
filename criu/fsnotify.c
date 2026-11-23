@@ -47,6 +47,8 @@
 #include "images/fsnotify.pb-c.h"
 #include "images/mnt.pb-c.h"
 
+#include "live_fsnotify.c"
+
 #undef LOG_PREFIX
 #define LOG_PREFIX "fsnotify: "
 
@@ -266,32 +268,6 @@ static char *find_path_on_overlay(struct mount_info *m,
 	return found;
 }
 
-/*
- * Watches no resolution path could map. check_open_handle() defers them
- * here instead of deciding on the spot: only fsnotify_resolve_pending(),
- * running once every file of every task has been dumped and the ghost
- * registry is complete, may let a watch stay in the image without a path —
- * a watch on a file dumped as ghost (deleted while still open), which
- * restore re-attaches via lookup_ghost_remap. A live target with no
- * resolved path is a resolution bug and fails the dump there.
- */
-struct pending_watch {
-	struct list_head list;
-	u32 s_dev;
-	u64 i_ino;
-};
-static LIST_HEAD(pending_watches);
-
-static int add_pending_watch(u32 s_dev, u64 i_ino)
-{
-	struct pending_watch *p = xmalloc(sizeof(*p));
-	if (!p)
-		return -1;
-	p->s_dev = s_dev;
-	p->i_ino = i_ino;
-	list_add_tail(&p->list, &pending_watches);
-	return 0;
-}
 
 static char *alloc_openable(unsigned int s_dev, unsigned long i_ino, FhEntry *f_handle)
 {
@@ -515,35 +491,6 @@ err:
 	return -1;
 }
 
-/*
- * Decide the fate of the watches no resolution path could map. Must run after
- * every file of every task has been dumped, so the ghost registry is
- * complete. In the final dump a watch may stay pathless only when its target
- * was dumped as a ghost file; a live target that nothing could map is a
- * resolution bug and fails the dump instead of silently dropping the watch.
- * Pre-dump writes no ghost files, so there it only drains the list: the final
- * dump decides.
- */
-int fsnotify_resolve_pending(int strict)
-{
-	struct pending_watch *p, *n;
-
-	list_for_each_entry_safe(p, n, &pending_watches, list) {
-		if (lookup_ghost_remap(p->s_dev, p->i_ino)) {
-			pr_info("watch 0x%x:0x%lx target dumped as ghost file, restore will re-attach\n",
-				 p->s_dev, p->i_ino);
-		} else if (strict) {
-			pr_err("watch 0x%x:0x%lx target is live but has no resolved path\n",
-				p->s_dev, p->i_ino);
-			return -1;
-		} else {
-			pr_warn("watch 0x%x:0x%lx unresolved in pre-dump\n", p->s_dev, p->i_ino);
-		}
-		list_del(&p->list);
-		xfree(p);
-	}
-	return 0;
-}
 
 static int check_one_wd(InotifyWdEntry *we)
 {
@@ -760,7 +707,7 @@ static char *get_mark_path(const char *who, struct file_remap *remap, FhEntry *f
 	char *path = NULL;
 
 	if (remap) {
-		int mntns_root, pin;
+		int mntns_root;
 
 		mntns_root = mntns_get_root_by_mnt_id(remap->rmnt_id);
 		if (mntns_root < 0) {
@@ -773,25 +720,8 @@ static char *get_mark_path(const char *who, struct file_remap *remap, FhEntry *f
 		*target = openat(mntns_root, remap->rpath, O_PATH);
 		if (*target < 0)
 			goto err;
-		/*
-		 * The fd pins the ghost file's dentry through the restorer's
-		 * unlinks of the ghost name (open_path() and
-		 * try_clean_remaps()), so the kernel cannot run
-		 * fsnotify_inoderemove() on the inode and IN_IGNORED the
-		 * just-armed watch. It must not occupy a slot the task's own fd
-		 * table restoration wants: dup it above the task's fd range and
-		 * mark it close-on-exec, so it dies at the final exec — after
-		 * every ghost unlink has happened, and by then the restored
-		 * task's own fd keeps the inode alive.
-		 */
-		pin = fcntl(*target, F_DUPFD, 1024);
-		if (pin < 0) {
-			pr_perror("Can't pin ghost watch fd");
+		if (live_fsnotify_pin_remap_fd(target))
 			goto err;
-		}
-		close(*target);
-		fcntl(pin, F_SETFD, FD_CLOEXEC);
-		*target = pin;
 	} else if (f_handle->path) {
 		int mntns_root;
 		char *fpath = ".";
@@ -858,15 +788,8 @@ static int restore_one_inotify(int inotify_fd, struct fsnotify_mark_info *info)
 	uint32_t mask;
 
 	path = get_mark_path("inotify", info->remap, iwe->f_handle, iwe->i_ino, iwe->s_dev, buf, &target);
-	path = get_mark_path("inotify", info->remap, iwe->f_handle, iwe->i_ino, iwe->s_dev, buf, &target);
 	if (!path) {
-		/*
-		 * Dumped with no path and nothing to attach to: the watch
-		 * target is gone. Dropping one watch beats failing the restore
-		 * of everything else; INOTIFY_IOC_SETNEXTWD keeps the wd
-		 * numbering of the remaining watches exact across the gap.
-		 */
-		if (!iwe->f_handle->path && !info->remap && kdat.has_inotify_setnextwd) {
+		if (live_fsnotify_mark_gone(iwe->f_handle, info->remap) && kdat.has_inotify_setnextwd) {
 			pr_warn("Skipping watch 0x%x:0x%lx, target is gone\n", iwe->s_dev, iwe->i_ino);
 			ret = 0;
 		} else {
@@ -965,12 +888,8 @@ static int restore_one_fanotify(int fd, struct fsnotify_mark_info *mark)
 	} else if (fme->type == MARK_TYPE__INODE) {
 		path = get_mark_path("fanotify", mark->remap, fme->ie->f_handle, fme->ie->i_ino, fme->s_dev, buf,
 				     &target);
-	} else if (fme->type == MARK_TYPE__INODE) {
-		path = get_mark_path("fanotify", mark->remap, fme->ie->f_handle, fme->ie->i_ino, fme->s_dev, buf,
-				     &target);
 		if (!path) {
-			/* see restore_one_inotify */
-			if (!fme->ie->f_handle->path && !mark->remap) {
+			if (live_fsnotify_mark_gone(fme->ie->f_handle, mark->remap)) {
 				pr_warn("Skipping fanotify mark 0x%x:0x%lx, target is gone\n",
 					 fme->s_dev, fme->ie->i_ino);
 				ret = 0;
