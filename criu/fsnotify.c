@@ -760,7 +760,7 @@ static char *get_mark_path(const char *who, struct file_remap *remap, FhEntry *f
 	char *path = NULL;
 
 	if (remap) {
-		int mntns_root;
+		int mntns_root, pin;
 
 		mntns_root = mntns_get_root_by_mnt_id(remap->rmnt_id);
 		if (mntns_root < 0) {
@@ -771,6 +771,27 @@ static char *get_mark_path(const char *who, struct file_remap *remap, FhEntry *f
 
 		pr_debug("\t\tRestore %s watch for %#08x:%#016lx (via %s)\n", who, s_dev, i_ino, remap->rpath);
 		*target = openat(mntns_root, remap->rpath, O_PATH);
+		if (*target < 0)
+			goto err;
+		/*
+		 * The fd pins the ghost file's dentry through the restorer's
+		 * unlinks of the ghost name (open_path() and
+		 * try_clean_remaps()), so the kernel cannot run
+		 * fsnotify_inoderemove() on the inode and IN_IGNORED the
+		 * just-armed watch. It must not occupy a slot the task's own fd
+		 * table restoration wants: dup it above the task's fd range and
+		 * mark it close-on-exec, so it dies at the final exec — after
+		 * every ghost unlink has happened, and by then the restored
+		 * task's own fd keeps the inode alive.
+		 */
+		pin = fcntl(*target, F_DUPFD, 1024);
+		if (pin < 0) {
+			pr_perror("Can't pin ghost watch fd");
+			goto err;
+		}
+		close(*target);
+		fcntl(pin, F_SETFD, FD_CLOEXEC);
+		*target = pin;
 	} else if (f_handle->path) {
 		int mntns_root;
 		char *fpath = ".";
@@ -892,7 +913,16 @@ static int restore_one_inotify(int inotify_fd, struct fsnotify_mark_info *info)
 	}
 
 err:
-	close_safe(&target);
+	/*
+	 * A remap-based watch keeps its target fd open: it pins the ghost
+	 * file's dentry through the restorer's unlinks of the ghost name
+	 * (open_path() and try_clean_remaps()), so the kernel cannot run
+	 * fsnotify_inoderemove on the inode and IN_IGNORED the just-armed
+	 * watch. O_CLOEXEC closes it at the final exec, after all unlinks;
+	 * the restored task's own fd keeps the inode alive from there on.
+	 */
+	if (!info->remap)
+		close_safe(&target);
 	return ret;
 }
 
@@ -976,7 +1006,9 @@ static int restore_one_fanotify(int fd, struct fsnotify_mark_info *mark)
 	}
 
 err:
-	close_safe(&target);
+	/* see restore_one_inotify: the remap target fd stays open */
+	if (!mark->remap)
+		close_safe(&target);
 	return ret;
 }
 

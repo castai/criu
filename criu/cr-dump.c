@@ -1866,7 +1866,6 @@ int cr_pre_dump_tasks(pid_t pid)
 		parent_ie = NULL;
 	}
 
->>>>>>> ae5a3ecb7 (fsnotify: resolve ghost watches up front, fail loudly on live unresolvable ones)
 	ret = cr_dump_shmem();
 	if (ret)
 		goto err;
