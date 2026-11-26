@@ -1,6 +1,8 @@
 #ifndef __CR_FSNOTIFY_H__
 #define __CR_FSNOTIFY_H__
 
+#include "fsnotify_error.h"
+
 #include "files.h"
 
 #include "protobuf.h"
@@ -11,6 +13,8 @@
 #ifndef INOTIFY_IOC_SETNEXTWD
 #define INOTIFY_IOC_SETNEXTWD _IOW('I', 0, __s32)
 #endif
+
+void fsnotify_log_handle_attempt(u32 s_dev, u64 i_ino, const char *what);
 
 extern int is_inotify_link(char *link);
 extern int is_fanotify_link(char *link);

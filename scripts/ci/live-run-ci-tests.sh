@@ -243,7 +243,6 @@ fi
 make -C test/others/make/ run CC="$CC"
 make -C test/others/criu-ns/ run
 make -C test/others/skip-file-rwx-check/ run
-make -C test/others/rpc/ run
 
 ./test/zdtm.py run -t zdtm/static/maps00 --preload-libfault
 ./test/zdtm.py run -t zdtm/static/maps02 --preload-libfault

@@ -102,7 +102,9 @@ static void decode_handle(fh_t *handle, FhEntry *img)
 
 static int open_by_handle(void *arg, int fd, int pid)
 {
-	return syscall(__NR_open_by_handle_at, fd, arg, O_PATH);
+	int result = syscall(__NR_open_by_handle_at, fd, arg, O_PATH);
+
+	return fsnotify_error_from_syscall(result, errno);
 }
 
 enum {
@@ -304,6 +306,7 @@ static char *alloc_openable(unsigned int s_dev, unsigned long i_ino, FhEntry *f_
 			continue;
 
 		fd = userns_call(open_by_handle, UNS_FDOUT, &handle, sizeof(handle), mntfd);
+		record_handle_failure(s_dev, i_ino, f_handle, m, fd);
 		close(mntfd);
 		if (fd < 0) {
 			if (m->fstype->code == FSTYPE__OVERLAYFS) {
@@ -401,6 +404,7 @@ static int open_handle(unsigned int s_dev, unsigned long i_ino, FhEntry *f_handl
 		}
 
 		fd = userns_call(open_by_handle, UNS_FDOUT, &handle, sizeof(handle), mntfd);
+		record_handle_failure(s_dev, i_ino, f_handle, m, fd);
 		if (fd >= 0) {
 			close(mntfd);
 			goto out;
@@ -485,6 +489,7 @@ fault:
 out:
 	pr_debug("\tDumping %s as path for handle\n", path);
 	f_handle->path = path;
+	forget_handle_failure(s_dev, i_ino);
 out_nopath:
 	return 0;
 err:
@@ -752,8 +757,7 @@ static char *get_mark_path(const char *who, struct file_remap *remap, FhEntry *f
 			pr_perror("Unable to open %s via path %s (dev %#x ino %#lx)",
 				  who, f_handle->path, s_dev, i_ino);
 		else
-			pr_perror("Unable to open %s by handle (dev %#x ino %#lx)",
-				  who, s_dev, i_ino);
+			fsnotify_log_handle_attempt(s_dev, i_ino, "Unable to open by handle");
 		goto err;
 	}
 

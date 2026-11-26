@@ -35,6 +35,7 @@
  */
 
 static LIST_HEAD(pending_watches);
+static LIST_HEAD(handle_failures);
 
 struct pending_watch {
 	struct list_head list;
@@ -42,10 +43,95 @@ struct pending_watch {
 	u64 i_ino;
 };
 
+/* Failure metadata is keyed by watch identity so no public function signature changes. */
+struct handle_failure {
+	struct list_head list;
+	u32 s_dev;
+	u64 i_ino;
+	int code;
+	int mnt_id;
+	const char *mountpoint;
+	const char *fstype;
+	u32 bytes;
+	u32 type;
+};
+
+static struct handle_failure *find_handle_failure(u32 s_dev, u64 i_ino)
+{
+	struct handle_failure *h;
+
+	list_for_each_entry(h, &handle_failures, list) {
+		if (h->s_dev == s_dev && h->i_ino == i_ino)
+			return h;
+	}
+	return NULL;
+}
+
+static void forget_handle_failure(u32 s_dev, u64 i_ino)
+{
+	struct handle_failure *h = find_handle_failure(s_dev, i_ino);
+
+	if (h) {
+		list_del(&h->list);
+		xfree(h);
+	}
+}
+
+static void clear_handle_failures(void)
+{
+	struct handle_failure *h, *n;
+
+	list_for_each_entry_safe(h, n, &handle_failures, list)
+		xfree(h);
+	INIT_LIST_HEAD(&handle_failures);
+}
+
+static void record_handle_failure(u32 s_dev, u64 i_ino, FhEntry *f_handle, const struct mount_info *m, int result)
+{
+	struct handle_failure *h;
+
+	if (result >= 0)
+		return;
+	h = find_handle_failure(s_dev, i_ino);
+	if (!h) {
+		h = xzalloc(sizeof(*h));
+		if (!h)
+			return;
+		h->s_dev = s_dev;
+		h->i_ino = i_ino;
+		list_add_tail(&h->list, &handle_failures);
+	}
+	h->code = result == -1 ? -EIO : result;
+	h->mnt_id = m->mnt_id;
+	h->mountpoint = m->ns_mountpoint;
+	h->fstype = m->fstype->name;
+	h->bytes = f_handle->bytes;
+	h->type = f_handle->type;
+}
+
+void fsnotify_log_handle_attempt(u32 s_dev, u64 i_ino, const char *what)
+{
+	struct handle_failure *h = find_handle_failure(s_dev, i_ino);
+
+	if (!h || !h->code) {
+		pr_err("watch 0x%x:0x%lx: %s (no open_by_handle_at error was recorded)\n", s_dev, i_ino, what);
+		return;
+	}
+	pr_err("watch 0x%x:0x%lx: %s; last open_by_handle_at on mnt %d (%s, %s) failed with %d (%s), handle type %#x bytes %#x\n",
+	       s_dev, i_ino, what, h->mnt_id, h->mountpoint ?: "?", h->fstype ?: "?", -h->code,
+	       strerror(-h->code), h->type, h->bytes);
+}
+
 static int add_pending_watch(u32 s_dev, u64 i_ino)
 {
-	struct pending_watch *p = xmalloc(sizeof(*p));
+	struct pending_watch *p;
 
+	list_for_each_entry(p, &pending_watches, list) {
+		if (p->s_dev == s_dev && p->i_ino == i_ino)
+			return 0;
+	}
+
+	p = xzalloc(sizeof(*p));
 	if (!p)
 		return -1;
 	p->s_dev = s_dev;
@@ -72,8 +158,8 @@ int fsnotify_resolve_pending(int strict)
 			pr_info("watch 0x%x:0x%lx target dumped as ghost file, restore will re-attach\n",
 				p->s_dev, p->i_ino);
 		} else if (strict) {
-			pr_err("watch 0x%x:0x%lx target is live but has no resolved path\n",
-				p->s_dev, p->i_ino);
+			fsnotify_log_handle_attempt(p->s_dev, p->i_ino, "target is live but has no resolved path");
+			clear_handle_failures();
 			return -1;
 		} else {
 			pr_warn("watch 0x%x:0x%lx unresolved in pre-dump\n", p->s_dev, p->i_ino);
@@ -81,6 +167,7 @@ int fsnotify_resolve_pending(int strict)
 		list_del(&p->list);
 		xfree(p);
 	}
+	clear_handle_failures();
 	return 0;
 }
 
