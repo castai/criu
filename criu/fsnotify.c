@@ -186,6 +186,14 @@ static char *__walk_overlay_dir(int dirfd, const char *base,
 			int subfd;
 			char *subbase;
 
+			/* Directories on other filesystems (procfs, sysfs,
+			 * tmpfs mounts under the overlay root) cannot contain
+			 * the target inode, and readdir on kernel
+			 * pseudo-files fails with EINVAL - don't descend.
+			 */
+			if (MKKDEV(major(st.st_dev), minor(st.st_dev)) != s_dev)
+				continue;
+
 			subfd = openat(dirfd, de->d_name,
 				       O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 			if (subfd < 0)
