@@ -155,14 +155,14 @@ int fsnotify_resolve_pending(int strict)
 
 	list_for_each_entry_safe(p, n, &pending_watches, list) {
 		if (lookup_ghost_remap(p->s_dev, p->i_ino)) {
-			pr_err("watch 0x%x:0x%lx target dumped as ghost file, restore will re-attach\n",
+			pr_info("watch 0x%x:0x%lx target dumped as ghost file, restore will re-attach\n",
 				p->s_dev, p->i_ino);
 		} else if (strict) {
 			fsnotify_log_handle_attempt(p->s_dev, p->i_ino, "target is live but has no resolved path");
 			clear_handle_failures();
 			return -1;
 		} else {
-			pr_err("watch 0x%x:0x%lx unresolved in pre-dump\n", p->s_dev, p->i_ino);
+			pr_warn("watch 0x%x:0x%lx unresolved in pre-dump\n", p->s_dev, p->i_ino);
 		}
 		list_del(&p->list);
 		xfree(p);
@@ -181,20 +181,6 @@ int fsnotify_resolve_pending(int strict)
  * unlink has happened — the task's own restored fd keeps the inode
  * alive from there on.
  */
-static int live_fsnotify_pin_remap_fd(int *target)
-{
-	int pin = fcntl(*target, F_DUPFD, 1024);
-
-	if (pin < 0) {
-		pr_perror("Can't pin ghost watch fd");
-		return -1;
-	}
-	close(*target);
-	fcntl(pin, F_SETFD, FD_CLOEXEC);
-	*target = pin;
-	return 0;
-}
-
 /*
  * A restored watch with no path and no remap points at a target that is
  * gone: the watch entry was dumped without a path because the target

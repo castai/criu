@@ -478,7 +478,7 @@ fault:
 		 * the decision to fsnotify_resolve_pending(), which runs after
 		 * every file has been dumped and the ghost registry is complete.
 		 */
-		pr_err("\tHandle 0x%x:0x%lx has no path yet\n", s_dev, i_ino);
+		pr_warn("\tHandle 0x%x:0x%lx has no path yet\n", s_dev, i_ino);
 		if (add_pending_watch(s_dev, i_ino))
 			goto err;
 		goto out_nopath;
@@ -725,8 +725,6 @@ static char *get_mark_path(const char *who, struct file_remap *remap, FhEntry *f
 		*target = openat(mntns_root, remap->rpath, O_PATH);
 		if (*target < 0)
 			goto err;
-		if (live_fsnotify_pin_remap_fd(target))
-			goto err;
 	} else if (f_handle->path) {
 		int mntns_root;
 		char *fpath = ".";
@@ -794,7 +792,7 @@ static int restore_one_inotify(int inotify_fd, struct fsnotify_mark_info *info)
 	path = get_mark_path("inotify", info->remap, iwe->f_handle, iwe->i_ino, iwe->s_dev, buf, &target);
 	if (!path) {
 		if (live_fsnotify_mark_gone(iwe->f_handle, info->remap) && kdat.has_inotify_setnextwd) {
-			pr_err("Skipping watch 0x%x:0x%lx, target is gone\n", iwe->s_dev, iwe->i_ino);
+			pr_warn("Skipping watch 0x%x:0x%lx, target is gone\n", iwe->s_dev, iwe->i_ino);
 			ret = 0;
 		} else {
 			pr_err("Failed to get path for inotify wd %#x (dev %#x ino %#" PRIx64 " mask %#x)\n",
@@ -841,15 +839,16 @@ static int restore_one_inotify(int inotify_fd, struct fsnotify_mark_info *info)
 
 err:
 	/*
-	 * A remap-based watch keeps its target fd open: it pins the ghost
-	 * file's dentry through the restorer's unlinks of the ghost name
-	 * (open_path() and try_clean_remaps()), so the kernel cannot run
-	 * fsnotify_inoderemove on the inode and IN_IGNORED the just-armed
-	 * watch. O_CLOEXEC closes it at the final exec, after all unlinks;
-	 * the restored task's own fd keeps the inode alive from there on.
+	 * The target fd is only needed as the /proc/self/fd path for the
+	 * inotify_add_watch above; it must be closed right after arming, or
+	 * it occupies the fd number that the fd-table serving reopens for the
+	 * next ghost file ("fd N already in use" at files.c:1125) and leaks
+	 * into the checkpoint. The kernel clears inotify marks at the
+	 * last-name unlink (dentry_unlink_inode runs fsnotify_inoderemove
+	 * regardless of open fds), so the fd cannot protect an armed watch
+	 * anyway.
 	 */
-	if (!info->remap)
-		close_safe(&target);
+	close_safe(&target);
 	return ret;
 }
 
@@ -894,7 +893,7 @@ static int restore_one_fanotify(int fd, struct fsnotify_mark_info *mark)
 				     &target);
 		if (!path) {
 			if (live_fsnotify_mark_gone(fme->ie->f_handle, mark->remap)) {
-				pr_err("Skipping fanotify mark 0x%x:0x%lx, target is gone\n",
+				pr_warn("Skipping fanotify mark 0x%x:0x%lx, target is gone\n",
 					 fme->s_dev, fme->ie->i_ino);
 				ret = 0;
 			} else {
@@ -929,9 +928,8 @@ static int restore_one_fanotify(int fd, struct fsnotify_mark_info *mark)
 	}
 
 err:
-	/* see restore_one_inotify: the remap target fd stays open */
-	if (!mark->remap)
-		close_safe(&target);
+	/* see restore_one_inotify: close the target fd after arming */
+	close_safe(&target);
 	return ret;
 }
 
