@@ -487,14 +487,14 @@ int irmap_load_cache(void)
 		struct stat st;
 
 		if (!stat("irmap-cache", &st) && st.st_size < 3 * sizeof(u32)) {
-			pr_info("irmap cache is short (%ld bytes), ignoring\n", (long)st.st_size);
+			pr_err("irmap cache is short (%ld bytes), ignoring\n", (long)st.st_size);
 			return 0;
 		}
 	}
 
 	ret = open_irmap_cache(&img);
 	if (ret < 0) {
-		pr_warn("irmap cache unreadable, ignoring\n");
+		pr_err("irmap cache unreadable, ignoring\n");
 		return 0;
 	}
 	if (ret == 0)
@@ -523,7 +523,7 @@ int irmap_load_cache(void)
 	 * rest of the cache, not fail the dump.
 	 */
 	if (ret < 0) {
-		pr_warn("irmap cache corrupt, ignoring the rest\n");
+		pr_err("irmap cache corrupt, ignoring the rest\n");
 		ret = 0;
 	}
 	return ret;
