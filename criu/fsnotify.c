@@ -478,7 +478,7 @@ fault:
 		 * the decision to fsnotify_resolve_pending(), which runs after
 		 * every file has been dumped and the ghost registry is complete.
 		 */
-		pr_warn("\tHandle 0x%x:0x%lx has no path yet\n", s_dev, i_ino);
+		pr_err("\tHandle 0x%x:0x%lx has no path yet\n", s_dev, i_ino);
 		if (add_pending_watch(s_dev, i_ino))
 			goto err;
 		goto out_nopath;
@@ -792,7 +792,7 @@ static int restore_one_inotify(int inotify_fd, struct fsnotify_mark_info *info)
 	path = get_mark_path("inotify", info->remap, iwe->f_handle, iwe->i_ino, iwe->s_dev, buf, &target);
 	if (!path) {
 		if (live_fsnotify_mark_gone(iwe->f_handle, info->remap) && kdat.has_inotify_setnextwd) {
-			pr_warn("Skipping watch 0x%x:0x%lx, target is gone\n", iwe->s_dev, iwe->i_ino);
+			pr_err("Skipping watch 0x%x:0x%lx, target is gone\n", iwe->s_dev, iwe->i_ino);
 			ret = 0;
 		} else {
 			pr_err("Failed to get path for inotify wd %#x (dev %#x ino %#" PRIx64 " mask %#x)\n",
@@ -893,7 +893,7 @@ static int restore_one_fanotify(int fd, struct fsnotify_mark_info *mark)
 				     &target);
 		if (!path) {
 			if (live_fsnotify_mark_gone(fme->ie->f_handle, mark->remap)) {
-				pr_warn("Skipping fanotify mark 0x%x:0x%lx, target is gone\n",
+				pr_err("Skipping fanotify mark 0x%x:0x%lx, target is gone\n",
 					 fme->s_dev, fme->ie->i_ino);
 				ret = 0;
 			} else {

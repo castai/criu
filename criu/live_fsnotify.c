@@ -155,14 +155,14 @@ int fsnotify_resolve_pending(int strict)
 
 	list_for_each_entry_safe(p, n, &pending_watches, list) {
 		if (lookup_ghost_remap(p->s_dev, p->i_ino)) {
-			pr_info("watch 0x%x:0x%lx target dumped as ghost file, restore will re-attach\n",
+			pr_err("watch 0x%x:0x%lx target dumped as ghost file, restore will re-attach\n",
 				p->s_dev, p->i_ino);
 		} else if (strict) {
 			fsnotify_log_handle_attempt(p->s_dev, p->i_ino, "target is live but has no resolved path");
 			clear_handle_failures();
 			return -1;
 		} else {
-			pr_warn("watch 0x%x:0x%lx unresolved in pre-dump\n", p->s_dev, p->i_ino);
+			pr_err("watch 0x%x:0x%lx unresolved in pre-dump\n", p->s_dev, p->i_ino);
 		}
 		list_del(&p->list);
 		xfree(p);
