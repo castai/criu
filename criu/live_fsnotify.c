@@ -122,6 +122,94 @@ void fsnotify_log_handle_attempt(u32 s_dev, u64 i_ino, const char *what)
 	       strerror(-h->code), h->type, h->bytes);
 }
 
+/*
+ * Per-watch resolution summary, built while alloc_openable() walks the
+ * mounts and reported by live_fsnotify_report_unresolved_handle() when a
+ * watch ends up with no path. Kept here so the upstream fsnotify.c only
+ * carries one-line seams.
+ */
+static char res_summary[512];
+static size_t res_off;
+static int res_last_err;
+
+void live_fsnotify_resolution_reset(void)
+{
+	res_off = 0;
+	res_last_err = 0;
+	res_summary[0] = '\0';
+}
+
+void live_fsnotify_resolution_mount_skip(struct mount_info *m, int err)
+{
+	res_last_err = err;
+	if (res_off < sizeof(res_summary))
+		res_off += snprintf(res_summary + res_off,
+				    sizeof(res_summary) - res_off,
+				    "mnt %d(%s): %s; ",
+				    m->mnt_id, m->fstype->name, strerror(err));
+}
+
+/*
+ * Directories on other filesystems (procfs, sysfs, tmpfs mounts under the
+ * overlay root) cannot contain the target inode, and readdir on kernel
+ * pseudo-files fails with EINVAL - don't descend into them.
+ */
+bool live_fsnotify_overlay_skip_dir(dev_t dev, unsigned int s_dev)
+{
+	return MKKDEV(major(dev), minor(dev)) != s_dev;
+}
+
+void live_fsnotify_resolution_overlay_walk(unsigned long entries)
+{
+	if (res_off < sizeof(res_summary))
+		res_off += snprintf(res_summary + res_off,
+				    sizeof(res_summary) - res_off,
+				    "overlay walk: %lu entries, not found; ",
+				    entries);
+}
+
+void live_fsnotify_resolution_no_mount(unsigned int s_dev)
+{
+	if (res_off == 0 && sizeof(res_summary) > 0)
+		snprintf(res_summary, sizeof(res_summary),
+			 "no mount with dev 0x%x", s_dev);
+}
+
+const char *live_fsnotify_handle_err_hint(int err)
+{
+	switch (err) {
+	case ESTALE:
+		return "stale handle: file deleted or handle captured on another export";
+	case EINVAL:
+		return "handle rejected by this filesystem";
+	case ENOENT:
+		return "inode not found on this mount";
+	case EACCES:
+	case EPERM:
+		return "missing CAP_DAC_READ_SEARCH";
+	default:
+		return "";
+	}
+}
+
+/*
+ * Report a watch whose handle could not be resolved to any path: the full
+ * handle (to correlate with the checkpoint image and the app's
+ * name_to_handle_at output), what was tried on which mounts, and the most
+ * likely cause. pr_err: must be visible at the production log level 1.
+ */
+void live_fsnotify_report_unresolved_handle(u32 s_dev, u64 i_ino, FhEntry *f_handle)
+{
+	const char *tried = res_off ? res_summary : "no attempts recorded";
+	const char *hint = live_fsnotify_handle_err_hint(-res_last_err);
+
+	pr_err("\tHandle 0x%x:0x%lx has no path yet: handle type %#x bytes %#x words %#llx:%#llx; tried: %s%s%s\n",
+	       s_dev, i_ino, f_handle->type, f_handle->bytes,
+	       f_handle->n_handle > 0 ? (unsigned long long)f_handle->handle[0] : 0,
+	       f_handle->n_handle > 1 ? (unsigned long long)f_handle->handle[1] : 0,
+	       tried, hint[0] ? " -- " : "", hint);
+}
+
 static int add_pending_watch(u32 s_dev, u64 i_ino)
 {
 	struct pending_watch *p;

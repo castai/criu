@@ -186,12 +186,7 @@ static char *__walk_overlay_dir(int dirfd, const char *base,
 			int subfd;
 			char *subbase;
 
-			/* Directories on other filesystems (procfs, sysfs,
-			 * tmpfs mounts under the overlay root) cannot contain
-			 * the target inode, and readdir on kernel
-			 * pseudo-files fails with EINVAL - don't descend.
-			 */
-			if (MKKDEV(major(st.st_dev), minor(st.st_dev)) != s_dev)
+			if (live_fsnotify_overlay_skip_dir(st.st_dev, s_dev))
 				continue;
 
 			subfd = openat(dirfd, de->d_name,
@@ -271,6 +266,9 @@ static char *find_path_on_overlay(struct mount_info *m,
 				   OVL_WALK_MAX_DEPTH, &visited);
 	/* mount_fd is consumed by fdopendir inside __walk_overlay_dir */
 
+	if (!found)
+		live_fsnotify_resolution_overlay_walk(visited);
+
 	if (found)
 		pr_debug("overlay walk: found ino %lx after %lu entries\n",
 			 i_ino, visited);
@@ -317,6 +315,7 @@ static char *alloc_openable(unsigned int s_dev, unsigned long i_ino, FhEntry *f_
 		record_handle_failure(s_dev, i_ino, f_handle, m, fd);
 		close(mntfd);
 		if (fd < 0) {
+			live_fsnotify_resolution_mount_skip(m, -fd);
 			if (m->fstype->code == FSTYPE__OVERLAYFS) {
 				char *ovl_path;
 
@@ -386,6 +385,7 @@ static char *alloc_openable(unsigned int s_dev, unsigned long i_ino, FhEntry *f_
 	}
 
 err:
+	live_fsnotify_resolution_no_mount(s_dev);
 	if (suitable_mount_found)
 		return ERR_PTR(ERR_NO_PATH_IN_MOUNT);
 	return ERR_PTR(ERR_NO_MOUNT);
@@ -427,6 +427,8 @@ int check_open_handle(unsigned int s_dev, unsigned long i_ino, FhEntry *f_handle
 {
 	char *path, *irmap_path;
 	struct mount_info *mi;
+
+	live_fsnotify_resolution_reset();
 
 	if (fault_injected(FI_CHECK_OPEN_HANDLE))
 		goto fault;
@@ -486,7 +488,7 @@ fault:
 		 * the decision to fsnotify_resolve_pending(), which runs after
 		 * every file has been dumped and the ghost registry is complete.
 		 */
-		pr_err("\tHandle 0x%x:0x%lx has no path yet\n", s_dev, i_ino);
+		live_fsnotify_report_unresolved_handle(s_dev, i_ino, f_handle);
 		if (add_pending_watch(s_dev, i_ino))
 			goto err;
 		goto out_nopath;
