@@ -37,7 +37,7 @@ extern const struct fdtype_ops regfile_dump_ops;
 extern int do_open_reg_noseek_flags(int ns_root_fd, struct reg_file_info *rfi, void *arg);
 extern int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p);
 
-extern struct file_remap *lookup_ghost_remap(u32 dev, u32 ino);
+extern struct file_remap *lookup_ghost_remap(u32 dev, u64 ino);
 
 extern struct file_desc *try_collect_special_file(u32 id, int optional);
 #define collect_special_file(id) try_collect_special_file(id, 0)

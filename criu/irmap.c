@@ -487,8 +487,13 @@ int irmap_load_cache(void)
 		struct stat st;
 
 		if (!stat("irmap-cache", &st) && st.st_size < 3 * sizeof(u32)) {
-			pr_err("irmap cache is short (%ld bytes), ignoring\n", (long)st.st_size);
-			return 0;
+			/*
+			 * Drop the short work-dir copy so open_irmap_cache()
+			 * falls back to the parent images dir, which may hold
+			 * a usable cache from an earlier pre-dump.
+			 */
+			pr_info("irmap cache is short (%ld bytes), ignoring\n", (long)st.st_size);
+			unlink("irmap-cache");
 		}
 	}
 
@@ -523,7 +528,10 @@ int irmap_load_cache(void)
 	 * rest of the cache, not fail the dump.
 	 */
 	if (ret < 0) {
-		pr_err("irmap cache corrupt, ignoring the rest\n");
+		if (ret == -ENOMEM)
+			pr_err("irmap cache: out of memory, ignoring the rest\n");
+		else
+			pr_err("irmap cache corrupt, ignoring the rest\n");
 		ret = 0;
 	}
 	return ret;

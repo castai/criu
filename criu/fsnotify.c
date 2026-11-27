@@ -447,7 +447,7 @@ int check_open_handle(unsigned int s_dev, unsigned long i_ino, FhEntry *f_handle
 	path = alloc_openable(s_dev, i_ino, f_handle);
 
 	if (!IS_ERR_OR_NULL(path)) {
-		pr_debug("\tHandle 0x%x:0x%lx is openable\n", s_dev, i_ino);
+		pr_debug("\tHandle 0x%x:0x%" PRIx64 " is openable\n", s_dev, i_ino);
 		goto out;
 	} else if (IS_ERR(path) && PTR_ERR(path) == ERR_NO_MOUNT) {
 		goto fault;
@@ -480,7 +480,7 @@ int check_open_handle(unsigned int s_dev, unsigned long i_ino, FhEntry *f_handle
 		goto out_nopath;
 
 fault:
-	pr_warn("\tHandle 0x%x:0x%lx cannot be opened\n", s_dev, i_ino);
+	pr_warn("\tHandle 0x%x:0x%" PRIx64 " cannot be opened\n", s_dev, i_ino);
 	irmap_path = irmap_lookup(s_dev, i_ino);
 	if (!irmap_path) {
 		/*
@@ -733,8 +733,10 @@ static char *get_mark_path(const char *who, struct file_remap *remap, FhEntry *f
 
 		pr_debug("\t\tRestore %s watch for %#08x:%#016lx (via %s)\n", who, s_dev, i_ino, remap->rpath);
 		*target = openat(mntns_root, remap->rpath, O_PATH);
-		if (*target < 0)
+		if (*target < 0) {
+			pr_perror("Can't open remap target %s", remap->rpath);
 			goto err;
+		}
 	} else if (f_handle->path) {
 		int mntns_root;
 		char *fpath = ".";
@@ -802,7 +804,7 @@ static int restore_one_inotify(int inotify_fd, struct fsnotify_mark_info *info)
 	path = get_mark_path("inotify", info->remap, iwe->f_handle, iwe->i_ino, iwe->s_dev, buf, &target);
 	if (!path) {
 		if (live_fsnotify_mark_gone(iwe->f_handle, info->remap) && kdat.has_inotify_setnextwd) {
-			pr_err("Skipping watch 0x%x:0x%lx, target is gone\n", iwe->s_dev, iwe->i_ino);
+			pr_err("Skipping watch 0x%x:0x%" PRIx64 ", target is gone\n", iwe->s_dev, iwe->i_ino);
 			ret = 0;
 		} else {
 			pr_err("Failed to get path for inotify wd %#x (dev %#x ino %#" PRIx64 " mask %#x)\n",

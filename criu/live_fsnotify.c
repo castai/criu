@@ -101,7 +101,7 @@ static void record_handle_failure(u32 s_dev, u64 i_ino, FhEntry *f_handle, const
 		h->i_ino = i_ino;
 		list_add_tail(&h->list, &handle_failures);
 	}
-	h->code = result == -1 ? -EIO : result;
+	h->code = result;
 	h->mnt_id = m->mnt_id;
 	h->mountpoint = m->ns_mountpoint;
 	h->fstype = m->fstype->name;
@@ -114,7 +114,7 @@ void fsnotify_log_handle_attempt(u32 s_dev, u64 i_ino, const char *what)
 	struct handle_failure *h = find_handle_failure(s_dev, i_ino);
 
 	if (!h || !h->code) {
-		pr_err("watch 0x%x:0x%lx: %s (no open_by_handle_at error was recorded)\n", s_dev, i_ino, what);
+		pr_err("watch 0x%x:0x%" PRIx64 ": %s (no open_by_handle_at error was recorded)\n", s_dev, i_ino, what);
 		return;
 	}
 	pr_err("watch 0x%x:0x%lx: %s; last open_by_handle_at on mnt %d (%s, %s) failed with %d (%s), handle type %#x bytes %#x\n",
@@ -250,7 +250,7 @@ int fsnotify_resolve_pending(int strict)
 			clear_handle_failures();
 			return -1;
 		} else {
-			pr_err("watch 0x%x:0x%lx unresolved in pre-dump\n", p->s_dev, p->i_ino);
+			pr_err("watch 0x%x:0x%" PRIx64 " unresolved in pre-dump\n", p->s_dev, p->i_ino);
 		}
 		list_del(&p->list);
 		xfree(p);

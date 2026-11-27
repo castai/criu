@@ -1006,7 +1006,7 @@ err_out:
 	return exit_code;
 }
 
-struct file_remap *lookup_ghost_remap(u32 dev, u32 ino)
+struct file_remap *lookup_ghost_remap(u32 dev, u64 ino)
 {
 	struct ghost_file *gf;
 

@@ -1861,11 +1861,6 @@ int cr_pre_dump_tasks(pid_t pid)
 	if (fsnotify_resolve_pending(0))
 		goto err;
 
-	if (parent_ie) {
-		inventory_entry__free_unpacked(parent_ie, NULL);
-		parent_ie = NULL;
-	}
-
 	ret = cr_dump_shmem();
 	if (ret)
 		goto err;

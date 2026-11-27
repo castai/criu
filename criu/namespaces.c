@@ -1454,9 +1454,17 @@ int __userns_call(const char *func_name, uns_call_t call, int flags, void *arg, 
 
 	/* Decode the result and return */
 
-	if (flags & UNS_FDOUT)
+	if (flags & UNS_FDOUT) {
 		unsc_msg_pid_fd(&um, NULL, &ret);
-	else
+		/*
+		 * A failed handler sends no SCM_RIGHTS fd; its negative errno
+		 * travels in the message body (res). Without this, every
+		 * handler failure reports as bare -1 and the caller cannot
+		 * tell the real errno (e.g. EPERM from open_by_handle_at).
+		 */
+		if (ret < 0 && res < 0)
+			ret = res;
+	} else
 		ret = res;
 out:
 	if (!async)

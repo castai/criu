@@ -48,7 +48,13 @@ static bool live_irmap_root_covers_dev(char *root, unsigned int dev)
 
 		if (!is_sub_path(root_norm, mnp))
 			continue;
-		/* Ties are impossible: mountpoints are unique. */
+		/*
+		 * Overmounts share a mountpoint, so ties ARE possible: skip
+		 * shadowed mounts and keep the visible (topmost) one, the
+		 * only one whose contents the scan can actually see.
+		 */
+		if (mnt_is_overmounted(m))
+			continue;
 		if (!containing || len >= containing_len) {
 			containing = m;
 			containing_len = len;
