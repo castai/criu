@@ -11,6 +11,8 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
 	libaio-dev \
 	libbsd-dev \
 	libcap-dev \
+	liblz4-dev \
+	libnl-3-dev \
 	libnl-3-dev \
 	libprotobuf-c-dev \
 	libprotobuf-dev \
@@ -28,6 +30,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
 
 COPY . /work
 WORKDIR /work
+RUN make -j $(nproc) mrproper
 RUN make -j $(nproc) criu cuda_plugin
 
 FROM scratch

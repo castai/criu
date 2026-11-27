@@ -47,6 +47,8 @@
 #include "images/fsnotify.pb-c.h"
 #include "images/mnt.pb-c.h"
 
+#include "live_fsnotify.c"
+
 #undef LOG_PREFIX
 #define LOG_PREFIX "fsnotify: "
 
@@ -100,7 +102,9 @@ static void decode_handle(fh_t *handle, FhEntry *img)
 
 static int open_by_handle(void *arg, int fd, int pid)
 {
-	return syscall(__NR_open_by_handle_at, fd, arg, O_PATH);
+	int result = syscall(__NR_open_by_handle_at, fd, arg, O_PATH);
+
+	return fsnotify_error_from_syscall(result, errno);
 }
 
 enum {
@@ -182,6 +186,9 @@ static char *__walk_overlay_dir(int dirfd, const char *base,
 			int subfd;
 			char *subbase;
 
+			if (live_fsnotify_overlay_skip_dir(st.st_dev, s_dev))
+				continue;
+
 			subfd = openat(dirfd, de->d_name,
 				       O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 			if (subfd < 0)
@@ -259,12 +266,16 @@ static char *find_path_on_overlay(struct mount_info *m,
 				   OVL_WALK_MAX_DEPTH, &visited);
 	/* mount_fd is consumed by fdopendir inside __walk_overlay_dir */
 
+	if (!found)
+		live_fsnotify_resolution_overlay_walk(visited);
+
 	if (found)
 		pr_debug("overlay walk: found ino %lx after %lu entries\n",
 			 i_ino, visited);
 
 	return found;
 }
+
 
 static char *alloc_openable(unsigned int s_dev, unsigned long i_ino, FhEntry *f_handle)
 {
@@ -301,8 +312,10 @@ static char *alloc_openable(unsigned int s_dev, unsigned long i_ino, FhEntry *f_
 			continue;
 
 		fd = userns_call(open_by_handle, UNS_FDOUT, &handle, sizeof(handle), mntfd);
+		record_handle_failure(s_dev, i_ino, f_handle, m, fd);
 		close(mntfd);
 		if (fd < 0) {
+			live_fsnotify_resolution_mount_skip(m, -fd);
 			if (m->fstype->code == FSTYPE__OVERLAYFS) {
 				char *ovl_path;
 
@@ -372,6 +385,7 @@ static char *alloc_openable(unsigned int s_dev, unsigned long i_ino, FhEntry *f_
 	}
 
 err:
+	live_fsnotify_resolution_no_mount(s_dev);
 	if (suitable_mount_found)
 		return ERR_PTR(ERR_NO_PATH_IN_MOUNT);
 	return ERR_PTR(ERR_NO_MOUNT);
@@ -398,6 +412,7 @@ static int open_handle(unsigned int s_dev, unsigned long i_ino, FhEntry *f_handl
 		}
 
 		fd = userns_call(open_by_handle, UNS_FDOUT, &handle, sizeof(handle), mntfd);
+		record_handle_failure(s_dev, i_ino, f_handle, m, fd);
 		if (fd >= 0) {
 			close(mntfd);
 			goto out;
@@ -412,6 +427,8 @@ int check_open_handle(unsigned int s_dev, unsigned long i_ino, FhEntry *f_handle
 {
 	char *path, *irmap_path;
 	struct mount_info *mi;
+
+	live_fsnotify_resolution_reset();
 
 	if (fault_injected(FI_CHECK_OPEN_HANDLE))
 		goto fault;
@@ -430,7 +447,7 @@ int check_open_handle(unsigned int s_dev, unsigned long i_ino, FhEntry *f_handle
 	path = alloc_openable(s_dev, i_ino, f_handle);
 
 	if (!IS_ERR_OR_NULL(path)) {
-		pr_debug("\tHandle 0x%x:0x%lx is openable\n", s_dev, i_ino);
+		pr_debug("\tHandle 0x%x:0x%" PRIx64 " is openable\n", s_dev, i_ino);
 		goto out;
 	} else if (IS_ERR(path) && PTR_ERR(path) == ERR_NO_MOUNT) {
 		goto fault;
@@ -463,11 +480,18 @@ int check_open_handle(unsigned int s_dev, unsigned long i_ino, FhEntry *f_handle
 		goto out_nopath;
 
 fault:
-	pr_warn("\tHandle 0x%x:0x%lx cannot be opened\n", s_dev, i_ino);
+	pr_warn("\tHandle 0x%x:0x%" PRIx64 " cannot be opened\n", s_dev, i_ino);
 	irmap_path = irmap_lookup(s_dev, i_ino);
 	if (!irmap_path) {
-		pr_err("\tCan't dump that handle\n");
-		return -1;
+		/*
+		 * No path anywhere yet. Keep the watch without one and defer
+		 * the decision to fsnotify_resolve_pending(), which runs after
+		 * every file has been dumped and the ghost registry is complete.
+		 */
+		live_fsnotify_report_unresolved_handle(s_dev, i_ino, f_handle);
+		if (add_pending_watch(s_dev, i_ino))
+			goto err;
+		goto out_nopath;
 	}
 	path = xstrdup(irmap_path);
 	if (!path)
@@ -475,11 +499,13 @@ fault:
 out:
 	pr_debug("\tDumping %s as path for handle\n", path);
 	f_handle->path = path;
+	forget_handle_failure(s_dev, i_ino);
 out_nopath:
 	return 0;
 err:
 	return -1;
 }
+
 
 static int check_one_wd(InotifyWdEntry *we)
 {
@@ -707,6 +733,10 @@ static char *get_mark_path(const char *who, struct file_remap *remap, FhEntry *f
 
 		pr_debug("\t\tRestore %s watch for %#08x:%#016lx (via %s)\n", who, s_dev, i_ino, remap->rpath);
 		*target = openat(mntns_root, remap->rpath, O_PATH);
+		if (*target < 0) {
+			pr_perror("Can't open remap target %s", remap->rpath);
+			goto err;
+		}
 	} else if (f_handle->path) {
 		int mntns_root;
 		char *fpath = ".";
@@ -737,8 +767,7 @@ static char *get_mark_path(const char *who, struct file_remap *remap, FhEntry *f
 			pr_perror("Unable to open %s via path %s (dev %#x ino %#lx)",
 				  who, f_handle->path, s_dev, i_ino);
 		else
-			pr_perror("Unable to open %s by handle (dev %#x ino %#lx)",
-				  who, s_dev, i_ino);
+			fsnotify_log_handle_attempt(s_dev, i_ino, "Unable to open by handle");
 		goto err;
 	}
 
@@ -774,8 +803,13 @@ static int restore_one_inotify(int inotify_fd, struct fsnotify_mark_info *info)
 
 	path = get_mark_path("inotify", info->remap, iwe->f_handle, iwe->i_ino, iwe->s_dev, buf, &target);
 	if (!path) {
-		pr_err("Failed to get path for inotify wd %#x (dev %#x ino %#" PRIx64 " mask %#x)\n",
-		       iwe->wd, iwe->s_dev, iwe->i_ino, iwe->mask);
+		if (live_fsnotify_mark_gone(iwe->f_handle, info->remap) && kdat.has_inotify_setnextwd) {
+			pr_err("Skipping watch 0x%x:0x%" PRIx64 ", target is gone\n", iwe->s_dev, iwe->i_ino);
+			ret = 0;
+		} else {
+			pr_err("Failed to get path for inotify wd %#x (dev %#x ino %#" PRIx64 " mask %#x)\n",
+			       iwe->wd, iwe->s_dev, iwe->i_ino, iwe->mask);
+		}
 		goto err;
 	}
 
@@ -816,6 +850,16 @@ static int restore_one_inotify(int inotify_fd, struct fsnotify_mark_info *info)
 	}
 
 err:
+	/*
+	 * The target fd is only needed as the /proc/self/fd path for the
+	 * inotify_add_watch above; it must be closed right after arming, or
+	 * it occupies the fd number that the fd-table serving reopens for the
+	 * next ghost file ("fd N already in use" at files.c:1125) and leaks
+	 * into the checkpoint. The kernel clears inotify marks at the
+	 * last-name unlink (dentry_unlink_inode runs fsnotify_inoderemove
+	 * regardless of open fds), so the fd cannot protect an armed watch
+	 * anyway.
+	 */
 	close_safe(&target);
 	return ret;
 }
@@ -860,8 +904,14 @@ static int restore_one_fanotify(int fd, struct fsnotify_mark_info *mark)
 		path = get_mark_path("fanotify", mark->remap, fme->ie->f_handle, fme->ie->i_ino, fme->s_dev, buf,
 				     &target);
 		if (!path) {
-			pr_err("Failed to get path for fanotify mark (dev %#x ino %#" PRIx64 " mask %#x)\n",
-			       fme->s_dev, fme->ie->i_ino, fme->mask);
+			if (live_fsnotify_mark_gone(fme->ie->f_handle, mark->remap)) {
+				pr_err("Skipping fanotify mark 0x%x:0x%lx, target is gone\n",
+					 fme->s_dev, fme->ie->i_ino);
+				ret = 0;
+			} else {
+				pr_err("Failed to get path for fanotify mark (dev %#x ino %#" PRIx64 " mask %#x)\n",
+				       fme->s_dev, fme->ie->i_ino, fme->mask);
+			}
 			goto err;
 		}
 	} else {
@@ -890,6 +940,7 @@ static int restore_one_fanotify(int fd, struct fsnotify_mark_info *mark)
 	}
 
 err:
+	/* see restore_one_inotify: close the target fd after arming */
 	close_safe(&target);
 	return ret;
 }

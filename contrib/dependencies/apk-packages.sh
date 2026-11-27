@@ -8,7 +8,6 @@ apk add --no-cache \
 	e2fsprogs \
 	elfutils-dev \
 	git \
-	gnutls-dev \
 	go \
 	ip6tables \
 	iproute2 \
@@ -20,12 +19,13 @@ apk add --no-cache \
 	libcap-utils \
 	libdrm-dev \
 	lz4-dev \
+	lz4-static \
 	libnet-dev \
+	libnet-static \
 	libnl3-dev \
+	libnl3-static \
 	libtraceevent-dev \
 	libtracefs-dev \
-	nftables \
-	nftables-dev \
 	perl \
 	pkgconfig \
 	procps \
@@ -41,4 +41,5 @@ apk add --no-cache \
 	sudo \
 	tar \
 	util-linux \
-	util-linux-dev
+	util-linux-dev \
+	util-linux-static

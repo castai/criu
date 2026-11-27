@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <sys/stat.h>
@@ -29,6 +30,8 @@
 #include "protobuf.h"
 #include "images/fsnotify.pb-c.h"
 #include "images/fh.pb-c.h"
+
+#include "live_irmap.c"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "irmap: "
@@ -239,6 +242,7 @@ invalid:
 
 static bool doing_predump = false;
 
+
 char *irmap_lookup(unsigned int s_dev, unsigned long i_ino)
 {
 	struct irmap *c, *h, **p;
@@ -279,6 +283,10 @@ char *irmap_lookup(unsigned int s_dev, unsigned long i_ino)
 	 * about them, hopefully they're more interesting than our hints.
 	 */
 	list_for_each_entry(o, &opts.irmap_scan_paths, node) {
+		if (!live_irmap_root_covers_dev(o->ir->path, s_dev)) {
+			pr_debug("Skipping %s: no mount of %#x under it\n", o->ir->path, s_dev);
+			continue;
+		}
 		c = irmap_scan(o->ir, s_dev, i_ino);
 		if (c) {
 			pr_debug("\tScanned %s\n", c->path);
@@ -288,6 +296,10 @@ char *irmap_lookup(unsigned int s_dev, unsigned long i_ino)
 	}
 
 	for (h = hints; h->path; h++) {
+		if (!live_irmap_root_covers_dev(h->path, s_dev)) {
+			pr_debug("Skipping %s hint: no mount of %#x under it\n", h->path, s_dev);
+			continue;
+		}
 		pr_debug("Scanning %s hint\n", h->path);
 		c = irmap_scan(h, s_dev, i_ino);
 		if (c) {
@@ -463,8 +475,34 @@ int irmap_load_cache(void)
 	int ret;
 	struct cr_img *img;
 
+	/*
+	 * The cache is a pure optimization: every entry is revalidated with
+	 * fstatat before use. irmap_predump_run() rewrites it with O_TRUNC at
+	 * the end of every pre-dump, so a dump killed between truncate and
+	 * rewrite leaves it short. Skip a short file before open_image_at()
+	 * prints an error for it: the log line alone is enough for callers
+	 * that collect CRIU error output to fail the whole dump.
+	 */
+	{
+		struct stat st;
+
+		if (!stat("irmap-cache", &st) && st.st_size < 3 * sizeof(u32)) {
+			/*
+			 * Drop the short work-dir copy so open_irmap_cache()
+			 * falls back to the parent images dir, which may hold
+			 * a usable cache from an earlier pre-dump.
+			 */
+			pr_info("irmap cache is short (%ld bytes), ignoring\n", (long)st.st_size);
+			unlink("irmap-cache");
+		}
+	}
+
 	ret = open_irmap_cache(&img);
-	if (ret <= 0)
+	if (ret < 0) {
+		pr_err("irmap cache unreadable, ignoring\n");
+		return 0;
+	}
+	if (ret == 0)
 		return ret;
 
 	pr_info("Loading irmap cache\n");
@@ -483,6 +521,19 @@ int irmap_load_cache(void)
 	}
 
 	close_image(img);
+	/*
+	 * The cache is a pure optimization: every entry is revalidated with
+	 * fstatat before use. A truncated or corrupt file — a dump retry can
+	 * rewrite it while a straggling reader is still in it — must skip the
+	 * rest of the cache, not fail the dump.
+	 */
+	if (ret < 0) {
+		if (ret == -ENOMEM)
+			pr_err("irmap cache: out of memory, ignoring the rest\n");
+		else
+			pr_err("irmap cache corrupt, ignoring the rest\n");
+		ret = 0;
+	}
 	return ret;
 }
 
