@@ -8,9 +8,9 @@ PYTHON ?= python3
 
 run: all
 	@make -C .. loop
-	mkdir -p build/{imgs_errno,imgs_ps,imgs_c,imgs_loop,imgs_py}
+	mkdir -p build/imgs_errno build/imgs_ps build/imgs_c build/imgs_loop build/imgs_py
 	chmod a+rwx build
-	chmod a+rwx build/{imgs_errno,imgs_ps,imgs_c,imgs_loop,imgs_py}
+	chmod a+rwx build/imgs_errno build/imgs_ps build/imgs_c build/imgs_loop build/imgs_py
 	rm -f build/status
 	rm -f build/pidfile
 	rm -f build/criu_service.socket
